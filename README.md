@@ -27,7 +27,13 @@ digital-human/
 │   ├── llm.py               # OpenRouter (gemini-2.5-flash) streaming
 │   ├── tts.py               # edge-tts (en-US-GuyNeural)
 │   ├── avatar.py            # FLOAT multi-GPU pool (0/1/2) + idle video
-│   └── audio_server.py      # Browser audio WS handler
+│   ├── audio_server.py      # Browser audio WS handler
+│   └── sbirt/               # SBIRT clinical framework (data-driven, config-free)
+│       ├── instruments.py   #   validated screening tools (AUDIT, DAST-10, CAGE-AID, CRAFFT, ...)
+│       ├── intervention.py  #   MI/OARS, FRAMES, stages of change, readiness rulers
+│       ├── referral.py      #   ASAM levels of care, MAT, resources, crisis protocol
+│       ├── workflow.py      #   the SBIRT conversation state machine
+│       └── prompt.py        #   build_system_prompt(): renders ALL of the above into the prompt
 ├── static/
 │   ├── index.html           # Frontend UI
 │   └── test_audio.html      # Mic / ASR debug page
@@ -70,7 +76,7 @@ All other settings live in `config.py`. Common knobs:
 | `FLOAT_NFE` | `10` | FLOAT inference steps (lower = faster) |
 | `VAD_THRESHOLD` | `0.5` | Silero VAD trigger threshold |
 | `VAD_SILENCE_DURATION` | `0.5` | Seconds of silence to mark sentence end |
-| `SYSTEM_PROMPT` | SBIRT counselor | Persona prompt (override as needed) |
+| `SYSTEM_PROMPT` | built from `modules/sbirt/` | SBIRT counselor prompt — **do not edit the string**; edit the clinical data modules under `modules/sbirt/` and it rebuilds automatically |
 
 ## Running
 
