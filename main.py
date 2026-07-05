@@ -397,6 +397,13 @@ async def _poll_session(session: Session):
     # re-serialized and re-sent in full every tick.
     await _push_chat_delta(session)
 
+    # Consent declined: end the session — turn the mic off server-side and tell the
+    # client to stop capturing (it lets the goodbye clip finish, then resets to Start).
+    if pipeline.ended:
+        pipeline.ended = False
+        session.mic_enabled = False
+        await broadcast(clients, {"type": "stop"})
+
 
 def _chat_delta(prev: list, chat: list):
     """Return (from_index, new_snapshot) where `chat` first differs from the

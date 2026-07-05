@@ -74,6 +74,9 @@ class Pipeline:
         # reply is handled — that one turn is routed through classify_consent so a
         # "no" gets the fixed decline clip instead of the full LLM.
         self.awaiting_consent = False
+        # Set when the user declines consent: the server then turns the mic off and
+        # tells the client to stop, ending the session until Start is pressed again.
+        self.ended = False
         self._lock = threading.Lock()
         self._processing_thread = None
         # Track which sentences were actually played
@@ -220,6 +223,9 @@ class Pipeline:
             self.video_queue.put(None)
         else:
             self.state = "idle"
+        # Consent declined: end the session (the server turns the mic off + tells the
+        # client to stop) now that the goodbye clip is queued for delivery.
+        self.ended = True
 
     # ---------- Shared history management (both histories move together) ----------
     # chat_history (frontend display) and llm_history (sent to the API) are kept in
@@ -686,6 +692,7 @@ class Pipeline:
         self.chat_history.clear()
         self.patient.clear()
         self.awaiting_consent = False
+        self.ended = False
         self._pending_assistant_text = ""
         self._played_sentences = []
         while not self.video_queue.empty():

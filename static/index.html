@@ -85,6 +85,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 
   const IDLE_VIDEO_URL = '/video/assets/idle_loop.mp4';
   let micActive = false;
+  let endedByDecline = false;   // session ended (consent declined) — next Start is fresh
 
   // Per-browser session id: isolates this tab's conversation/avatar/mic on the
   // server from every other connected user. Sent on both WebSockets and all
@@ -313,6 +314,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
       chatMessages.innerHTML = '';
       interruptPlayback();
       statusBar.textContent = 'Click Start to begin';
+    } else if (msg.type === 'stop') {
+      // Conversation ended (consent declined): stop capturing and reset to Start,
+      // but do NOT interrupt playback — let the goodbye clip finish, then it
+      // dissolves to idle on its own. The next Start begins a fresh session.
+      endedByDecline = true;
+      if (micActive) {
+        stopMic();
+        micActive = false;
+        btnStart.textContent = 'Start';
+        btnStart.classList.remove('active');
+      }
     }
   }
 
@@ -449,6 +461,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   // ============ Button handlers ============
   btnStart.addEventListener('click', async () => {
     if (!micActive) {
+      // If the previous session ended by a consent decline, Start begins fresh:
+      // clear the server conversation so the greeting fires again.
+      if (endedByDecline) {
+        endedByDecline = false;
+        await fetch('/api/reset' + SID_Q, { method: 'POST' });
+      }
       // Toggle mic on server
       const resp = await fetch('/api/toggle' + SID_Q, { method: 'POST' });
       const data = await resp.json();
