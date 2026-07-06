@@ -526,6 +526,16 @@ class Pipeline:
                 return self._deliver_step(
                     user_text, runtime.crisis_step(clinical), turn)
 
+            if out.action == "abort":
+                # T22: the user wants to stop the whole session. Close
+                # gracefully with the fixed goodbye (no retention attempt),
+                # keep everything coded so far, and end the session like a
+                # consent decline (mic off via `ended`).
+                step = runtime.enter_abort(clinical)
+                self._deliver_step(user_text, step, turn)
+                self.ended = True
+                return
+
             if out.action == "answer":
                 if exp.ask_key == "consent.opening":
                     # THE study consent (the greeting's ask) -> audit trail.

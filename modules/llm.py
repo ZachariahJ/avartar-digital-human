@@ -228,6 +228,9 @@ action — exactly one of:
   "question"     they are asking YOU something
   "tangent"      an off-topic aside or small talk
   "crisis"       ANY sign of self-harm, overdose, danger, acute distress
+  "abort"        they clearly want to stop the WHOLE conversation ("stop",
+                 "i'm done", "i don't want to do this anymore") — NOT a
+                 plain "no" to the current may-I question (that's "answer")
   "unclear"      none of the above is safe to assume
 
 Coding rules (guess-free — a wrong code corrupts a validated screening):
@@ -273,7 +276,7 @@ reply rules — you speak WITH the person, warm and plain-spoken:
   question word-for-word, and never reuse a clarification wording already
   used in this conversation — each attempt must get more specific, not
   repeat itself. Never suggest which choice to pick.
-- crisis: leave reply empty — a fixed safety response takes over.
+- crisis / abort: leave reply empty — a fixed response takes over.
 - NEVER: scores, risk zones, diagnoses, clinical jargon, lecturing, stacked
   questions, or stock phrases like "I hear you."
 """

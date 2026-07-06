@@ -111,6 +111,7 @@ class ClinicalSession:
     slots: dict[str, dict[str, str]] = field(default_factory=dict)  # slot captures
     last_ask_key: str | None = None            # target for continuation absorption
     crisis: bool = False
+    aborted: bool = False                      # user stopped the session (T22)
     last_step: Step | None = None
 
     def instrument(self):
@@ -135,6 +136,7 @@ class ClinicalSession:
             "answered": sorted(self.answers),
             "slots_filled": {k: sorted(v) for k, v in self.slots.items()},
             "crisis": self.crisis,
+            "aborted": self.aborted,
         }
 
 
@@ -362,6 +364,19 @@ def enter_crisis(session: ClinicalSession) -> Step:
     turn is an LLM crisis-protocol turn."""
     session.crisis = True
     return _pause(session, "crisis", [], Expect("open"))
+
+
+def enter_abort(session: ClinicalSession) -> Step:
+    """User asked to stop the whole session (T22): close gracefully from ANY
+    node with the fixed abort goodbye — no re-ask, no retention attempt.
+    Everything coded so far stays in the session state (partial data is
+    real data for the provider); the abort itself is recorded for audit."""
+    session.aborted = True
+    key = "close.aborted"
+    session.covered.add(key)
+    logger.info("[clinical] session aborted by user at node %s", session.node)
+    return _pause(session, "aborted",
+                  [Say(key, templates.FIXED[key])], Expect("end"))
 
 
 _CRISIS_INSTRUCTION = (

@@ -109,6 +109,12 @@ class TextSession:
             self.transcript.append(("avatar", reply, "CRISIS(nlu)"))
             return reply, "crisis"
 
+        if out.action == "abort":
+            step = runtime.enter_abort(self.s)
+            reply = self.speak(step.utterances)
+            self.transcript.append(("avatar", reply, "ABORT"))
+            return reply, "abort"
+
         if out.action == "answer":
             step = runtime.advance(self.s, out)
             if self.s.node == "declined":

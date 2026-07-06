@@ -30,9 +30,13 @@ from .instruments import BY_KEY, PRE_SCREEN
 #                  machine holds)
 #   crisis       — distress/danger cue (deterministic crisis path takes over;
 #                  UNION with crisis.detect — either may fire)
+#   abort        — they want to STOP the whole conversation (T22): the engine
+#                  closes gracefully with partial data kept; never a re-ask,
+#                  never a retention attempt. Distinct from answering "no"
+#                  to the current permission gate (that is an `answer`).
 #   unclear      — none of the above is safe to assume (reply gently re-asks)
 Action = Literal["answer", "continuation", "question", "tangent", "crisis",
-                 "unclear"]
+                 "abort", "unclear"]
 
 
 class TurnOut(BaseModel):

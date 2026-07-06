@@ -109,6 +109,15 @@ FIXED: dict[str, str] = {
     "permission.declined": (
         "That's completely your call, and that's fine."
     ),
+    # User asks to STOP the whole conversation mid-protocol (T22 abort).
+    # Source gives no text; autonomy-respecting goodbye, no retention
+    # attempt, answers so far stay recorded for the provider. PENDING
+    # CLINICIAN REVIEW.
+    "close.aborted": (
+        "Of course — we can stop here, and that's completely fine. Thank "
+        "you for your time today. Anything you shared stays confidential, "
+        "and your provider can pick this up with you whenever you're ready."
+    ),
     # Brief-intervention closer (source line; the flow Tells it right before
     # listening for the open answer).
     "bi.leaves_you": "So where does this leave you?",
