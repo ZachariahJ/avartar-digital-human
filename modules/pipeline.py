@@ -429,21 +429,43 @@ class Pipeline:
         return item.text, item.options
 
     def _last_question_text(self):
-        """The most recent fixed question the avatar asked (for the consent
-        classifier's context); falls back to the greeting's consent ask."""
+        """The most recent question the avatar asked (context for the NLU
+        turn call): last fixed Say of the current pause, else the assistant's
+        last spoken text (compose asks), else the greeting's consent ask."""
         step = self.clinical.last_step
         if step:
             for utt in reversed(step.utterances):
                 if isinstance(utt, runtime.Say):
                     return utt.text
+        with self._lock:
+            for m in reversed(self.chat_history):
+                if m["role"] == "assistant" and m["content"].strip():
+                    return m["content"]
         return "May I ask you some questions about your health?"
 
+    def _turn_facts(self):
+        """Grounding for the NLU turn's replies: ONLY what the machine knows
+        deterministically. This is what lets a user's question ('have we
+        discussed the standard drink?') be answered honestly from state
+        instead of re-asking the machine's own question."""
+        c = self.clinical
+        return {
+            "current_phase": c.node,
+            "standard_drink_definition_discussed":
+                "alcohol.edu.standard_drink" in c.covered,
+            "drinking_limits_discussed": "alcohol.edu.limits" in c.covered,
+            "permissions_declined_so_far": list(c.declined),
+            "active_topic": c.arm,
+        }
+
     def _protocol_turn(self, user_text, turn):
-        """Code the user's words onto the machine's expected input, advance the
-        protocol, and speak the resulting step. Ambiguity clarifies and re-asks;
-        it NEVER guesses a code and never moves the machine. The whole turn is
-        serialized under _protocol_lock so a superseded turn can never advance
-        the machine after a newer one already has."""
+        """ONE NLU+voice call classifies the utterance relative to the current
+        ask (answer / continuation / question / tangent / crisis / unclear),
+        codes it if it is an answer, and produces this turn's bounded reply.
+        Only a VALIDATED answer advances the deterministic machine; every
+        other action holds position (T12). The whole turn is serialized under
+        _protocol_lock so a superseded turn can never advance the machine
+        after a newer one already has."""
         with self._protocol_lock:
             if self._aborted(turn):
                 return
@@ -457,32 +479,9 @@ class Pipeline:
                 self._run_crisis_synthesis(messages, turn)
                 return
 
-            # 1. Code the free text onto what the machine is waiting for. Any
-            #    ambiguity clarifies and re-asks WITHOUT moving the machine.
             exp = clinical.expect
-            if exp.kind == "consent":
-                verdict = llm.classify_consent(
-                    user_text, question=self._last_question_text())
-                if verdict == "unclear":
-                    return self._clarify(user_text, turn)
-                if clinical.node == "consent":
-                    # THE study consent (the greeting's ask) -> audit trail.
-                    privacy.record_consent(self.audit_key, verdict)
-                value = verdict
-            elif exp.kind == "option":
-                question, options = self._current_question()
-                result = llm.code_option(question, options, user_text)
-                if "code" not in result:
-                    return self._clarify(user_text, turn)
-                value = result["code"]
-            elif exp.kind == "number":
-                result = llm.code_number(user_text)
-                if "value" not in result:
-                    return self._clarify(user_text, turn)
-                value = result["value"]
-            elif exp.kind == "open":
-                value = user_text
-            else:  # "end" — session already closed/declined; stay warm, done.
+            if exp.kind == "end":
+                # Session already closed/declined; stay warm, done.
                 return self._deliver_step(user_text, runtime.Step(
                     clinical.node, (runtime.LLMSay(
                         "The screening session is already complete. In one warm "
@@ -490,51 +489,88 @@ class Pipeline:
                         "them their provider will follow up with them."),),
                     clinical.expect), turn)
 
-            # Coding may have taken a slow LLM round-trip; if a newer turn
+            with self._lock:
+                history = self._api_window()
+                patient = dict(self.patient)
+            out = llm.turn(user_text, exp,
+                           ask_text=self._last_question_text(),
+                           history=history, patient=patient,
+                           facts=self._turn_facts())
+
+            # The NLU may have taken a slow LLM round-trip; if a newer turn
             # started meanwhile (barge-in, typed message), don't touch the machine.
             if self._aborted(turn):
                 return
 
-            # 2. Advance the deterministic machine and 3. speak the result.
-            try:
-                step = runtime.advance(clinical, exp.kind, value)
-            except (runtime.ProtocolError, InvalidResponse):
-                # A coder/wiring bug must not strand the user: log loudly, then
-                # clarify and re-ask instead of guessing or going silent.
-                logger.exception("protocol advance failed; clarifying")
-                return self._clarify(user_text, turn)
+            if out.action == "crisis":
+                # NLU-flagged crisis (union with the deterministic net, which
+                # already ran in _process_speech/_process_text): pause the
+                # protocol permanently; this and every later turn follow the
+                # crisis protocol.
+                logger.warning("[crisis] NLU flagged crisis at node %s",
+                               clinical.node)
+                runtime.enter_crisis(clinical)
+                return self._deliver_step(
+                    user_text, runtime.crisis_step(clinical), turn)
 
-            if clinical.node == "declined":
-                # Machine recorded the decline; the fixed decline path speaks it
-                # and ends the session (mic off via `ended`).
-                return self._deliver_decline(user_text, turn)
-            self._deliver_step(user_text, step, turn)
+            if out.action == "answer":
+                if exp.ask_key == "consent.opening":
+                    # THE study consent (the greeting's ask) -> audit trail.
+                    privacy.record_consent(
+                        self.audit_key, "yes" if out.code == 1 else "no")
+                try:
+                    step = runtime.advance(clinical, out)
+                except (runtime.ProtocolError, InvalidResponse):
+                    # A wiring bug must not strand the user: log loudly, then
+                    # re-ask instead of guessing or going silent.
+                    logger.exception("protocol advance failed; re-asking")
+                    return self._hold(user_text, "", turn)
+                if clinical.node == "declined":
+                    # Machine recorded the decline; the fixed decline path
+                    # speaks it and ends the session (mic off via `ended`).
+                    return self._deliver_decline(user_text, turn)
+                return self._deliver_step(user_text, step, turn,
+                                          ack=out.reply)
 
-    def _clarify(self, user_text, turn):
-        """Ambiguous answer: one bounded LLM clarification that re-poses the
-        CURRENT question. The machine's expectation is untouched, so the next
-        answer is coded against the same item (guess-free by construction)."""
+            if out.action == "continuation":
+                # The two-breath answer: fold it into the previous capture,
+                # keep the machine exactly where it is, and let the reply
+                # re-pose the pending ask (never a duplicate re-question).
+                runtime.absorb(clinical, out)
+                return self._hold(user_text, out.reply, turn)
+
+            # question / tangent / unclear: machine holds position; the reply
+            # answers/acknowledges and re-poses the current ask.
+            return self._hold(user_text, out.reply, turn)
+
+    def _hold(self, user_text, reply, turn):
+        """Speak a bounded hold-turn WITHOUT touching the machine: the NLU's
+        reply if it produced one, else a deterministic re-ask built from the
+        current expectation (the guess-free fallback when the model failed)."""
         exp = self.clinical.expect
-        question = self._last_question_text()
-        if exp.kind == "option":
-            q, options = self._current_question()
-            labels = "; ".join(o.label for o in options)
-            instruction = (
-                "The person's answer didn't clearly match one of the answer "
-                f"choices. In one or two short sentences, gently re-ask: "
-                f"{q!r} — you may briefly mention the choices ({labels}). "
-                "Do not suggest which one to pick.")
-        elif exp.kind == "number":
-            instruction = ("In one short sentence, gently ask again for a "
-                           "single number from 0 to 10.")
+        if reply:
+            utterance = runtime.Speak(reply)
         else:
-            instruction = (f"The person's answer to {question!r} wasn't a "
-                           "clear yes or no. In one short sentence, gently "
-                           "ask again.")
+            question = self._last_question_text()
+            if exp.kind == "option":
+                q, options = self._current_question()
+                labels = "; ".join(o.label for o in options)
+                instruction = (
+                    "The person's answer didn't clearly match one of the "
+                    f"answer choices. In one or two short sentences, gently "
+                    f"re-ask: {q!r} — you may briefly mention the choices "
+                    f"({labels}). Do not suggest which one to pick.")
+            elif exp.kind == "number":
+                instruction = ("In one short sentence, gently ask again for "
+                               "a single number from 0 to 10.")
+            else:
+                instruction = (f"The person's answer to {question!r} wasn't "
+                               "clear. In one short sentence, gently ask "
+                               "again.")
+            utterance = runtime.LLMSay(instruction)
         self._deliver_step(
             user_text,
-            runtime.Step(self.clinical.node, (runtime.LLMSay(instruction),),
-                         exp),
+            runtime.Step(self.clinical.node, (utterance,), exp),
             turn)
 
     def _render_dynamic(self, text):
@@ -549,14 +585,22 @@ class Pipeline:
             pass
         return video
 
-    def _deliver_step(self, user_text, step, turn):
+    def _deliver_step(self, user_text, step, turn, ack=""):
         """Speak one machine step: fixed utterances come from the shared clip
-        cache (rendered once, reused across sessions); LLMSay utterances are
-        phrased by the bounded LLM then rendered. Enqueued strictly in order."""
+        cache (rendered once, reused across sessions); Speak utterances are
+        pre-resolved dynamic text (the NLU turn's acknowledgment); LLMSay
+        utterances are phrased by the bounded LLM then rendered. Enqueued
+        strictly in order. `ack` (when the turn was an answer) is prepended
+        as its own short Speak so the person hears they were heard BEFORE the
+        next protocol content — and, being the turn's first short segment, it
+        rides the FLOAT_NFE_FIRST fast path."""
         self._history_begin(user_text)
         self.state = "processing"
+        utterances = step.utterances
+        if ack:
+            utterances = (runtime.Speak(ack),) + tuple(utterances)
         spoken = []
-        for utt in step.utterances:
+        for utt in utterances:
             if self._aborted(turn):
                 return
             if isinstance(utt, runtime.Say):
@@ -564,6 +608,11 @@ class Pipeline:
                 video = ensure_fixed_clip(text, protocol_clip_path(utt.key))
                 if video is None and not self._aborted(turn):
                     video = self._render_dynamic(text)   # cache miss fallback
+            elif isinstance(utt, runtime.Speak):
+                text = utt.text
+                if not text.strip():
+                    continue
+                video = None if self._aborted(turn) else self._render_dynamic(text)
             else:
                 with self._lock:
                     history = self._api_window()

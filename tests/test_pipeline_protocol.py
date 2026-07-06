@@ -1,8 +1,10 @@
-"""End-to-end protocol wiring through the REAL Pipeline (P4 acceptance).
+"""End-to-end protocol wiring through the REAL Pipeline (P4 acceptance,
+migrated to the T6 engine + llm.turn NLU).
 
 Runs only where the heavy stack imports (the float conda env); GPU renders and
-network LLM calls are stubbed, everything else — coder pre-match, state
-machine, scoring, histories, video queue — is the real code path.
+network LLM calls are stubbed, everything else — deterministic pre-match,
+turn validation, generic engine, scoring, histories, video queue — is the
+real code path.
 """
 
 import json
@@ -17,6 +19,7 @@ pytest.importorskip("torch")
 import modules.pipeline as P
 from modules import llm
 from modules.sbirt import runtime
+from modules.sbirt.turn import TurnOut, expected_item, validate
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -26,9 +29,36 @@ def load(name):
         return json.load(f)
 
 
+def scripted_turn(user_text, expect, *, ask_text, history, patient=None,
+                  facts=None):
+    """Deterministic stand-in for llm.turn: REAL pre-match + REAL validate,
+    canned semantics for what would need the network. Open answers surface as
+    text and let validate() route them onto the asked slot — exactly the
+    production behavior for a one-slot-at-a-time answer."""
+    t = user_text.strip().lower()
+    if expect.kind == "consent":
+        if t.startswith(("yes", "sure", "ok", "fine")):
+            out = TurnOut(action="answer", code=1)
+        elif t.startswith("no"):
+            out = TurnOut(action="answer", code=0)
+        else:
+            out = TurnOut(action="unclear", reply="")
+    elif expect.kind == "option":
+        pre = llm._prematch_option(expected_item(expect).options, user_text)
+        out = (TurnOut(action="answer", code=pre) if pre is not None
+               else TurnOut(action="unclear", reply=""))
+    elif expect.kind == "number":
+        got = llm.code_number(user_text)
+        out = (TurnOut(action="answer", code=got["value"])
+               if "value" in got else TurnOut(action="unclear", reply=""))
+    else:
+        out = TurnOut(action="answer", text=user_text)
+    return validate(out, expect)
+
+
 @pytest.fixture()
 def pipeline(monkeypatch):
-    # No GPU / no network: renders return fake paths; bounded LLM canned.
+    # No GPU / no network: renders return fake paths; NLU turn scripted.
     monkeypatch.setattr(P, "ensure_fixed_clip",
                         lambda text, path: "/fake/" + os.path.basename(path))
     monkeypatch.setattr(P.tts, "synthesize", lambda text, out, ev=None: "/fake.wav")
@@ -36,10 +66,7 @@ def pipeline(monkeypatch):
     monkeypatch.setattr(P.llm, "phrase_utterance",
                         lambda instruction, history, patient=None: "[reflection]")
     monkeypatch.setattr(P.llm, "extract_patient_facts", lambda h: {})
-    monkeypatch.setattr(P.llm, "classify_consent",
-                        lambda text, question=None:
-                        "yes" if text.strip().lower().startswith(("yes", "sure", "ok"))
-                        else ("no" if text.strip().lower().startswith("no") else "unclear"))
+    monkeypatch.setattr(P.llm, "turn", scripted_turn)
     # Full-counselor path must NEVER run in a non-crisis protocol session.
     def no_full_llm(*a, **k):
         raise AssertionError("full LLM synthesis ran during a protocol turn")
@@ -88,10 +115,21 @@ def test_full_alcohol_bi_protocol(pipeline):
     say_turn(p, "no")
     say_turn(p, "within the last year")
     spoken = say_turn(p, "none")
+    # Q/F is now a composed slot-ask: one question at a time, three slots.
     assert p.clinical.node == "alcohol.qf"
-    assert "What do you like to drink?" in spoken[0]
+    assert p.clinical.expect.missing == ("drink", "amount", "frequency")
+    assert spoken[-1] == "[reflection]", "composed ask, not a fixed 3-in-1"
 
-    say_turn(p, "wine mostly, two or three glasses")     # open Q/F
+    # The two-breath regression from the field transcript: answers arrive in
+    # pieces; the machine holds the SAME ask and only the gap is re-asked.
+    say_turn(p, "wine mostly")
+    assert p.clinical.node == "alcohol.qf"
+    assert p.clinical.expect.missing == ("amount", "frequency")
+    say_turn(p, "two or three glasses")
+    spoken = say_turn(p, "most evenings")
+    assert p.clinical.node == "alcohol.edu.permission"
+    assert "wine mostly" in p.clinical.answers["alcohol.qf"]
+
     spoken = say_turn(p, "sure")                          # edu permission
     assert any("12-ounce beer" in s for s in spoken), "standard-drink education"
     spoken = say_turn(p, "yes")                           # AUDIT permission
@@ -133,22 +171,72 @@ def test_full_alcohol_bi_protocol(pipeline):
     assert tail[0][0] == "user", "API window must never start on an assistant turn"
 
 
-def test_ambiguous_answer_clarifies_and_does_not_advance(pipeline, monkeypatch):
+def test_unclear_answer_clarifies_and_does_not_advance(pipeline, monkeypatch):
     p = pipeline
     runtime.start(p.clinical)
     say_turn(p, "yes")            # consent
     node_before = p.clinical.node
     assert node_before == "prescreen.tobacco"
-    # A fuzzy answer with the option-coder forced ambiguous:
-    monkeypatch.setattr(P.llm, "code_option",
-                        lambda q, o, t: {"status": "AMBIGUOUS"})
+    # A fuzzy answer with the NLU forced unclear (no reply -> deterministic
+    # re-ask through the bounded LLMSay fallback):
+    monkeypatch.setattr(P.llm, "turn",
+                        lambda *a, **k: TurnOut(action="unclear", reply=""))
     spoken = say_turn(p, "well, you know how it is")
     assert p.clinical.node == node_before, "ambiguity must not move the machine"
     assert spoken == ["[reflection]"], "one bounded clarification is spoken"
     # Machine still accepts a clean answer afterwards.
-    monkeypatch.undo()
+    monkeypatch.setattr(P.llm, "turn", scripted_turn)
     say_turn(p, "no")
     assert p.clinical.node == "prescreen.alcohol"
+
+
+def test_user_question_is_answered_and_machine_holds(pipeline, monkeypatch):
+    """毛病3: the person asks US something mid-protocol — the reply answers
+    THEM (from state facts) and the machine stays exactly where it was."""
+    p = pipeline
+    runtime.start(p.clinical)
+    say_turn(p, "yes")
+    node_before = p.clinical.node
+    monkeypatch.setattr(P.llm, "turn", lambda *a, **k: TurnOut(
+        action="question",
+        reply="We haven't gone over that yet. Do you smoke or use tobacco?"))
+    spoken = say_turn(p, "have we ever discussed the standard drink definition")
+    assert p.clinical.node == node_before, "a question must not move the machine"
+    assert spoken == ["We haven't gone over that yet. Do you smoke or use tobacco?"]
+    monkeypatch.setattr(P.llm, "turn", scripted_turn)
+    say_turn(p, "no")
+    assert p.clinical.node == "prescreen.alcohol"
+
+
+def test_continuation_is_absorbed_not_reasked(pipeline, monkeypatch):
+    """毛病2: a late addition lands in the PREVIOUS capture; the pending gate
+    is re-posed by the reply, never duplicated by the machine."""
+    p = pipeline
+    runtime.start(p.clinical)
+    for text in ("yes", "no", "within the last year", "none",
+                 "whiskey", "twelve ounces", "hardly ever"):
+        say_turn(p, text)
+    assert p.clinical.node == "alcohol.edu.permission"
+    monkeypatch.setattr(P.llm, "turn", lambda *a, **k: TurnOut(
+        action="continuation", slots={"frequency": "once a week"},
+        reply="Once a week — noted. Would you like that information?"))
+    spoken = say_turn(p, "and i drink once every week")
+    assert p.clinical.node == "alcohol.edu.permission", "machine must hold"
+    assert p.clinical.slots["alcohol.qf"]["frequency"] == "once a week"
+    assert spoken == ["Once a week — noted. Would you like that information?"]
+
+
+def test_answer_ack_is_prepended(pipeline, monkeypatch):
+    """T11: when the NLU produces an acknowledgment for an answer, the person
+    hears it BEFORE the next protocol content."""
+    p = pipeline
+    runtime.start(p.clinical)
+    monkeypatch.setattr(P.llm, "turn", lambda *a, **k: validate(
+        TurnOut(action="answer", code=1, reply="Great, thank you."),
+        p.clinical.expect))
+    spoken = say_turn(p, "yes that works")
+    assert spoken[0] == "Great, thank you."
+    assert "tobacco" in spoken[1], "protocol ask follows the acknowledgment"
 
 
 def test_crisis_phrase_mid_screen_fires_fixed_path(pipeline):
@@ -160,6 +248,19 @@ def test_crisis_phrase_mid_screen_fires_fixed_path(pipeline):
     assert p.clinical.crisis
     from modules.sbirt import crisis as crisis_mod
     assert spoken and spoken[0] == crisis_mod.RESPONSES["suicide"]
+
+
+def test_nlu_flagged_crisis_pauses_protocol(pipeline, monkeypatch):
+    """T14 union: a crisis the regex net missed but the NLU caught must pause
+    the protocol exactly the same way."""
+    p = pipeline
+    runtime.start(p.clinical)
+    say_turn(p, "yes")
+    monkeypatch.setattr(P.llm, "turn",
+                        lambda *a, **k: TurnOut(action="crisis", reply=""))
+    spoken = say_turn(p, "everything is just... very dark lately")
+    assert p.clinical.crisis, "NLU crisis flag must pause the protocol"
+    assert spoken == ["[reflection]"], "crisis turn speaks via the bounded LLM"
 
 
 def test_consent_decline_uses_fixed_decline(pipeline, monkeypatch):
@@ -176,9 +277,9 @@ def test_consent_decline_uses_fixed_decline(pipeline, monkeypatch):
 
 
 def test_generation_budget_full_session(pipeline, monkeypatch):
-    """P6 acceptance: with a warm clip cache, a COMPLETE screening session
+    """P6/T18 acceptance: with a warm clip cache, a COMPLETE screening session
     performs zero FLOAT renders for fixed content — the only runtime renders
-    are the bounded LLM utterances (the dynamic face)."""
+    are the dynamic face (composed slot-asks + the three BI summaries)."""
     p = pipeline
     renders = []
     monkeypatch.setattr(P.avatar, "generate_video",
@@ -189,7 +290,9 @@ def test_generation_budget_full_session(pipeline, monkeypatch):
     say_turn(p, "no")
     say_turn(p, "within the last year")
     say_turn(p, "none")
-    say_turn(p, "wine")                                   # open
+    say_turn(p, "wine")                                   # slot: drink
+    say_turn(p, "two glasses")                            # slot: amount
+    say_turn(p, "weekly")                                 # slot: frequency
     say_turn(p, "yes")                                    # edu perm
     say_turn(p, "yes")                                    # AUDIT perm
     for a in ["2 to 3 times a week", "3 or 4", "less than monthly", "never",
@@ -206,9 +309,10 @@ def test_generation_budget_full_session(pipeline, monkeypatch):
     say_turn(p, "we'll see")                              # leaves -> LLM reflect
     assert p.clinical.node == "closed"
 
-    # Dynamic face of this walk: 3 LLMSay utterances (decisional-balance
-    # summary, ruler summary, closing reflection). Fixed content: 0 renders.
-    assert len(renders) == 3, f"FLOAT ran {len(renders)}x; budget is 3"
+    # Dynamic face of this walk: 3 composed Q/F slot-asks + 3 LLMSay
+    # utterances (decisional-balance summary, ruler summary, closing
+    # reflection). Fixed content: 0 renders.
+    assert len(renders) == 6, f"FLOAT ran {len(renders)}x; budget is 6"
 
 
 def test_every_protocol_clip_is_prewarmed(pipeline, monkeypatch):

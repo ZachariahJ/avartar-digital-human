@@ -30,11 +30,9 @@ _STOP_NOUN = {"alcohol": "alcohol", "drugs": "drugs"}  # "... stop using {x}"
 
 # --------------- Fixed lines, keyed for clip caching ---------------
 FIXED: dict[str, str] = {
-    # Alcohol arm — quantity/frequency exploration + standard-drink education
-    "alcohol.qf": (
-        "What do you like to drink? How much do you usually drink? "
-        "How often do you usually drink?"
-    ),
+    # Alcohol arm — standard-drink education. (The old three-questions-in-one
+    # "alcohol.qf" line is gone: the flow's slot-ask covers drink/amount/
+    # frequency ONE question at a time, phrased by the LLM.)
     "alcohol.edu.permission": (
         "May I provide you some more information about drinking alcohol?"
     ),

@@ -12,7 +12,9 @@ pytest.importorskip("funasr")
 pytest.importorskip("torch")
 
 import modules.pipeline as P
+from modules import llm
 from modules.sbirt import runtime
+from modules.sbirt.turn import TurnOut, expected_item, validate
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -22,35 +24,54 @@ def load(name):
         return json.load(f)
 
 
-def stub_pipeline(monkeypatch, consent_fn=None):
+def scripted_turn(user_text, expect, *, ask_text, history, patient=None,
+                  facts=None):
+    """Deterministic NLU stand-in (same shape as test_pipeline_protocol's)."""
+    t = user_text.strip().lower()
+    if expect.kind == "consent":
+        code = (1 if t.startswith(("yes", "sure"))
+                else (0 if t.startswith("no") else None))
+        out = (TurnOut(action="answer", code=code) if code is not None
+               else TurnOut(action="unclear", reply=""))
+    elif expect.kind == "option":
+        pre = llm._prematch_option(expected_item(expect).options, user_text)
+        out = (TurnOut(action="answer", code=pre) if pre is not None
+               else TurnOut(action="unclear", reply=""))
+    elif expect.kind == "number":
+        got = llm.code_number(user_text)
+        out = (TurnOut(action="answer", code=got["value"])
+               if "value" in got else TurnOut(action="unclear", reply=""))
+    else:
+        out = TurnOut(action="answer", text=user_text)
+    return validate(out, expect)
+
+
+def stub_pipeline(monkeypatch, turn_fn=None):
     monkeypatch.setattr(P, "ensure_fixed_clip", lambda text, path: "/fake.mp4")
     monkeypatch.setattr(P.tts, "synthesize", lambda text, out, ev=None: "/fake.wav")
     monkeypatch.setattr(P.avatar, "generate_video", lambda *a, **k: "/fake.mp4")
     monkeypatch.setattr(P.llm, "phrase_utterance", lambda *a, **k: "[r]")
     monkeypatch.setattr(P.llm, "extract_patient_facts", lambda h: {})
     monkeypatch.setattr(P.privacy, "record_consent", lambda *a: True)
-    monkeypatch.setattr(P.llm, "classify_consent", consent_fn or (
-        lambda text, question=None:
-        "yes" if text.lower().startswith(("yes", "sure")) else
-        ("no" if text.lower().startswith("no") else "unclear")))
+    monkeypatch.setattr(P.llm, "turn", turn_fn or scripted_turn)
     return P.Pipeline()
 
 
 def test_superseded_turn_cannot_advance_machine(monkeypatch):
-    """Turn A (slow coder, would answer 'yes') is superseded by turn B ('no').
+    """Turn A (slow NLU, would answer 'yes') is superseded by turn B ('no').
     Protocol turns are serialized: B queues on the lock while A stalls; when A
     resumes it must notice it was superseded and NEVER advance the machine —
     the final state is B's decline, not A's consent-yes. Without the lock +
     staleness re-check, A's advance() lands after B's and corrupts the flow."""
     barrier = threading.Event()
 
-    def slow_then_fast(text, question=None):
-        if text == "yes slow":
-            barrier.wait(timeout=5)      # A stalls inside its coding call
-            return "yes"
-        return "no"
+    def slow_then_fast(user_text, expect, **kw):
+        if user_text == "yes slow":
+            barrier.wait(timeout=5)      # A stalls inside its NLU call
+            return TurnOut(action="answer", code=1)
+        return TurnOut(action="answer", code=0)
 
-    p = stub_pipeline(monkeypatch, consent_fn=slow_then_fast)
+    p = stub_pipeline(monkeypatch, turn_fn=slow_then_fast)
     runtime.start(p.clinical)
 
     p.on_speech_end_text("yes slow")     # turn A: enters the lock, stalls
@@ -79,10 +100,11 @@ def test_concurrent_sessions_never_cross(monkeypatch):
     monkeypatch.setattr(P.llm, "phrase_utterance", lambda *a, **k: "[r]")
     monkeypatch.setattr(P.llm, "extract_patient_facts", lambda h: {})
     monkeypatch.setattr(P.privacy, "record_consent", lambda *a: True)
-    monkeypatch.setattr(P.llm, "classify_consent",
-                        lambda text, question=None: "yes")
+    monkeypatch.setattr(P.llm, "turn", scripted_turn)
 
-    alcohol = ["yes", "no", "within the last year", "none", "wine", "yes", "yes",
+    alcohol = ["yes", "no", "within the last year", "none",
+               "wine", "two glasses", "weekly",          # Q/F slots, one each
+               "yes", "yes",
                "2 to 3 times a week", "3 or 4", "less than monthly", "never",
                "less than monthly", "never", "less than monthly", "never",
                "no", "yes, but not in the last year",

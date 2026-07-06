@@ -1,5 +1,6 @@
-"""Constrained NLU coding (P4): deterministic pre-pass, strict JSON handling,
-never-guess semantics. LLM calls are faked — no network in tests."""
+"""Constrained NLU (P4 -> T4): deterministic pre-pass, strict JSON handling,
+never-guess semantics — now through the ONE llm.turn() call whose output is
+gated by turn.validate. LLM calls are faked — no network in tests."""
 
 import json
 from types import SimpleNamespace
@@ -10,6 +11,8 @@ pytest.importorskip("openai")
 
 from modules import llm
 from modules.sbirt.instruments import AUDIT, DAST_10
+from modules.sbirt.runtime import Expect
+from modules.sbirt.turn import TurnOut
 
 
 def fake_client(replies):
@@ -27,6 +30,18 @@ def fake_client(replies):
         completions=SimpleNamespace(create=create)))
     client.calls = calls
     return client
+
+
+def forbid_llm(monkeypatch):
+    def boom():
+        raise AssertionError("LLM must not be called on a deterministic path")
+    monkeypatch.setattr(llm, "_client", boom)
+
+
+def turn_kwargs(**over):
+    kw = dict(ask_text="q?", history=[], patient=None, facts={})
+    kw.update(over)
+    return kw
 
 
 # ---------------- deterministic pre-match (no LLM at all) ----------------
@@ -47,70 +62,18 @@ def test_prematch_binary_yes_no():
     assert llm._prematch_option(opts, "well sometimes") is None
 
 
+def test_prematch_binary_shortcut_needs_short_utterance():
+    # "yes but ..." may carry a question or a caveat — the LLM must see it.
+    opts = DAST_10.items[0].options
+    assert llm._prematch_option(opts, "yes but only weed on weekends") is None
+
+
 def test_prematch_binary_shortcut_only_for_no_yes_items():
     # AUDIT item 9 options are timeframed (No / Yes-not-last-year / Yes-last-
     # year): a bare "yes" must NOT shortcut — the timeframe is undetermined.
     opts = AUDIT.items[8].options
     assert llm._prematch_option(opts, "yes") is None
     assert llm._prematch_option(opts, "no") == 0   # exact label match is fine
-
-
-def test_code_option_uses_prematch_without_llm(monkeypatch):
-    def boom():
-        raise AssertionError("LLM must not be called for an exact match")
-    monkeypatch.setattr(llm, "_client", boom)
-    out = llm.code_option("q", AUDIT.items[0].options, "monthly or less")
-    assert out == {"code": 1}
-
-
-# ---------------- strict-JSON LLM coding ----------------
-
-def test_code_option_valid_json(monkeypatch):
-    monkeypatch.setattr(llm, "_client", lambda: fake_client(
-        ['{"option": 2, "confidence": 0.9}']))
-    out = llm.code_option("q", AUDIT.items[0].options, "a few times a month")
-    assert out == {"code": 2}
-
-
-def test_code_option_low_confidence_is_ambiguous(monkeypatch):
-    monkeypatch.setattr(llm, "_client", lambda: fake_client(
-        ['{"option": 2, "confidence": 0.3}']))
-    out = llm.code_option("q", AUDIT.items[0].options, "hmm sometimes")
-    assert out == {"status": "AMBIGUOUS"}
-
-
-def test_code_option_explicit_ambiguous(monkeypatch):
-    monkeypatch.setattr(llm, "_client", lambda: fake_client(
-        ['{"status": "AMBIGUOUS", "reason": "no timeframe"}']))
-    # The case-card item-10 answer: "told me once or twice ... sometimes"
-    out = llm.code_option("q", AUDIT.items[9].options,
-                          "my spouse has told me once or twice that I drink too much")
-    assert out == {"status": "AMBIGUOUS"}
-
-
-def test_code_option_retries_invalid_then_succeeds(monkeypatch):
-    client = fake_client(["not json at all", '{"option": 1, "confidence": 0.8}'])
-    monkeypatch.setattr(llm, "_client", lambda: client)
-    out = llm.code_option("q", AUDIT.items[0].options, "monthly-ish")
-    assert out == {"code": 1}
-    assert len(client.calls) == 2
-
-
-def test_code_option_out_of_range_twice_is_ambiguous(monkeypatch):
-    monkeypatch.setattr(llm, "_client", lambda: fake_client(
-        ['{"option": 9, "confidence": 0.9}', '{"option": -1, "confidence": 0.9}']))
-    out = llm.code_option("q", AUDIT.items[0].options, "whatever")
-    assert out == {"status": "AMBIGUOUS"}
-
-
-def test_code_option_llm_error_is_ambiguous(monkeypatch):
-    def create(**kwargs):
-        raise RuntimeError("network down")
-    client = SimpleNamespace(chat=SimpleNamespace(
-        completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr(llm, "_client", lambda: client)
-    out = llm.code_option("q", AUDIT.items[0].options, "some answer")
-    assert out == {"status": "AMBIGUOUS"}, "coder failure must clarify, never guess"
 
 
 # ---------------- readiness ruler (deterministic only) ----------------
@@ -129,10 +92,122 @@ def test_code_number(text, expected):
     assert llm.code_number(text) == expected
 
 
-def test_consent_question_is_parameterized(monkeypatch):
-    client = fake_client(["yes"])
+# ---------------- turn(): deterministic fast paths (zero LLM) ----------------
+
+def test_turn_consent_prepass_no_llm(monkeypatch):
+    forbid_llm(monkeypatch)
+    exp = Expect("consent", ask_key="alcohol.edu.permission")
+    assert llm.turn("Sure.", exp, **turn_kwargs()).code == 1
+    assert llm.turn("no thank you", exp, **turn_kwargs()).code == 0
+    out = llm.turn("yes", exp, **turn_kwargs())
+    assert out.action == "answer" and out.reply == ""
+
+
+def test_turn_option_prepass_no_llm(monkeypatch):
+    forbid_llm(monkeypatch)
+    exp = Expect("option", instrument="audit", item_index=0)
+    out = llm.turn("monthly or less", exp, **turn_kwargs())
+    assert out.action == "answer" and out.code == 1
+
+
+def test_turn_number_prepass_no_llm(monkeypatch):
+    forbid_llm(monkeypatch)
+    exp = Expect("number", ask_key="bi.ruler")
+    out = llm.turn("an 8 I guess", exp, **turn_kwargs())
+    assert out.action == "answer" and out.code == 8
+
+
+# ---------------- turn(): strict-JSON LLM path ----------------
+
+def _j(**kw):
+    base = {"action": "answer", "code": None, "slots": {}, "text": None,
+            "reply": ""}
+    base.update(kw)
+    return json.dumps(base)
+
+
+def test_turn_valid_option_answer(monkeypatch):
+    monkeypatch.setattr(llm, "_client", lambda: fake_client(
+        [_j(code=2, reply="A few times a month — thanks.")]))
+    exp = Expect("option", instrument="audit", item_index=0)
+    out = llm.turn("a few times a month", exp, **turn_kwargs())
+    assert out.action == "answer" and out.code == 2
+    assert out.reply.startswith("A few times")
+
+
+def test_turn_out_of_range_code_downgrades_to_unclear(monkeypatch):
+    monkeypatch.setattr(llm, "_client", lambda: fake_client(
+        [_j(code=9, reply="Roughly how often?")]))
+    exp = Expect("option", instrument="audit", item_index=0)
+    out = llm.turn("whatever", exp, **turn_kwargs())
+    assert out.action == "unclear" and out.code is None
+    assert out.reply == "Roughly how often?", "model's re-ask is kept"
+
+
+def test_turn_no_timeframe_stays_unclear(monkeypatch):
+    # The case-card AUDIT item-10 rule: "told me once or twice ... sometimes"
+    # must clarify, never guess a timeframed option.
+    monkeypatch.setattr(llm, "_client", lambda: fake_client(
+        [_j(action="unclear", reply="Was that within the last year?")]))
+    exp = Expect("option", instrument="audit", item_index=9)
+    out = llm.turn("my spouse has told me once or twice that I drink too much",
+                   exp, **turn_kwargs())
+    assert out.action == "unclear" and out.code is None
+
+
+def test_turn_retries_invalid_json_then_succeeds(monkeypatch):
+    client = fake_client(["not json at all", _j(code=1, reply="Okay.")])
     monkeypatch.setattr(llm, "_client", lambda: client)
-    assert llm.classify_consent("sure go ahead",
-                                question="May I provide you some more information?") == "yes"
+    exp = Expect("option", instrument="audit", item_index=0)
+    out = llm.turn("monthly-ish", exp, **turn_kwargs())
+    assert out.action == "answer" and out.code == 1
+    assert len(client.calls) == 2
+
+
+def test_turn_llm_error_is_unclear_never_guess(monkeypatch):
+    def create(**kwargs):
+        raise RuntimeError("network down")
+    client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(llm, "_client", lambda: client)
+    exp = Expect("option", instrument="audit", item_index=0)
+    out = llm.turn("some answer", exp, **turn_kwargs())
+    assert out.action == "unclear" and out.reply == "", \
+        "NLU failure must clarify, never guess"
+
+
+def test_turn_question_action_passthrough(monkeypatch):
+    monkeypatch.setattr(llm, "_client", lambda: fake_client(
+        [_j(action="question", code=1,
+            reply="We haven't gone over it yet. Shall we continue?")]))
+    exp = Expect("consent", ask_key="alcohol.screen.permission")
+    out = llm.turn("have we ever discussed the standard drink definition?",
+                   exp, **turn_kwargs())
+    assert out.action == "question"
+    assert out.code is None, "a question must carry no coded answer"
+    assert "haven't gone over it" in out.reply
+
+
+def test_turn_slot_extraction_filters_undeclared(monkeypatch):
+    monkeypatch.setattr(llm, "_client", lambda: fake_client(
+        [_j(slots={"drink": "whiskey", "amount": "12 oz", "bogus": "x"},
+            reply="Whiskey, twelve ounces — got it.")]))
+    exp = Expect("open", ask_key="alcohol.qf",
+                 slots=("drink", "amount", "frequency"),
+                 missing=("drink", "amount", "frequency"))
+    out = llm.turn("i like whiskey and i drink twelve oun per time",
+                   exp, **turn_kwargs())
+    assert out.action == "answer"
+    assert out.slots == {"drink": "whiskey", "amount": "12 oz"}
+
+
+def test_turn_prompt_carries_ask_and_facts(monkeypatch):
+    client = fake_client([_j(code=1)])
+    monkeypatch.setattr(llm, "_client", lambda: client)
+    exp = Expect("consent", ask_key="alcohol.screen.permission")
+    llm.turn("hmm okay I suppose so", exp, **turn_kwargs(
+        ask_text="May I ask you a few more questions?",
+        facts={"standard_drink_definition_discussed": False}))
     sent = client.calls[0]["messages"][0]["content"]
-    assert "May I provide you some more information?" in sent
+    assert "May I ask you a few more questions?" in sent
+    assert '"standard_drink_definition_discussed": false' in sent

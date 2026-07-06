@@ -1,27 +1,32 @@
-"""Runtime clinical state machine (P3) — the study protocol as executable code.
+"""The generic turn engine (T6): ONE interpreter over the declarative
+protocol program in flow.py — no per-question handler code anywhere.
 
-Until now the SBIRT flow existed only as prose inside the system prompt and the
-LLM improvised its way through it. This module makes the protocol operative:
-question order, skip rules, arm selection (AUDIT vs DAST), feedback routing and
-the brief-intervention sequence are DETERMINISTIC transitions over coded input.
-The LLM's remaining conversational jobs are emitted explicitly as `LLMSay`
-directives — a single node-scoped utterance (reflect / summarize / ask the one
-parameterized question) — never a protocol decision.
+Until now every protocol node had its own `_on_xxx` handler that hard-wired
+the next node. Now the protocol IS data (flow.PROTOCOL) and this module is
+the only executor: it walks steps, collects the utterances of a turn, pauses
+wherever user input is needed, and consumes exactly ONE validated TurnOut per
+turn. The LLM's understanding of an utterance arrives ONLY as a validated
+`turn.TurnOut`; the pointer, the scores, the zones, the skip rules and every
+branch remain deterministic code (instruments.py / flow.py).
 
 Contract with the pipeline:
   • `ClinicalSession` is per-user mutable state (owned by the Pipeline).
-  • `advance(session, kind, value) -> Step` consumes ONE coded user input
-    (kind matches `session.expect.kind`) and returns what to say next +
-    what to expect. Coding free text is the NLU layer's job (llm.py).
+  • `advance(session, out)` consumes ONE VALIDATED answer (turn.validate
+    guarantees legality for the current expectation) and returns the next
+    Step: what to say + what to expect next.
+  • `absorb(session, out)` folds a `continuation` into the most recent open
+    capture WITHOUT moving the machine (the two-breath answer fix).
   • `enter_crisis(session)` — the deterministic crisis net (crisis.py) or the
-    coder may call this at ANY point; the protocol then pauses permanently for
+    NLU may call this at ANY point; the protocol then pauses permanently for
     the session and every later turn is an LLM crisis-protocol turn. There is
-    deliberately no automatic resume (a human-review decision, not a pattern's).
-  • Unclear / ambiguous answers do NOT advance the machine: the pipeline
-    re-asks via `repeat_step()` (optionally with a clarification preface).
+    deliberately no automatic resume (a human-review decision, not a
+    pattern's).
+  • question / tangent / unclear turns never reach this module: the pipeline
+    speaks the bounded reply and the machine holds (`repeat_step` re-emits
+    the pause if a re-ask is needed).
 
-This machine is pure Python over instruments.py / templates.py —
-no LLM, no IO — so every branch is testable against the case cards.
+Pure Python over flow.py / instruments.py / templates.py — no LLM, no IO —
+so every branch is testable against the case cards.
 """
 
 from __future__ import annotations
@@ -30,18 +35,16 @@ import logging
 from dataclasses import dataclass, field
 
 from . import templates
-from .instruments import (assess, Assessment, BY_KEY, InvalidResponse, Item,
+from .flow import (ARM_INSTRUMENT, ARM_ORDER, Ask, End, Gate, Label, PROTOCOL,
+                   RunItems, Route, Tell, close_unit, label_index)
+from .instruments import (assess, Assessment, BY_KEY, InvalidResponse,
                           next_item_index, option_score, PRE_SCREEN)
+from .turn import TurnOut
 
 logger = logging.getLogger(__name__)
 
-# Which full instrument each positive pre-screen arm opens (protocol order:
-# alcohol before drugs, matching the study dialogue).
-ARM_INSTRUMENT = {"alcohol": "audit", "drugs": "dast_10"}
-ARM_ORDER = ("alcohol", "drugs")
 
-
-# --------------- Directives the machine emits ---------------
+# --------------- What a turn can speak ---------------
 
 @dataclass(frozen=True)
 class Say:
@@ -59,11 +62,21 @@ class LLMSay:
 
 
 @dataclass(frozen=True)
+class Speak:
+    """Already-resolved dynamic text (e.g. the NLU turn's acknowledgment).
+    Rendered per-turn, never cached (it depends on what the user just said)."""
+    text: str
+
+
+@dataclass(frozen=True)
 class Expect:
-    """What the next user input means (drives the NLU coder)."""
+    """What the next user input means (drives the NLU turn call)."""
     kind: str                        # consent | option | number | open | end
     instrument: str | None = None    # for kind="option": instrument key or "prescreen"
     item_index: int | None = None    # for kind="option"
+    ask_key: str | None = None       # the Gate/Ask this pause belongs to
+    slots: tuple[str, ...] = ()      # declared slots of a slot-ask
+    missing: tuple[str, ...] = ()    # slots still unfilled (ask ONE at a time)
 
 
 @dataclass(frozen=True)
@@ -82,6 +95,7 @@ class ProtocolError(RuntimeError):
 
 @dataclass
 class ClinicalSession:
+    pc: int = 0                                # index of the paused step
     node: str = "consent"
     expect: Expect = field(default_factory=lambda: Expect("consent"))
     consent: str | None = None                 # "yes" | "no"
@@ -92,6 +106,10 @@ class ClinicalSession:
     assessments: dict[str, Assessment] = field(default_factory=dict)
     readiness: dict[str, int] = field(default_factory=dict)   # arm -> 0..10
     declined: list[str] = field(default_factory=list)         # declined permission keys (audit)
+    covered: set[str] = field(default_factory=set)            # delivered unit ids (T9)
+    answers: dict[str, str] = field(default_factory=dict)     # open captures (in-memory only)
+    slots: dict[str, dict[str, str]] = field(default_factory=dict)  # slot captures
+    last_ask_key: str | None = None            # target for continuation absorption
     crisis: bool = False
     last_step: Step | None = None
 
@@ -100,7 +118,8 @@ class ClinicalSession:
 
     def to_audit_dict(self) -> dict:
         """Structured, non-free-text summary for the audit record (P7b):
-        codes/scores/zones only — no transcripts."""
+        codes/scores/zones only — open captures appear as KEYS (what was
+        answered), never as text (no transcripts)."""
         return {
             "node": self.node,
             "consent": self.consent,
@@ -112,44 +131,229 @@ class ClinicalSession:
             },
             "readiness": dict(self.readiness),
             "declined": list(self.declined),
+            "covered": sorted(self.covered),
+            "answered": sorted(self.answers),
+            "slots_filled": {k: sorted(v) for k, v in self.slots.items()},
             "crisis": self.crisis,
         }
 
 
-# --------------- Helpers ---------------
+# --------------- @resolvers: state-dependent units/asks ---------------
+# The closed vocabulary here is locked by tests/test_flow_contract.py — a new
+# @name in the program without a resolver arm below fails that test first.
 
-def _fixed(key: str) -> Say:
-    return Say(key, templates.FIXED[key])
+def _resolve_say(session: ClinicalSession, name: str) -> Say:
+    arm = session.arm
+    if name == "@alcohol.screen.permission":
+        # T9: only claim "the standard drink definition we just discussed"
+        # if the education unit was actually delivered this session.
+        key = ("alcohol.screen.permission"
+               if "alcohol.edu.standard_drink" in session.covered
+               else "alcohol.screen.permission.no_defn")
+        return Say(key, templates.FIXED[key])
+    if name == "@feedback":
+        instrument_key = ARM_INSTRUMENT[arm]
+        zone = session.assessments[instrument_key].zone
+        return Say(f"feedback.{instrument_key}.{zone}",
+                   templates.feedback_text(instrument_key, zone))
+    if name == "@bi.permission":
+        return Say(f"bi.permission.{arm}", templates.bi_permission(arm))
+    if name == "@bi.likes":
+        return Say(f"bi.likes.{arm}", templates.bi_likes(arm))
+    if name == "@bi.dislikes":
+        return Say(f"bi.dislikes.{arm}", templates.bi_dislikes(arm))
+    if name == "@bi.recommend":
+        return Say(f"bi.recommend.{arm}", templates.bi_recommend(arm))
+    if name == "@bi.ruler":
+        return Say(f"bi.ruler.{arm}", templates.bi_ruler(arm))
+    if name == "@bi.why_not_lower":
+        v = session.readiness[arm]
+        return Say(f"bi.why_not_lower.{v}", templates.bi_why_not_lower(v))
+    if name == "@bi.why_not_higher":
+        v = session.readiness[arm]
+        return Say(f"bi.why_not_higher.{v}", templates.bi_why_not_higher(v))
+    if name == "@close":
+        key = close_unit(session)
+        return Say(key, templates.FIXED[key])
+    raise ProtocolError(f"unknown resolver {name!r}")
 
 
-def _item_say(instrument_key: str, index: int, item: Item) -> Say:
-    return Say(f"{instrument_key}.item.{index}", item.text)
+def _points_instruction(session: ClinicalSession, unit: templates.Unit) -> str:
+    """Instruction for a non-verbatim unit: the reviewable points plus the
+    person's own captured words as grounding (their words, not paraphrase
+    fodder from the model's imagination)."""
+    ground = []
+    a = session.answers
+    if unit.id == "bi.summary.balance":
+        ground = [f"They LIKE: {a.get('bi.likes', '(not captured)')}",
+                  f"They DISLIKE: {a.get('bi.dislikes', '(not captured)')}"]
+    elif unit.id == "bi.summary.rulers":
+        ground = [f"Readiness {session.readiness.get(session.arm, '?')}/10.",
+                  f"Why not lower: {a.get('bi.why_not_lower', '(not captured)')}",
+                  f"Why not higher: {a.get('bi.why_not_higher', '(not captured)')}"]
+    elif unit.id == "bi.reflect":
+        ground = [f"They said: {a.get('bi.leaves_you', '(not captured)')}"]
+    return " ".join(unit.points) + (("\n" + "\n".join(ground)) if ground else "")
 
 
-def _step(session: ClinicalSession, node: str, utterances: list,
-          expect: Expect) -> Step:
+def _tell_beats(session: ClinicalSession, unit: str) -> list:
+    if unit.startswith("@"):
+        say = _resolve_say(session, unit)
+        session.covered.add(say.key)
+        return [say]
+    if unit in templates.POINTS_UNITS:
+        session.covered.add(unit)
+        return [LLMSay(_points_instruction(session,
+                                           templates.POINTS_UNITS[unit]))]
+    session.covered.add(unit)
+    return [Say(unit, templates.FIXED[unit])]
+
+
+def _ask_beats(session: ClinicalSession, step: Ask,
+               missing: tuple[str, ...]) -> list:
+    """The utterance that poses an Ask (nothing for ask='included' — a
+    preceding Tell already spoke the question)."""
+    if step.ask == "included":
+        return []
+    if step.ask == "fixed":
+        if step.key.startswith("@"):
+            return [_resolve_say(session, step.key)]
+        return [Say(step.key, templates.FIXED[step.key])]
+    # ask == "compose": the LLM phrases it. Slot-asks ask ONE missing slot
+    # at a time (never a stacked question); plain composes fill {slot}s
+    # from captured state.
+    if step.slots:
+        point = dict(step.slot_points)[missing[0]]
+        return [LLMSay("Ask the person, in one short natural question, "
+                       f"{point}. Ask nothing else.")]
+    instruction = " ".join(step.points).format(
+        drugs_kind=session.answers.get("drugs.kind", "the drugs they use"))
+    return [LLMSay(instruction)]
+
+
+# --------------- Pause bookkeeping ---------------
+
+def _pause(session: ClinicalSession, node: str, beats: list,
+           expect: Expect) -> Step:
     session.node = node
     session.expect = expect
-    step = Step(node, tuple(utterances), expect)
+    step = Step(node, tuple(beats), expect)
     session.last_step = step
     logger.info("[clinical] -> %s (expect %s)", node, expect.kind)
     return step
 
 
 def repeat_step(session: ClinicalSession) -> Step:
-    """Re-emit the current step (after an ambiguous answer, the pipeline
-    clarifies and asks again; the machine does not move)."""
+    """Re-emit the current pause (after a hold turn the pipeline may need to
+    re-pose the ask; the machine does not move)."""
     if session.last_step is None:
         return start(session)
     return session.last_step
 
 
-# --------------- Entry ---------------
+# --------------- The interpreter ---------------
+
+def _ask_key(step: Ask) -> str:
+    """Canonical capture/node key of an Ask: the '@' marks how the ask TEXT
+    resolves (per-arm Say), never how the capture is keyed."""
+    return step.key.lstrip("@")
+
+
+def _ask_missing(session: ClinicalSession, step: Ask) -> tuple[str, ...]:
+    filled = session.slots.get(_ask_key(step), {})
+    return tuple(s for s in step.slots if s not in filled)
+
+
+def _run(session: ClinicalSession, beats: list) -> Step:
+    """Execute steps from session.pc, collecting utterances, until a step
+    needs user input (pause) or the program ends."""
+    while True:
+        step = PROTOCOL[session.pc]
+
+        if isinstance(step, Label):
+            session.pc += 1
+
+        elif isinstance(step, Route):
+            target = step.fn(session)
+            session.pc = label_index(target)
+
+        elif isinstance(step, Tell):
+            beats.extend(_tell_beats(session, step.unit))
+            session.pc += 1
+
+        elif isinstance(step, Gate):
+            key = step.key
+            if key.startswith("@"):
+                resolved = _resolve_say(session, key)
+                if not step.ask_included:
+                    beats.append(resolved)
+                key = resolved.key
+            elif not step.ask_included:
+                beats.append(Say(key, templates.FIXED[key]))
+            return _pause(session, key, beats,
+                          Expect("consent", ask_key=key))
+
+        elif isinstance(step, Ask):
+            missing = _ask_missing(session, step) if step.slots else ()
+            beats.extend(_ask_beats(session, step, missing))
+            kind = "number" if step.kind == "number" else "open"
+            key = _ask_key(step)
+            return _pause(session, key, beats,
+                          Expect(kind, ask_key=key,
+                                 slots=step.slots, missing=missing))
+
+        elif isinstance(step, RunItems):
+            itemset = step.itemset
+            if itemset == "prescreen":
+                idx = next((i for i in range(len(PRE_SCREEN))
+                            if PRE_SCREEN[i].key not in session.prescreen),
+                           None)
+                if idx is None:
+                    session.pc += 1
+                    continue
+                q = PRE_SCREEN[idx]
+                beats.append(Say(f"prescreen.{q.key}", q.item.text))
+                return _pause(session, f"prescreen.{q.key}", beats,
+                              Expect("option", instrument="prescreen",
+                                     item_index=idx))
+            instrument = BY_KEY[itemset]
+            responses = session.responses.setdefault(itemset, {})
+            idx = next_item_index(instrument, responses)
+            if idx is None:
+                assessment = assess(instrument, responses)
+                session.assessments[itemset] = assessment
+                logger.info("[clinical] %s complete: score=%d zone=%s",
+                            itemset, assessment.score, assessment.zone)
+                session.pc += 1
+                continue
+            preamble_key = f"{itemset}.preamble"
+            if (instrument.preamble and not responses
+                    and preamble_key not in session.covered):
+                session.covered.add(preamble_key)
+                beats.append(Say(preamble_key, instrument.preamble))
+            item = instrument.items[idx]
+            beats.append(Say(f"{itemset}.item.{idx}", item.text))
+            return _pause(session, f"screening.{itemset}.{idx}", beats,
+                          Expect("option", instrument=itemset,
+                                 item_index=idx))
+
+        elif isinstance(step, End):
+            if step.close:
+                beats.extend(_tell_beats(session, step.close))
+            return _pause(session, step.node, beats, Expect("end"))
+
+        else:  # pragma: no cover — program integrity tests prevent this
+            raise ProtocolError(f"unknown step type at pc={session.pc}")
+
+
+# --------------- Entry / crisis ---------------
 
 def start(session: ClinicalSession) -> Step:
     """The fixed greeting (config.GREETING_TEXT, delivered by the pipeline)
     already asked for consent; the machine starts by expecting that answer."""
-    return _step(session, "consent", [], Expect("consent"))
+    session.pc = 0
+    return _pause(session, "consent", [],
+                  Expect("consent", ask_key="consent.opening"))
 
 
 def enter_crisis(session: ClinicalSession) -> Step:
@@ -157,7 +361,7 @@ def enter_crisis(session: ClinicalSession) -> Step:
     The pipeline speaks the fixed crisis response (crisis.py); every later
     turn is an LLM crisis-protocol turn."""
     session.crisis = True
-    return _step(session, "crisis", [], Expect("open"))
+    return _pause(session, "crisis", [], Expect("open"))
 
 
 _CRISIS_INSTRUCTION = (
@@ -168,271 +372,118 @@ _CRISIS_INSTRUCTION = (
 )
 
 
-# --------------- Node handlers ---------------
-
-def _on_consent(session: ClinicalSession, value) -> Step:
-    if value == "no":
-        session.consent = "no"
-        # The fixed decline text (config.DECLINE_TEXT) is spoken by the
-        # pipeline's existing decline path; the machine just terminates.
-        return _step(session, "declined", [], Expect("end"))
-    session.consent = "yes"
-    return _ask_prescreen(session, 0)
+def crisis_step(session: ClinicalSession) -> Step:
+    """One LLM crisis-protocol turn — every turn while the session is in
+    crisis (whether the deterministic net or the NLU flagged it)."""
+    return _pause(session, "crisis", [LLMSay(_CRISIS_INSTRUCTION)],
+                  Expect("open"))
 
 
-def _ask_prescreen(session: ClinicalSession, index: int) -> Step:
-    q = PRE_SCREEN[index]
-    return _step(session, f"prescreen.{q.key}",
-                 [Say(f"prescreen.{q.key}", q.item.text)],
-                 Expect("option", instrument="prescreen", item_index=index))
+# --------------- Consuming validated input ---------------
+
+def _consume(session: ClinicalSession, out: TurnOut) -> None:
+    """Apply ONE validated answer to the paused step and move the pointer.
+    Raises ProtocolError when the payload doesn't fit the pause — that is
+    always pipeline wiring gone wrong, never user ambiguity (turn.validate
+    already downgraded anything ambiguous)."""
+    step = PROTOCOL[session.pc]
+
+    if isinstance(step, Gate):
+        if out.code not in (0, 1):
+            raise ProtocolError(
+                f"gate {session.node!r} needs yes(1)/no(0), got {out.code!r}")
+        key = session.expect.ask_key or step.key
+        if key == "consent.opening":
+            session.consent = "yes" if out.code == 1 else "no"
+        if out.code == 1:
+            session.pc += 1
+        else:
+            session.declined.append(key)
+            session.pc = label_index(step.on_no)
+        return
+
+    if isinstance(step, Ask):
+        key = _ask_key(step)
+        if step.kind == "number":
+            if not isinstance(out.code, int) or not 0 <= out.code <= 10:
+                raise ProtocolError(f"ruler needs 0-10, got {out.code!r}")
+            session.answers[key] = str(out.code)
+            session.readiness[session.arm] = out.code
+            session.last_ask_key = key
+            session.pc += 1
+            return
+        # Open ask: EVERY capture lands in state (no discarded turns).
+        if step.slots:
+            if not out.slots:
+                # turn.validate maps a bare text answer onto the asked slot,
+                # so a slotless answer here means UNVALIDATED input — fail
+                # loudly instead of holding this ask forever.
+                raise ProtocolError(
+                    f"slot ask {key!r} got no slots — unvalidated input?")
+            store = session.slots.setdefault(key, {})
+            store.update(out.slots)
+            session.last_ask_key = key
+            if _ask_missing(session, step):
+                return                    # hold: ask the next missing slot
+            session.answers[key] = "; ".join(
+                f"{s}: {store[s]}" for s in step.slots)
+            session.pc += 1
+            return
+        if not out.text:
+            raise ProtocolError(f"open ask {key!r} got empty capture")
+        session.answers[key] = out.text
+        session.last_ask_key = key
+        session.pc += 1
+        return
+
+    if isinstance(step, RunItems):
+        exp = session.expect
+        if exp.kind != "option" or exp.item_index is None:
+            raise ProtocolError(f"item pause expected option, got {out!r}")
+        code = out.code
+        if not isinstance(code, int):
+            raise ProtocolError(f"item {exp.item_index} needs an int code")
+        if exp.instrument == "prescreen":
+            q = PRE_SCREEN[exp.item_index]
+            if not 0 <= code < len(q.item.options):
+                raise ProtocolError(f"prescreen {q.key}: invalid code {code}")
+            session.prescreen[q.key] = code
+            return                        # RunItems loops to the next item
+        instrument = BY_KEY[exp.instrument]
+        # Validates the code against the instrument (raises InvalidResponse
+        # on a coder bug rather than silently mis-scoring).
+        option_score(instrument, exp.item_index, code)
+        session.responses[exp.instrument][exp.item_index] = code
+        return                            # RunItems loops / completes
+
+    raise ProtocolError(
+        f"no input expected at pc={session.pc} ({type(step).__name__})")
 
 
-def _on_prescreen(session: ClinicalSession, value) -> Step:
-    index = session.expect.item_index
-    q = PRE_SCREEN[index]
-    code = int(value)
-    if not 0 <= code < len(q.item.options):
-        raise ProtocolError(f"prescreen {q.key}: invalid code {code}")
-    session.prescreen[q.key] = code
-    if index + 1 < len(PRE_SCREEN):
-        return _ask_prescreen(session, index + 1)
-    # All three answered: queue positive arms in protocol order. Pre-screen
-    # options are (negative, positive) with scores 0/1, so code > 0 = positive.
-    session.arms = [arm for arm in ARM_ORDER if session.prescreen.get(arm, 0) > 0]
-    if not session.arms:
-        return _close(session, prefix=[_fixed("prescreen.all_negative")])
-    return _start_arm(session)
-
-
-def _start_arm(session: ClinicalSession) -> Step:
-    session.arm = session.arms.pop(0)
-    if session.arm == "alcohol":
-        return _step(session, "alcohol.qf", [_fixed("alcohol.qf")],
-                     Expect("open"))
-    return _step(session, "drugs.kind", [_fixed("drugs.kind")], Expect("open"))
-
-
-def _finish_arm(session: ClinicalSession, prefix: list | None = None) -> Step:
-    if session.arms:
-        head = list(prefix or [])
-        step = _start_arm(session)
-        if head:  # prepend transition utterances to the new arm's first step
-            step = Step(step.node, tuple(head) + step.utterances, step.expect)
-            session.last_step = step
-        return step
-    return _close(session, prefix=prefix)
-
-
-def _close(session: ClinicalSession, prefix: list | None = None) -> Step:
-    utterances = list(prefix or []) + [_fixed("close")]
-    return _step(session, "closed", utterances, Expect("end"))
-
-
-# --- Alcohol arm: Q/F exploration -> education -> AUDIT permission ---
-
-def _on_alcohol_qf(session: ClinicalSession, value) -> Step:
-    return _step(session, "alcohol.edu.permission",
-                 [_fixed("alcohol.edu.permission")], Expect("consent"))
-
-
-def _on_alcohol_edu_perm(session: ClinicalSession, value) -> Step:
-    utterances = []
-    if value == "yes":
-        utterances += [_fixed("alcohol.edu.standard_drink"),
-                       _fixed("alcohol.edu.limits")]
-    else:
-        session.declined.append("alcohol.edu.permission")
-    # Either way the protocol proceeds to ask permission for the AUDIT itself.
-    utterances.append(_fixed("alcohol.screen.permission"))
-    return _step(session, "alcohol.screen.permission", utterances,
-                 Expect("consent"))
-
-
-# --- Drug arm: kind -> quantity/frequency (parameterized) -> DAST permission ---
-
-def _on_drugs_kind(session: ClinicalSession, value) -> Step:
-    return _step(session, "drugs.qf", [LLMSay(
-        "In one sentence, ask how much and how often the person uses the "
-        "drug or drugs they just named. Ask nothing else."
-    )], Expect("open"))
-
-
-def _on_drugs_qf(session: ClinicalSession, value) -> Step:
-    return _step(session, "drugs.screen.permission",
-                 [_fixed("drugs.screen.permission")], Expect("consent"))
-
-
-# --- Screening: administer the instrument item by item (skip rules apply) ---
-
-def _on_screen_permission(session: ClinicalSession, value) -> Step:
-    if value != "yes":
-        session.declined.append(f"{session.arm}.screen.permission")
-        return _finish_arm(session, prefix=[_fixed("permission.declined")])
-    instrument = session.instrument()
-    session.responses.setdefault(instrument.key, {})
-    utterances = []
-    if instrument.preamble:
-        utterances.append(Say(f"{instrument.key}.preamble", instrument.preamble))
-    return _ask_next_item(session, utterances)
-
-
-def _ask_next_item(session: ClinicalSession, prefix: list | None = None) -> Step:
-    instrument = session.instrument()
-    responses = session.responses[instrument.key]
-    idx = next_item_index(instrument, responses)
-    if idx is None:
-        return _screen_complete(session)
-    item = instrument.items[idx]
-    utterances = list(prefix or []) + [_item_say(instrument.key, idx, item)]
-    return _step(session, f"screening.{instrument.key}.{idx}", utterances,
-                 Expect("option", instrument=instrument.key, item_index=idx))
-
-
-def _on_screen_item(session: ClinicalSession, value) -> Step:
-    instrument = session.instrument()
-    idx = session.expect.item_index
-    code = int(value)
-    # Validates the code against the instrument (raises InvalidResponse on a
-    # coder bug rather than silently mis-scoring).
-    option_score(instrument, idx, code)
-    session.responses[instrument.key][idx] = code
-    return _ask_next_item(session)
-
-
-def _screen_complete(session: ClinicalSession) -> Step:
-    instrument = session.instrument()
-    assessment = assess(instrument, session.responses[instrument.key])
-    session.assessments[instrument.key] = assessment
-    logger.info("[clinical] %s complete: score=%d zone=%s",
-                instrument.key, assessment.score, assessment.zone)
-    return _step(session, f"{session.arm}.feedback.permission",
-                 [_fixed(f"{session.arm}.feedback.permission")],
-                 Expect("consent"))
-
-
-# --- Feedback -> (healthy: done) / (else: brief intervention) ---
-
-def _on_feedback_permission(session: ClinicalSession, value) -> Step:
-    instrument = session.instrument()
-    assessment = session.assessments[instrument.key]
-    if value != "yes":
-        session.declined.append(f"{session.arm}.feedback.permission")
-        return _finish_arm(session, prefix=[_fixed("permission.declined")])
-    zone = assessment.zone
-    feedback = Say(f"feedback.{instrument.key}.{zone}",
-                   templates.feedback_text(instrument.key, zone))
-    if zone == "healthy":
-        return _finish_arm(session, prefix=[feedback])
-    utterances = [feedback]
-    if (instrument.key, zone) not in templates.FEEDBACK_ASKS_BI:
-        # e.g. the source's dependent-drug text doesn't end with the BI ask.
-        utterances.append(Say(f"bi.permission.{session.arm}",
-                              templates.bi_permission(session.arm)))
-    return _step(session, f"bi.permission.{session.arm}", utterances,
-                 Expect("consent"))
-
-
-# --- Brief intervention: decisional balance -> readiness ruler ---
-
-def _on_bi_permission(session: ClinicalSession, value) -> Step:
-    if value != "yes":
-        session.declined.append(f"{session.arm}.bi.permission")
-        return _finish_arm(session, prefix=[_fixed("permission.declined")])
-    return _step(session, "bi.likes",
-                 [Say(f"bi.likes.{session.arm}", templates.bi_likes(session.arm))],
-                 Expect("open"))
-
-
-def _on_bi_likes(session: ClinicalSession, value) -> Step:
-    return _step(session, "bi.dislikes",
-                 [Say(f"bi.dislikes.{session.arm}", templates.bi_dislikes(session.arm))],
-                 Expect("open"))
-
-
-def _on_bi_dislikes(session: ClinicalSession, value) -> Step:
-    return _step(session, "bi.ruler", [
-        LLMSay("In one or two sentences, summarize back first what the person "
-               "said they LIKE about their use, then what they DISLIKE, using "
-               "their own words. Do not add advice or new clinical content."),
-        Say(f"bi.recommend.{session.arm}", templates.bi_recommend(session.arm)),
-        Say(f"bi.ruler.{session.arm}", templates.bi_ruler(session.arm)),
-    ], Expect("number"))
-
-
-def _on_bi_ruler(session: ClinicalSession, value) -> Step:
-    value = int(value)
-    if not 0 <= value <= 10:
-        raise ProtocolError(f"readiness ruler out of range: {value}")
-    session.readiness[session.arm] = value
-    # Key carries the value: each of the 11 variants is its own cached clip.
-    return _step(session, "bi.why_not_lower",
-                 [Say(f"bi.why_not_lower.{value}",
-                      templates.bi_why_not_lower(value))],
-                 Expect("open"))
-
-
-def _on_bi_why_lower(session: ClinicalSession, value) -> Step:
-    value = session.readiness[session.arm]
-    return _step(session, "bi.why_not_higher",
-                 [Say(f"bi.why_not_higher.{value}",
-                      templates.bi_why_not_higher(value))],
-                 Expect("open"))
-
-
-def _on_bi_why_higher(session: ClinicalSession, value) -> Step:
-    return _step(session, "bi.leaves_you", [
-        LLMSay("In one or two sentences, summarize the person's reasons for "
-               "not being a 9 or 10, then their reasons for not being a 1 or "
-               "2, using their own words. Do not add advice."),
-        Say("bi.leaves_you", templates.BI_LEAVES_YOU),
-    ], Expect("open"))
-
-
-def _on_bi_leaves(session: ClinicalSession, value) -> Step:
-    reflect = LLMSay("In one brief sentence, reflect what the person just "
-                     "said about where this leaves them. No new questions.")
-    return _finish_arm(session, prefix=[reflect])
-
-
-_HANDLERS = {
-    "consent": _on_consent,
-    "prescreen.tobacco": _on_prescreen,
-    "prescreen.alcohol": _on_prescreen,
-    "prescreen.drugs": _on_prescreen,
-    "alcohol.qf": _on_alcohol_qf,
-    "alcohol.edu.permission": _on_alcohol_edu_perm,
-    "alcohol.screen.permission": _on_screen_permission,
-    "drugs.kind": _on_drugs_kind,
-    "drugs.qf": _on_drugs_qf,
-    "drugs.screen.permission": _on_screen_permission,
-    "alcohol.feedback.permission": _on_feedback_permission,
-    "drugs.feedback.permission": _on_feedback_permission,
-    "bi.permission.alcohol": _on_bi_permission,
-    "bi.permission.drugs": _on_bi_permission,
-    "bi.likes": _on_bi_likes,
-    "bi.dislikes": _on_bi_dislikes,
-    "bi.ruler": _on_bi_ruler,
-    "bi.why_not_lower": _on_bi_why_lower,
-    "bi.why_not_higher": _on_bi_why_higher,
-    "bi.leaves_you": _on_bi_leaves,
-}
-
-# --------------- The transition function ---------------
-
-def advance(session: ClinicalSession, kind: str, value) -> Step:
-    """Consume ONE coded user input and move the protocol forward.
-    kind mirrors session.expect.kind; value is the coded payload
-    (consent: "yes"|"no"; option: int code; number: int; open: transcript)."""
+def advance(session: ClinicalSession, out: TurnOut) -> Step:
+    """Consume ONE VALIDATED answer and move the protocol forward. The
+    pipeline must have run turn.validate first; anything else is a wiring
+    bug and raises ProtocolError."""
     if session.crisis:
-        return _step(session, "crisis", [LLMSay(_CRISIS_INSTRUCTION)],
-                     Expect("open"))
-    if session.expect.kind != kind:
+        return crisis_step(session)
+    if session.expect.kind == "end":
+        raise ProtocolError("session already ended; nothing advances")
+    if out.action != "answer":
         raise ProtocolError(
-            f"machine at node {session.node!r} expects "
-            f"{session.expect.kind!r}, got {kind!r}")
-    # Screening item nodes are dynamic ("screening.<instrument>.<idx>").
-    handler = _HANDLERS.get(session.node) or (
-        _on_screen_item if session.node.startswith("screening.") else None)
-    if handler is None:
-        raise ProtocolError(f"no handler for node {session.node!r}")
-    return handler(session, value)
+            f"advance() only takes validated answers, got {out.action!r}")
+    _consume(session, out)
+    return _run(session, [])
+
+
+def absorb(session: ClinicalSession, out: TurnOut) -> None:
+    """Fold a `continuation` into the most recent open capture WITHOUT
+    moving the machine — the two-breath answer lands where it belongs
+    instead of being coded against the wrong expectation."""
+    key = session.last_ask_key
+    if key is None:
+        return
+    if out.slots:
+        session.slots.setdefault(key, {}).update(out.slots)
+    if out.text:
+        prev = session.answers.get(key, "")
+        session.answers[key] = (prev + " " + out.text).strip()

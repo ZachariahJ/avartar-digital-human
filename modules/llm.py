@@ -4,6 +4,8 @@ import re
 import threading
 from openai import OpenAI
 import config
+from modules.sbirt.turn import TurnOut, expected_item
+from modules.sbirt.turn import validate as validate_turn
 
 logger = logging.getLogger(__name__)
 
@@ -140,48 +142,13 @@ def chat_stream(messages: list[dict],
         yield buffer.strip()
 
 
-_CONSENT_SYSTEM = (
-    "A health-screening tool asked the user for permission with the question: "
-    "{question!r}. Read ONLY the user's reply and classify their intent as "
-    "exactly one lowercase word:\n"
-    "  yes — they clearly agree to proceed (incl. 'sure', 'ok', 'go ahead', 'no problem')\n"
-    "  no — they clearly decline ('no', 'not now', \"I'd rather not\")\n"
-    "  unclear — anything else, OR any sign of distress/crisis/off-topic.\n"
-    "Output only that one word."
-)
-
-_DEFAULT_CONSENT_QUESTION = "May I ask you some questions about your health?"
-
-
-def classify_consent(text: str, question: str = _DEFAULT_CONSENT_QUESTION) -> str:
-    """Classify the user's reply to a permission question as
-    'yes' | 'no' | 'unclear'. Conservative: distress/crisis/ambiguous -> 'unclear'
-    so the caller clarifies instead of guessing. Returns 'unclear' on any failure."""
-    if not text or not text.strip():
-        return "unclear"
-    try:
-        resp = _client().chat.completions.create(
-            model=config.LLM_MODEL,
-            messages=[{"role": "system",
-                       "content": _CONSENT_SYSTEM.format(question=question)},
-                      {"role": "user", "content": text}],
-            temperature=0,
-        )
-        out = (resp.choices[0].message.content or "").strip().lower()
-        if out.startswith("yes"):
-            return "yes"
-        if out.startswith("no"):
-            return "no"
-        return "unclear"
-    except Exception as e:
-        logger.info("consent classification skipped (%s)", e)
-        return "unclear"
-
-
 # =====================================================================
-# Constrained NLU coding (P4): free text -> option code, or AMBIGUOUS.
+# Constrained NLU (P4 -> T4): free text -> ONE validated TurnOut per turn.
 # The coder NEVER guesses: quantities/timeframes the user did not state
 # route to a clarification, not to a code (case-card AUDIT item 10 rule).
+# Deterministic pre-matching handles the unambiguous fast path with zero
+# LLM latency; everything semantic goes through ONE turn() call whose
+# output is gated by turn.validate before it can move anything.
 # =====================================================================
 
 AMBIGUOUS = "AMBIGUOUS"
@@ -195,83 +162,23 @@ _WORD_NUMBERS = {
 }
 _DIGIT_RE = re.compile(r"\b(10|[0-9])\b")
 
-# Confidence below this -> clarify rather than code.
-CODE_CONFIDENCE_MIN = 0.55
-
-_CODE_SYSTEM = (
-    "You code a patient's spoken answer onto EXACTLY ONE of the allowed "
-    "options of a health-screening question. The transcript comes from speech "
-    "recognition and may be informal.\n"
-    "Question: {question}\n"
-    "Options (code = number):\n{options}\n"
-    "Rules:\n"
-    "- Choose the single best-matching option code.\n"
-    "- NEVER guess a timeframe, frequency or quantity the patient did not "
-    "state. If the answer does not determine one option (e.g. no timeframe "
-    "where options differ by timeframe, or an off-topic reply), it is "
-    "ambiguous.\n"
-    "- Output ONLY compact JSON, nothing else: "
-    '{{"option": <int>, "confidence": <0..1>}} or '
-    '{{"status": "AMBIGUOUS", "reason": "<short>"}}'
-)
-
-
 def _prematch_option(options, text: str):
-    """Deterministic pre-pass: exact label match, and yes/no shortcuts for
-    binary No/Yes items. Returns a code or None."""
+    """Deterministic pre-pass: exact label/alias match, and yes/no shortcuts
+    for binary No/Yes items (short utterances only — a longer reply may carry
+    a question or a caveat the LLM must see). Returns a code or None."""
     t = " ".join(text.strip().lower().split())
     if not t:
         return None
     for i, opt in enumerate(options):
-        if t == opt.label.lower():
+        if t == opt.label.lower() or t in (a.lower() for a in opt.aliases):
             return i
     labels = [o.label for o in options]
-    if labels == ["No", "Yes"]:
+    if labels == ["No", "Yes"] and len(t.split()) <= 3:
         if _YES_RE.match(t):
             return 1
         if _NO_RE.match(t):
             return 0
     return None
-
-
-def code_option(question: str, options, user_text: str) -> dict:
-    """Code `user_text` onto one of `options` (tuple of instruments.Option).
-
-    Returns {"code": int} on success or {"status": "AMBIGUOUS"} when the
-    answer does not determine one option (caller clarifies — never guesses).
-    Strategy: deterministic pre-match first; then a strict-JSON LLM call with
-    one corrective retry; low confidence or any failure -> AMBIGUOUS."""
-    pre = _prematch_option(options, user_text)
-    if pre is not None:
-        return {"code": pre}
-
-    option_lines = "\n".join(f"  {i}: {o.label}" for i, o in enumerate(options))
-    system = _CODE_SYSTEM.format(question=question, options=option_lines)
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": user_text}]
-    for attempt in range(2):
-        try:
-            resp = _client().chat.completions.create(
-                model=config.LLM_MODEL, messages=messages, temperature=0)
-            raw = (resp.choices[0].message.content or "").strip()
-            start, end = raw.find("{"), raw.rfind("}")
-            data = json.loads(raw[start:end + 1])
-            if data.get("status") == AMBIGUOUS:
-                return {"status": AMBIGUOUS}
-            code = data["option"]
-            confidence = float(data.get("confidence", 0))
-            if (isinstance(code, int) and 0 <= code < len(options)
-                    and confidence >= CODE_CONFIDENCE_MIN):
-                return {"code": code}
-            if isinstance(code, int) and 0 <= code < len(options):
-                return {"status": AMBIGUOUS}      # valid but low confidence
-            raise ValueError(f"option {code!r} out of range")
-        except Exception as e:
-            logger.info("code_option attempt %d failed (%s)", attempt + 1, e)
-            messages.append({"role": "user", "content":
-                             "Your last output was invalid. Output ONLY the "
-                             "JSON object, with an in-range integer option."})
-    return {"status": AMBIGUOUS}
 
 
 def code_number(user_text: str, low: int = 0, high: int = 10) -> dict:
@@ -286,6 +193,156 @@ def code_number(user_text: str, low: int = 0, high: int = 10) -> dict:
     if len(found) == 1:
         return {"value": found.pop()}
     return {"status": AMBIGUOUS}
+
+
+# --------------- The ONE per-turn NLU + voice call (T4/T11/T12) ---------------
+
+# Whole-utterance consent matches only: "yes but what does that mean" must
+# reach the LLM (it is a question, not a bare yes).
+_CONSENT_YES = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
+                "all right", "of course", "sure thing", "go ahead",
+                "yes please", "fine", "sounds good"}
+_CONSENT_NO = {"no", "nope", "nah", "no thanks", "no thank you", "not now",
+               "not really", "i'd rather not", "id rather not"}
+
+_TURN_SYSTEM = """You are the natural-language understanding AND the voice of one turn of a
+structured SBIRT health-screening avatar (a VOICE conversation). The clinical
+protocol — which question comes next, scores, risk zones, routing — is
+decided by external code, NEVER by you.
+
+The avatar just asked:
+{ask}
+
+Expected form of an answer:
+{expectation}
+
+Session facts (the ONLY source for factual claims in your reply):
+{facts}
+
+Read the user's utterance and output ONLY a compact JSON object:
+{{"action": "...", "code": null, "slots": {{}}, "text": null, "reply": "..."}}
+
+action — exactly one of:
+  "answer"       it answers the current ask (even partially for slots)
+  "continuation" it adds to / completes their PREVIOUS answer instead
+  "question"     they are asking YOU something
+  "tangent"      an off-topic aside or small talk
+  "crisis"       ANY sign of self-harm, overdose, danger, acute distress
+  "unclear"      none of the above is safe to assume
+
+Coding rules (guess-free — a wrong code corrupts a validated screening):
+- Option items: "code" = the single best-matching option number, ONLY if the
+  utterance clearly determines it. NEVER guess a timeframe, frequency or
+  quantity the person did not state; if the options differ by a detail they
+  did not give, use action "unclear" instead.
+- Yes/no permission asks: "code" 1 = they agree, 0 = they decline.
+- Number asks: "code" = the single 0-10 number they said; two different
+  numbers or none -> "unclear".
+- Open asks: put the captured answer in "text"; when slots are listed in the
+  expectation, put each piece they actually gave under its slot name in
+  "slots" (never invent a slot they did not address).
+
+reply rules — you speak WITH the person, warm and plain-spoken:
+- answer: reply is ONLY a brief acknowledgment of what they said, at most 8
+  words, one sentence ending with a period. Vary it every time; never echo
+  an acknowledgment already used in the conversation. No questions, no
+  advice, no new information.
+- question: answer THEIR question in one or two short sentences using ONLY
+  the session facts above — if something was not covered, say so honestly —
+  then re-ask the current ask briefly in fresh words.
+- tangent: one warm sentence acknowledging what they said, then gently
+  return to the current ask.
+- continuation: briefly acknowledge the added detail, then re-pose the
+  current ask in a few words.
+- unclear: gently re-ask the current ask in one short sentence (you may
+  mention the answer choices; never suggest which one to pick).
+- crisis: leave reply empty — a fixed safety response takes over.
+- NEVER: scores, risk zones, diagnoses, clinical jargon, lecturing, stacked
+  questions, or stock phrases like "I hear you."
+"""
+
+
+def _expectation_text(expect) -> str:
+    kind = expect.kind
+    if kind == "consent":
+        return "A yes or no."
+    if kind == "option":
+        item = expected_item(expect)
+        lines = "\n".join(f"  {i}: {o.label}"
+                          for i, o in enumerate(item.options))
+        return f"One of these choices (code = number):\n{lines}"
+    if kind == "number":
+        return "A single number from 0 to 10."
+    if kind == "open" and expect.missing:
+        return (f"Free text. Slots: {', '.join(expect.slots)}. "
+                f"Still missing: {', '.join(expect.missing)} "
+                f"(the ask was about {expect.missing[0]!r}).")
+    if kind == "open":
+        return "Free text."
+    return "The session has ended; no answer is expected."
+
+
+def _prepass(user_text: str, expect) -> TurnOut | None:
+    """Zero-latency deterministic paths for unambiguous short answers.
+    reply stays empty — skipping the acknowledgment beats guessing one."""
+    t = " ".join(user_text.strip().lower().split()).rstrip(".!,")
+    if expect.kind == "consent":
+        if t in _CONSENT_YES:
+            return TurnOut(action="answer", code=1)
+        if t in _CONSENT_NO:
+            return TurnOut(action="answer", code=0)
+        return None
+    if expect.kind == "option":
+        code = _prematch_option(expected_item(expect).options, user_text)
+        if code is not None:
+            return TurnOut(action="answer", code=code)
+        return None
+    if expect.kind == "number":
+        got = code_number(user_text)
+        if "value" in got:
+            return TurnOut(action="answer", code=got["value"])
+        return None
+    return None
+
+
+def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
+         patient: dict | None = None, facts: dict | None = None) -> TurnOut:
+    """ONE call per user utterance: classify what the utterance IS relative
+    to the current ask, code it if it is an answer, and produce this turn's
+    bounded reply. The result is ALWAYS gated by turn.validate — an illegal
+    answer comes back as 'unclear' and moves nothing. Total failure returns
+    unclear with an empty reply (the pipeline then re-asks deterministically),
+    so the protocol can never be stranded by the model."""
+    pre = _prepass(user_text, expect)
+    if pre is not None:
+        return validate_turn(pre, expect)
+
+    all_facts = dict(facts or {})
+    if patient:
+        all_facts["patient"] = patient
+    system = _TURN_SYSTEM.format(
+        ask=ask_text or "(the opening consent question)",
+        expectation=_expectation_text(expect),
+        facts=json.dumps(all_facts, ensure_ascii=False))
+    messages = ([{"role": "system", "content": system}]
+                + list(history[-6:])
+                + [{"role": "user", "content": user_text}])
+    for attempt in range(2):
+        try:
+            resp = _client().chat.completions.create(
+                model=config.LLM_MODEL, messages=messages, temperature=0)
+            raw = (resp.choices[0].message.content or "").strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            if start == -1 or end <= start:
+                raise ValueError("no JSON object in turn output")
+            out = TurnOut.model_validate_json(raw[start:end + 1])
+            return validate_turn(out, expect)
+        except Exception as e:
+            logger.info("turn() attempt %d failed (%s)", attempt + 1, e)
+            messages.append({"role": "user", "content":
+                             "Your last output was invalid. Output ONLY the "
+                             "JSON object described, nothing else."})
+    return TurnOut(action="unclear", reply="")
 
 
 # --------------- Bounded single-utterance generation (P4) ---------------
