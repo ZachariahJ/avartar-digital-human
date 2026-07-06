@@ -58,7 +58,6 @@ digital-human/
 ├── tests/                   # pytest: gold-standard case cards + integration
 ├── static/
 │   ├── index.html           # Frontend UI
-│   └── test_audio.html      # Mic / ASR debug page
 ├── assets/
 │   ├── avatar.png           # Avatar portrait (FLOAT input)
 │   ├── clips/               # Pre-rendered fixed protocol clips (auto-generated)

@@ -85,15 +85,22 @@ async def index(request: Request):
 
 
 async def serve_video(request: Request):
-    """Serve video files from tmp/ and assets/."""
+    """Serve video files from tmp/ (per-sentence) and assets/clips/ (fixed clips)."""
     subdir = request.path_params["subdir"]
     filename = request.path_params["filename"]
 
-    # Only allow tmp and assets subdirectories
-    if subdir not in ("tmp", "assets"):
+    # Map URL token -> real directory. filename is a bare basename (str converter
+    # rejects slashes), so no path-traversal guard is needed here.
+    roots = {
+        "tmp": os.path.join(BASE_DIR, "tmp"),
+        "clips": config.CLIPS_DIR,          # assets/clips
+        "assets": config.ASSETS_DIR,        # assets/ root (idle_loop.mp4)
+    }
+    root = roots.get(subdir)
+    if root is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    filepath = os.path.join(BASE_DIR, subdir, filename)
+    filepath = os.path.join(root, filename)
     if not os.path.isfile(filepath):
         return JSONResponse({"error": "not found"}, status_code=404)
 
@@ -366,7 +373,7 @@ async def _poll_session(session: Session):
         if video_path.startswith(os.path.join(BASE_DIR, "tmp")):
             video_url = "/video/tmp/"  + os.path.basename(video_path)
         else:
-            video_url = "/video/assets/clips/" + os.path.basename(video_path)
+            video_url = "/video/clips/" + os.path.basename(video_path)
 
         # Latency: how long the finished clip sat in the queue before delivery.
         t_enq = item.get("_t_enqueue")
