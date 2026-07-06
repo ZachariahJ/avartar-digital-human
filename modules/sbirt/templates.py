@@ -118,6 +118,14 @@ FIXED: dict[str, str] = {
         "you for your time today. Anything you shared stays confidential, "
         "and your provider can pick this up with you whenever you're ready."
     ),
+    # A question the person cannot / will not answer after the recall-anchor
+    # probe (F1/F2 missing-data exit): acknowledge and move on — the manual's
+    # guidance is to note uncertainties on the record, not to interrogate
+    # (SBIRT_REF.pdf p.18). Source gives no text; PENDING CLINICIAN REVIEW.
+    "item.skipped": (
+        "That's okay — we can set that one aside. I'll make a note of it "
+        "for your provider."
+    ),
     # Brief-intervention closer (source line; the flow Tells it right before
     # listening for the open answer).
     "bi.leaves_you": "So where does this leave you?",

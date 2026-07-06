@@ -219,8 +219,16 @@ Expected form of an answer:
 Session facts (the ONLY source for factual claims in your reply):
 {facts}
 
+Live interview state (program-rendered from the session every turn — treat it
+as session facts too). It is the full map of the screening: every question,
+what is already answered, what is being asked right now, and what comes next.
+Use it to answer meta questions ("how many questions are left", "what is this
+for", "didn't I already tell you that") and to avoid re-asking anything it
+shows as answered:
+{interview_state}
+
 Read the user's utterance and output ONLY a compact JSON object:
-{{"action": "...", "code": null, "item": null, "slots": {{}}, "text": null, "reply": "..."}}
+{{"action": "...", "code": null, "item": null, "slots": {{}}, "text": null, "value": null, "per": null, "unit": null, "beverage": null, "reply": "..."}}
 
 action — exactly one of:
   "answer"       it answers the current ask (even partially for slots)
@@ -234,15 +242,23 @@ action — exactly one of:
   "correction"   they are CHANGING an answer they already gave to an earlier
                  question ("actually it's more like three times a week") —
                  see answers_already_given in the session facts
+  "dont_know"    they cannot answer or would rather not answer THIS question
+                 ("i don't know", "no idea", "can't remember", "skip that
+                 one", "rather not say") — NOT stopping the whole session,
+                 and NOT an answer of "never"/"no"
   "unclear"      none of the above is safe to assume
 
 Coding rules (guess-free — a wrong code corrupts a validated screening):
 - Option items: "code" = the option number the utterance determines. Their
   wording does NOT need to match the option label — when everything they
   stated falls inside exactly ONE option, code that option. Examples:
-  "ten or twenty times" -> "One or more"; "every single day" -> "Daily or
-  almost daily"; "10 or 20 drinks" -> "10 or more"; "yesterday" -> "Within
-  the last year". Refusing a codable answer is as wrong as guessing.
+  "ten or twenty times" -> "One or more"; "yesterday" -> "Within the last
+  year". Refusing a codable answer is as wrong as guessing.
+- EXTRACTION items: when the expectation below says the engine computes the
+  option from extracted fields, do NOT pick the option yourself — fill the
+  fields exactly as described there (value/per for frequencies, value/unit/
+  beverage for drink amounts) and leave "code" null. The deterministic
+  engine does the bucketing.
 - But NEVER guess: if what they said fits MORE THAN ONE option ("more than
   one", "a few", "sometimes"), or omits the detail the options differ by
   (timeframe, count), use action "unclear" — do not pick a side.
@@ -285,7 +301,8 @@ reply rules — you speak WITH the person, warm and plain-spoken:
   question word-for-word, and never reuse a clarification wording already
   used in this conversation — each attempt must get more specific, not
   repeat itself. Never suggest which choice to pick.
-- crisis / abort: leave reply empty — a fixed response takes over.
+- crisis / abort / dont_know: leave reply empty — a fixed response takes
+  over (for dont_know the protocol itself offers a recall anchor or moves on).
 - NEVER: scores, risk zones, diagnoses, clinical jargon, lecturing, stacked
   questions, or stock phrases like "I hear you."
 """
@@ -303,6 +320,31 @@ def _expectation_text(expect) -> str:
         item = expected_item(expect)
         lines = "\n".join(f"  {i}: {o.label}"
                           for i, o in enumerate(item.options))
+        coding = getattr(item, "coding", "choice")
+        if coding in ("freq_q1", "freq5"):
+            return (
+                "A frequency. The engine computes the option from your "
+                "extraction — fill \"value\" (how many times, a number) and "
+                "\"per\" (\"day\"|\"week\"|\"month\"|\"year\"); leave "
+                "\"code\" null. \"every week\" -> value 1, per \"week\"; "
+                "\"always\" / \"every single day\" -> value 1, per \"day\"; "
+                "\"twice a month\" -> value 2, per \"month\"; \"never\" -> "
+                "value 0. A rate you cannot pin down -> \"unclear\".\n"
+                f"The choices, for context only:\n{lines}")
+        if coding == "quantity_drinks":
+            return (
+                "An amount of drinking. The engine computes the option from "
+                "your extraction — fill \"value\" (a number) and \"unit\": "
+                "\"drinks\" when they count drinks, otherwise the container "
+                "or volume they said (\"liter\", \"bottle\", \"shot\", "
+                "\"glass\", \"can\", \"oz\", \"ml\", \"pint\", \"fifth\", "
+                "\"handle\"), plus \"beverage\" when known from this or an "
+                "earlier turn (\"whiskey\", \"beer\", \"wine\"); leave "
+                "\"code\" null. \"ten or more\" -> value 10, unit "
+                "\"drinks\"; \"a liter of whiskey\" -> value 1, unit "
+                "\"liter\", beverage \"whiskey\". An amount with no usable "
+                "number -> \"unclear\".\n"
+                f"The choices, for context only:\n{lines}")
         return f"One of these choices (code = number):\n{lines}"
     if kind == "number":
         return "A single number from 0 to 10."
@@ -315,10 +357,25 @@ def _expectation_text(expect) -> str:
     return "The session has ended; no answer is expected."
 
 
+# Whole-utterance matches only, same rule as the consent sets: "i don't know
+# if that counts" carries content and must reach the LLM.
+_DONT_KNOW = {"i don't know", "i dont know", "don't know", "dont know",
+              "dunno", "i dunno", "no idea", "i have no idea", "not sure",
+              "i'm not sure", "im not sure", "i can't remember",
+              "i cant remember", "can't remember", "cant remember",
+              "i don't remember", "i dont remember", "no clue",
+              "i'd rather not say", "id rather not say", "rather not say"}
+
+
 def _prepass(user_text: str, expect) -> TurnOut | None:
     """Zero-latency deterministic paths for unambiguous short answers.
     reply stays empty — skipping the acknowledgment beats guessing one."""
     t = " ".join(user_text.strip().lower().split()).rstrip(".!,")
+    if t in _DONT_KNOW and expect.kind in ("consent", "confirm", "option",
+                                           "number"):
+        # T25/F1: a first-class result — the pipeline probes once with a
+        # recall anchor, then marks the item missing. Never an unclear loop.
+        return TurnOut(action="dont_know")
     if expect.kind in ("consent", "confirm"):
         if t in _CONSENT_YES:
             return TurnOut(action="answer", code=1, exact=True)
@@ -341,7 +398,8 @@ def _prepass(user_text: str, expect) -> TurnOut | None:
 
 
 def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
-         patient: dict | None = None, facts: dict | None = None) -> TurnOut:
+         patient: dict | None = None, facts: dict | None = None,
+         interview_state: str = "") -> TurnOut:
     """ONE call per user utterance: classify what the utterance IS relative
     to the current ask, code it if it is an answer, and produce this turn's
     bounded reply. The result is ALWAYS gated by turn.validate — an illegal
@@ -358,7 +416,8 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
     system = _TURN_SYSTEM.format(
         ask=ask_text or "(the opening consent question)",
         expectation=_expectation_text(expect),
-        facts=json.dumps(all_facts, ensure_ascii=False))
+        facts=json.dumps(all_facts, ensure_ascii=False),
+        interview_state=interview_state or "(not available this turn)")
     messages = ([{"role": "system", "content": system}]
                 + list(history[-6:])
                 + [{"role": "user", "content": user_text}])
@@ -371,9 +430,11 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
             if start == -1 or end <= start:
                 raise ValueError("no JSON object in turn output")
             out = TurnOut.model_validate_json(raw[start:end + 1])
-            # `exact` is the deterministic pre-pass's field: a model claiming
-            # it must never skip a T20 read-back.
-            out = out.model_copy(update={"exact": False})
+            # `exact` belongs to the deterministic pre-pass and assumed/
+            # boundary/note to validate()'s derivation: a model claiming any
+            # of them must never skip (or fake) a T20 read-back.
+            out = out.model_copy(update={"exact": False, "assumed": False,
+                                         "boundary": False, "note": ""})
             return validate_turn(out, expect)
         except Exception as e:
             # Log the exception TYPE only — a pydantic/JSON error message can

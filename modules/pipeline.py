@@ -11,7 +11,7 @@ import re
 import config
 from modules import asr, llm, tts, avatar, privacy
 from modules.privacy import phi, phi_keys
-from modules.sbirt import crisis, runtime, templates
+from modules.sbirt import crisis, runtime, state_view, templates
 from modules.sbirt.instruments import BY_KEY, InvalidResponse, PRE_SCREEN
 
 logger = logging.getLogger(__name__)
@@ -520,7 +520,9 @@ class Pipeline:
             out = llm.turn(user_text, exp,
                            ask_text=self._last_question_text(),
                            history=history, patient=patient,
-                           facts=self._turn_facts())
+                           facts=self._turn_facts(),
+                           interview_state=state_view.render_interview_state(
+                               clinical))
 
             # The NLU may have taken a slow LLM round-trip; if a newer turn
             # started meanwhile (barge-in, typed message), don't touch the machine.
@@ -575,10 +577,14 @@ class Pipeline:
                                                    yes=(out.code == 1))
                     return self._deliver_step(user_text, step, turn,
                                               ack=out.reply)
-                if runtime.needs_confirm(clinical, out):
-                    # T20: a semantically-coded answer to a score-critical
-                    # item is read back BEFORE it can commit.
-                    step = runtime.request_confirm(clinical, out)
+                reason = runtime.confirm_reason(clinical, out)
+                if reason is not None:
+                    # T20/F5: the read-back is the exception — it fires only
+                    # when a conversion assumption entered the coding, the
+                    # value sat near a bucket edge, the answer contradicts an
+                    # earlier one, or nothing deterministic vouches for a
+                    # semantic code on a score-critical item.
+                    step = runtime.request_confirm(clinical, out, reason)
                     return self._deliver_step(user_text, step, turn,
                                               ack=out.reply)
                 try:
@@ -602,9 +608,62 @@ class Pipeline:
                 runtime.absorb(clinical, out)
                 return self._hold(user_text, out.reply, turn)
 
-            # question / tangent / unclear: machine holds position; the reply
+            if out.action == "dont_know":
+                # T25/F1: probe ONCE with the manual's recall anchor, then
+                # take the missing-data exit (F2) — never a re-ask loop.
+                if runtime.note_stall(clinical) >= runtime.DONT_KNOW_LIMIT:
+                    return self._deliver_missing(user_text, "dont_know", turn)
+                return self._hold_probe(user_text, turn)
+
+            if out.action == "unclear":
+                # F2: clarifications are finite — at the limit the item is
+                # recorded as unanswered and the protocol moves on.
+                if runtime.note_stall(clinical) >= runtime.UNCLEAR_LIMIT:
+                    return self._deliver_missing(user_text, "no_answer", turn)
+                return self._hold(user_text, out.reply, turn)
+
+            # question / tangent: machine holds position; the reply
             # answers/acknowledges and re-poses the current ask.
             return self._hold(user_text, out.reply, turn)
+
+    def _deliver_missing(self, user_text, reason, turn):
+        """F2's guaranteed terminus: mark the current pause missing and let
+        the protocol continue (an unanswerable consent gate degrades to its
+        decline path, which may end the session)."""
+        step = runtime.mark_missing(self.clinical, reason)
+        if self.clinical.node == "declined":
+            return self._deliver_decline(user_text, turn)
+        return self._deliver_step(user_text, step, turn)
+
+    def _hold_probe(self, user_text, turn):
+        """First dont_know at a pause: ONE assisted-recall attempt per the
+        WHO manual (p.18 — help the person estimate, anchored to their
+        heaviest period in the past year), always with the skip offer so
+        declining again is easy. The machine does not move."""
+        exp = self.clinical.expect
+        if exp.kind == "option":
+            q, _ = self._current_question()
+            instruction = (
+                "The person says they don't know or can't remember. In one "
+                "or two gentle sentences, help them estimate: suggest "
+                "thinking about the period in the past year when they were "
+                f"drinking or using the most, briefly re-ask the substance "
+                f"of {q!r} in fresh words, and mention that a rough guess "
+                "is fine — or we can skip it and move on.")
+        elif exp.kind == "number":
+            instruction = (
+                "The person says they don't know. In one gentle sentence, "
+                "say it doesn't have to be exact and ask for whatever "
+                "number from 0 to 10 feels closest — or offer to skip it.")
+        else:
+            # Gates and read-backs: re-pose the pending ask as-is.
+            return self._deliver_step(
+                user_text, runtime.repeat_step(self.clinical), turn)
+        return self._deliver_step(
+            user_text,
+            runtime.Step(self.clinical.node,
+                         (runtime.LLMSay(instruction),), exp),
+            turn)
 
     def _hold(self, user_text, reply, turn):
         """Speak a bounded hold-turn WITHOUT touching the machine: the NLU's

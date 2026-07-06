@@ -114,6 +114,16 @@ def _next_arm(session) -> str:
     return "close.completed"
 
 
+def _after_ruler(session) -> str:
+    """The two ruler follow-ups and the ruler summary presuppose a readiness
+    number; when the ruler went unanswered (marked missing after the F2
+    probes), the BI continues at the wrap-up instead of dereferencing a
+    number that was never given."""
+    if session.readiness.get(session.arm) is None:
+        return "bi.wrap"
+    return "bi.followups"
+
+
 def _after_feedback(session) -> str:
     """Healthy zone finishes the arm; every other zone routes into the brief
     intervention. Whether the BI permission still needs ASKING depends on
@@ -206,11 +216,14 @@ PROTOCOL: tuple = (
     Tell("@bi.recommend"),
     Tell("@bi.ruler"),
     Ask("bi.ruler", kind="number", ask="included"),
+    Route(_after_ruler),
+    Label("bi.followups"),
     Tell("@bi.why_not_lower"),
     Ask("bi.why_not_lower", kind="open", ask="included"),
     Tell("@bi.why_not_higher"),
     Ask("bi.why_not_higher", kind="open", ask="included"),
     Tell("bi.summary.rulers"),
+    Label("bi.wrap"),
     Tell("bi.leaves_you"),
     Ask("bi.leaves_you", kind="open", ask="included"),
     Tell("bi.reflect"),

@@ -27,7 +27,7 @@ Screen / NM ASSIST; TAPS tool; Knight CRAFFT 2.1.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Collection, Mapping
 
 
 @dataclass(frozen=True)
@@ -60,9 +60,19 @@ class Item:
     instrument items) live in the flow layer, not here.
 
     `confirm=True` (T20) marks score-bearing items whose coded answer is read
-    back for a yes/no confirmation BEFORE it is committed — but only when the
-    code came from semantic (LLM) mapping; an answer spoken as the option's
-    exact wording commits directly. A "no" re-collects the item.
+    back for a yes/no confirmation BEFORE it is committed. Round 2 makes the
+    read-back the exception, not the default: exact-wording answers and
+    cleanly derived codes (see `coding` below) commit directly; the read-back
+    fires only when a conversion assumption entered the coding, the value sat
+    near a bucket boundary, or the answer contradicts an earlier one
+    (runtime.confirm_reason). A "no" re-collects the item.
+
+    `coding` names the deterministic derivation for semantic answers
+    (coding.py, T26): "choice" items accept a directly coded option;
+    "freq_q1"/"freq5" items require an extracted rate (value + per) and
+    "quantity_drinks" items an extracted amount (value + unit [+ beverage]) —
+    the option code is then COMPUTED from the scale tables, never taken from
+    the model's claim.
     """
 
     text: str
@@ -70,6 +80,7 @@ class Item:
     note: str = ""  # skip rule / scoring deviation, rendered with the item
     verbatim: bool = True
     confirm: bool = False
+    coding: str = "choice"   # "choice" | "freq_q1" | "freq5" | "quantity_drinks"
 
     @property
     def kind(self) -> str:
@@ -262,31 +273,34 @@ AUDIT = Instrument(
               Option("2 to 4 times a month", 2),
               Option("2 to 3 times a week", 3),
               Option("4 or more times a week", 4)),
-             note="0 (Never) → skip to items 9–10", confirm=True),
+             note="0 (Never) → skip to items 9–10", confirm=True,
+             coding="freq_q1"),
         Item("How many drinks containing alcohol do you have on a typical day "
              "when you are drinking?",
              (Option("1 or 2", 0),
               Option("3 or 4", 1),
               Option("5 or 6", 2),
               Option("7, 8, or 9", 3),
-              Option("10 or more", 4)), confirm=True),
+              Option("10 or more", 4)), confirm=True,
+             coding="quantity_drinks"),
         Item("How often do you have six or more drinks on one occasion?",
              _FREQ_5,
-             note="if items 2+3 total 0 → skip to items 9–10", confirm=True),
+             note="if items 2+3 total 0 → skip to items 9–10", confirm=True,
+             coding="freq5"),
         Item("How often during the last year have you found that you were not "
              "able to stop drinking once you had started?", _FREQ_5,
-             confirm=True),
+             confirm=True, coding="freq5"),
         Item("How often during the last year have you failed to do what was "
              "normally expected from you because of drinking?", _FREQ_5,
-             confirm=True),
+             confirm=True, coding="freq5"),
         Item("How often during the last year have you needed a first drink in "
              "the morning to get yourself going after a heavy drinking session?",
-             _FREQ_5, confirm=True),
+             _FREQ_5, confirm=True, coding="freq5"),
         Item("How often during the last year have you had a feeling of guilt "
-             "or remorse after drinking?", _FREQ_5),
+             "or remorse after drinking?", _FREQ_5, coding="freq5"),
         Item("How often during the last year have you been unable to remember "
              "what happened the night before because you had been drinking?",
-             _FREQ_5),
+             _FREQ_5, coding="freq5"),
         Item("Have you or someone else been injured as a result of your "
              "drinking?", _YES_NO_TIMEFRAMED),
         Item("Has a relative or friend or a doctor or another health worker "
@@ -498,20 +512,24 @@ def _skipped_items(instrument: Instrument,
     return frozenset(skipped)
 
 
-def next_item_index(instrument: Instrument,
-                    responses: Mapping[int, int]) -> int | None:
+def next_item_index(instrument: Instrument, responses: Mapping[int, int],
+                    missing: Collection[int] = ()) -> int | None:
     """The next item to administer, honoring skip rules; None when complete.
-    Items are asked in order; skipped items are never asked."""
+    Items are asked in order; skipped items are never asked. `missing` items
+    (persistent don't-know / declined single items, F1/F2) are never re-asked
+    and contribute 0 like officially skipped items — but they mark the
+    assessment incomplete (see Assessment.missing)."""
     skipped = _skipped_items(instrument, responses)
     for i in range(len(instrument.items)):
-        if i in skipped or i in responses:
+        if i in skipped or i in responses or i in missing:
             continue
         return i
     return None
 
 
-def is_complete(instrument: Instrument, responses: Mapping[int, int]) -> bool:
-    return next_item_index(instrument, responses) is None
+def is_complete(instrument: Instrument, responses: Mapping[int, int],
+                missing: Collection[int] = ()) -> bool:
+    return next_item_index(instrument, responses, missing) is None
 
 
 def total_score(instrument: Instrument, responses: Mapping[int, int]) -> int:
@@ -524,12 +542,20 @@ def total_score(instrument: Instrument, responses: Mapping[int, int]) -> int:
 
 @dataclass(frozen=True)
 class Assessment:
-    """The authoritative screening result for one instrument."""
+    """The authoritative screening result for one instrument.
+
+    `missing` lists items the person could not / would not answer (F1/F2):
+    they scored 0, so `score` is a LOWER BOUND and the zone a floor — the
+    audit record carries the flag so the provider sees which items to follow
+    up rather than a false picture of complete data. (Whether the spoken
+    feedback should also mention it: PENDING CLINICIAN REVIEW.)
+    """
 
     instrument_key: str
     score: int
     complete: bool
     band: RiskBand | None     # None only if score is out of any band's range
+    missing: tuple[int, ...] = ()
 
     @property
     def zone(self) -> str:
@@ -540,13 +566,16 @@ class Assessment:
         return self.band.action if self.band else ""
 
 
-def assess(instrument: Instrument, responses: Mapping[int, int]) -> Assessment:
+def assess(instrument: Instrument, responses: Mapping[int, int],
+           missing: Collection[int] = ()) -> Assessment:
     """Compute the deterministic score + risk zone for the responses so far.
-    `complete=False` means items remain; the score is the running subtotal."""
+    `complete=False` means items remain; the score is the running subtotal.
+    Unanswerable items in `missing` score 0 and are carried on the result."""
     score = total_score(instrument, responses)
     return Assessment(
         instrument_key=instrument.key,
         score=score,
-        complete=is_complete(instrument, responses),
+        complete=is_complete(instrument, responses, missing),
         band=risk_band_for(instrument, score),
+        missing=tuple(sorted(missing)),
     )

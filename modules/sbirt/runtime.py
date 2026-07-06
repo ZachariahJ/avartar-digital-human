@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from . import templates
+from . import coding, templates
 from .flow import (ARM_INSTRUMENT, ARM_ORDER, Ask, End, Gate, Label, PROTOCOL,
                    RunItems, Route, Tell, close_unit, label_index)
 from .instruments import (assess, Assessment, BY_KEY, InvalidResponse,
@@ -112,8 +112,23 @@ class ClinicalSession:
     slots: dict[str, dict[str, str]] = field(default_factory=dict)  # slot captures
     last_ask_key: str | None = None            # target for continuation absorption
     # T20: an LLM-coded answer to a confirm item, held here (uncommitted)
-    # until the person confirms the read-back: {instrument, item_index, code}.
+    # until the person confirms the read-back: {instrument, item_index, code,
+    # reason, note, prior} (reason/note/prior per confirm_reason).
     pending_confirm: dict | None = None
+    # F1/F2: items the person could not / would not answer, keyed by itemset
+    # ("prescreen" | instrument key | "asks" | "gates") -> {item: reason}.
+    # They score 0 (lower bound) and mark the assessment incomplete — the
+    # provider record shows exactly what went unanswered, never a false
+    # picture of complete data.
+    missing: dict[str, dict] = field(default_factory=dict)
+    # F2: consecutive failed turns (unclear / dont_know) at the CURRENT
+    # pause. Reset by every successful consume; at the limit the pipeline
+    # stops re-asking and degrades (mark_missing) instead of looping.
+    stalls: int = 0
+    # Phase 5 audit trail: detected cross-item contradictions (codes only,
+    # never free text) + which rules already fired (one read-back per rule).
+    inconsistencies: list[dict] = field(default_factory=list)
+    fired_rules: set[str] = field(default_factory=set)
     crisis: bool = False
     aborted: bool = False                      # user stopped the session (T22)
     last_step: Step | None = None
@@ -131,12 +146,15 @@ class ClinicalSession:
             "prescreen": dict(self.prescreen),
             "responses": {k: dict(v) for k, v in self.responses.items()},
             "assessments": {
-                k: {"score": a.score, "zone": a.zone, "complete": a.complete}
+                k: {"score": a.score, "zone": a.zone, "complete": a.complete,
+                    "missing_items": list(a.missing)}
                 for k, a in self.assessments.items()
             },
             "readiness": dict(self.readiness),
             "declined": list(self.declined),
             "corrections": [dict(c) for c in self.corrections],
+            "missing": {k: dict(v) for k, v in self.missing.items()},
+            "inconsistencies": [dict(c) for c in self.inconsistencies],
             "covered": sorted(self.covered),
             "answered": sorted(self.answers),
             "slots_filled": {k: sorted(v) for k, v in self.slots.items()},
@@ -325,12 +343,16 @@ def _run(session: ClinicalSession, beats: list) -> Step:
                                      item_index=idx))
             instrument = BY_KEY[itemset]
             responses = session.responses.setdefault(itemset, {})
-            idx = next_item_index(instrument, responses)
+            unanswerable = session.missing.get(itemset, {})
+            idx = next_item_index(instrument, responses, unanswerable)
             if idx is None:
-                assessment = assess(instrument, responses)
+                assessment = assess(instrument, responses, unanswerable)
                 session.assessments[itemset] = assessment
-                logger.info("[clinical] %s complete: score=%d zone=%s",
-                            itemset, assessment.score, assessment.zone)
+                logger.info(
+                    "[clinical] %s complete: score=%d zone=%s%s",
+                    itemset, assessment.score, assessment.zone,
+                    (f" (LOWER BOUND — items {sorted(unanswerable)} "
+                     "unanswered)") if unanswerable else "")
                 session.pc += 1
                 continue
             preamble_key = f"{itemset}.preamble"
@@ -406,6 +428,7 @@ def _consume(session: ClinicalSession, out: TurnOut) -> None:
     Raises ProtocolError when the payload doesn't fit the pause — that is
     always pipeline wiring gone wrong, never user ambiguity (turn.validate
     already downgraded anything ambiguous)."""
+    session.stalls = 0                     # progress: the stall streak ends
     step = PROTOCOL[session.pc]
 
     if isinstance(step, Gate):
@@ -495,35 +518,116 @@ def advance(session: ClinicalSession, out: TurnOut) -> Step:
     return _run(session, [])
 
 
-def needs_confirm(session: ClinicalSession, out: TurnOut) -> bool:
-    """True when this validated answer must be read back before committing
-    (T20): an instrument item marked confirm, coded by SEMANTIC mapping (the
-    deterministic exact-wording pre-pass sets out.exact and skips this)."""
+def _conflict(session: ClinicalSession, out: TurnOut) -> tuple[str, str] | None:
+    """Phase 5: does this incoming answer contradict something already
+    established? Returns (rule_key, spoken-prior-statement) or None. Each
+    rule fires ONE read-back per session; every detection is recorded in
+    session.inconsistencies (codes only — the provider sees the contradiction
+    even if the person confirms both answers)."""
+    exp = session.expect
+    if exp.instrument != "audit" or not isinstance(out.code, int):
+        return None
+    items = BY_KEY["audit"].items
+    responses = session.responses.get("audit", {})
+
+    # AUDIT Q3 (6+ drinks) more often than Q1 says they drink at all.
+    if (exp.item_index == 2 and 0 in responses
+            and coding.Q3_MIN_PER_WEEK[out.code]
+            > coding.Q1_MAX_PER_WEEK[responses[0]]):
+        rule = "audit.q3_vs_q1"
+        session.inconsistencies.append(
+            {"rule": rule, "item": 2, "code": out.code,
+             "against_item": 0, "against_code": responses[0]})
+        if rule in session.fired_rules:
+            return None
+        session.fired_rules.add(rule)
+        q1 = items[0].options[responses[0]].label.lower()
+        return rule, f"you drink about {q1}"
+
+    # AUDIT Q1 far below the drinking frequency captured in the Q/F slots.
+    if exp.item_index == 0:
+        qf = session.slots.get("alcohol.qf", {}).get("frequency", "")
+        rate = coding.parse_freq_text(qf)
+        if (rate is not None
+                and rate > coding.Q1_MAX_PER_WEEK[out.code]
+                * coding.QF_VS_Q1_MARGIN + 0.1):
+            rule = "audit.q1_vs_qf"
+            session.inconsistencies.append(
+                {"rule": rule, "item": 0, "code": out.code,
+                 "against": "alcohol.qf.frequency"})
+            if rule in session.fired_rules:
+                return None
+            session.fired_rules.add(rule)
+            return rule, f"you usually drink {qf}"
+    return None
+
+
+def confirm_reason(session: ClinicalSession, out: TurnOut) -> dict | None:
+    """Round-2 confirmation discipline (F5): the read-back is the EXCEPTION.
+    A validated answer to a confirm item is read back only when
+      • a conversion default entered the coding (out.assumed — the person
+        must hear "1 liter of whiskey is about 23 standard drinks"),
+      • the normalized value sat near a bucket edge (out.boundary),
+      • it contradicts an earlier answer (Phase 5 rules), or
+      • the item has no deterministic derivation (coding == "choice") and
+        the code came from semantic mapping — nothing else vouches for it.
+    Exact-wording answers and cleanly derived codes commit directly.
+    (Rolling back the always-confirm default of the original T20 is a
+    clinical decision — PENDING CLINICIAN REVIEW.)
+    Returns None (commit directly) or the read-back's reason payload."""
     exp = session.expect
     if (exp.kind != "option" or not exp.instrument
-            or exp.instrument == "prescreen" or out.exact):
-        return False
+            or exp.instrument == "prescreen"
+            or not isinstance(out.code, int)):
+        return None
+    conflict = _conflict(session, out)
+    if conflict:
+        return {"reason": "conflict", "rule": conflict[0],
+                "prior": conflict[1]}
+    if out.exact:
+        return None
     item = BY_KEY[exp.instrument].items[exp.item_index]
-    return item.confirm and isinstance(out.code, int)
+    if not item.confirm:
+        return None
+    if out.assumed or out.boundary:
+        return {"reason": "conversion" if out.assumed else "boundary",
+                "note": out.note}
+    if item.coding == "choice":
+        return {"reason": "semantic"}
+    return None                            # cleanly derived: commit directly
+
+
+def needs_confirm(session: ClinicalSession, out: TurnOut) -> bool:
+    """Compatibility wrapper over confirm_reason (T20 entry point)."""
+    return confirm_reason(session, out) is not None
 
 
 def _confirm_pause(session: ClinicalSession) -> Step:
-    """(Re-)emit the read-back pause for session.pending_confirm."""
+    """(Re-)emit the read-back pause for session.pending_confirm.
+
+    F6: the read-back is DETERMINISTIC text that always speaks the coded
+    option label (plus the conversion note / conflicting prior when that is
+    why we are asking) — never an LLM paraphrase of the person's raw words,
+    so the value the person confirms IS the value about to be committed."""
     p = session.pending_confirm
     item = BY_KEY[p["instrument"]].items[p["item_index"]]
     label = item.options[p["code"]].label
-    instruction = (
-        f"You understood the person's answer to {item.text!r} as: {label!r}. "
-        "In ONE short natural sentence, say that understanding back to them "
-        "and ask if that's right (a yes/no). Do not re-ask the question "
-        "itself and do not suggest a different answer.")
+    if p.get("note"):
+        text = (f"{p['note']} — so that would be {label}. "
+                "Did I get that right?")
+    elif p.get("prior"):
+        text = (f"Earlier I heard that {p['prior']}, so I want to make sure "
+                f"I have this right: {label} — is that right?")
+    else:
+        text = f"So that's {label} — did I get that right?"
     return _pause(session, f"confirm.{p['instrument']}.{p['item_index']}",
-                  [LLMSay(instruction)],
+                  [Speak(text)],
                   Expect("confirm", instrument=p["instrument"],
                          item_index=p["item_index"]))
 
 
-def request_confirm(session: ClinicalSession, out: TurnOut) -> Step:
+def request_confirm(session: ClinicalSession, out: TurnOut,
+                    reason: dict | None = None) -> Step:
     """Hold a confirm item's coded answer UNCOMMITTED and ask the person to
     verify the read-back (T20). The read-back speaks the CODED option label,
     never a paraphrase of their raw words — the point is to surface a
@@ -531,7 +635,7 @@ def request_confirm(session: ClinicalSession, out: TurnOut) -> Step:
     exp = session.expect
     session.pending_confirm = {"instrument": exp.instrument,
                                "item_index": exp.item_index,
-                               "code": out.code}
+                               "code": out.code, **(reason or {})}
     return _confirm_pause(session)
 
 
@@ -544,6 +648,7 @@ def resolve_confirm(session: ClinicalSession, yes: bool) -> Step:
     session.pending_confirm = None
     if pending is None:
         raise ProtocolError("confirm resolution without a pending answer")
+    session.stalls = 0
     if yes:
         session.responses.setdefault(
             pending["instrument"], {})[pending["item_index"]] = pending["code"]
@@ -578,6 +683,7 @@ def correct(session: ClinicalSession, out: TurnOut) -> Step | None:
     old = responses[out.item]
     if old == out.code:
         return repeat_step(session)          # no-op change: just re-pose
+    session.stalls = 0
     responses[out.item] = out.code
     session.corrections.append({"instrument": exp.instrument,
                                 "item": out.item, "old": old,
@@ -587,6 +693,88 @@ def correct(session: ClinicalSession, out: TurnOut) -> Step | None:
     # Re-run from the paused RunItems step: the next unanswered, unskipped
     # item is recomputed under the corrected skip landscape.
     return _run(session, [])
+
+
+# --------------- Stalls and the missing-data exit (F1/F2) ---------------
+
+# How many consecutive failed turns the SAME pause tolerates before the
+# engine stops re-asking and degrades. dont_know escapes after one anchored
+# probe (2nd occurrence); unclear gets one more clarification attempt.
+DONT_KNOW_LIMIT = 2
+UNCLEAR_LIMIT = 3
+
+
+def note_stall(session: ClinicalSession) -> int:
+    """Count one failed turn (unclear / dont_know) at the current pause and
+    return the streak. Every successful consume resets it."""
+    session.stalls += 1
+    return session.stalls
+
+
+def mark_missing(session: ClinicalSession, reason: str = "no_answer") -> Step:
+    """F2's exit: the person cannot (or will not) answer the current pause
+    after the engine's probes — record it as MISSING and move the protocol
+    on. Never a guess: missing instrument items score 0 (the total is a
+    lower bound, Assessment.missing carries the flag for the provider);
+    an unanswerable permission gate degrades to its decline path (the safe
+    direction — nothing is screened without a clear yes); an unanswerable
+    open/number ask is recorded as not answered. This is the guaranteed
+    terminus that makes every clarification loop finite (F7)."""
+    session.stalls = 0
+    exp = session.expect
+    step = PROTOCOL[session.pc]
+    skip_line = Say("item.skipped", templates.FIXED["item.skipped"])
+
+    if exp.kind == "confirm":
+        # A read-back that can't get a yes/no: drop the UNVERIFIED candidate
+        # code and mark the item missing — an unconfirmable score-critical
+        # answer must not be committed on the model's claim alone.
+        p = session.pending_confirm
+        session.pending_confirm = None
+        if p is not None:
+            session.missing.setdefault(
+                p["instrument"], {})[p["item_index"]] = "unconfirmed"
+            logger.info("[clinical] confirm unresolvable: %s item %d "
+                        "marked missing", p["instrument"], p["item_index"])
+        return _run(session, [skip_line])
+
+    if exp.kind == "option" and exp.instrument:
+        if exp.instrument == "prescreen":
+            q = PRE_SCREEN[exp.item_index]
+            # Route as negative (score 0) but record the truth: the arm was
+            # not screened because the question went unanswered.
+            session.prescreen[q.key] = 0
+            session.missing.setdefault(
+                "prescreen", {})[exp.item_index] = reason
+        else:
+            session.missing.setdefault(
+                exp.instrument, {})[exp.item_index] = reason
+        logger.info("[clinical] item missing (%s): %s", reason, session.node)
+        return _run(session, [skip_line])
+
+    if isinstance(step, Gate):
+        key = exp.ask_key or step.key
+        if key == "consent.opening":
+            session.consent = "no"
+        session.declined.append(key)
+        session.missing.setdefault("gates", {})[key] = reason
+        logger.info("[clinical] gate unanswerable (%s): %s -> decline path",
+                    reason, key)
+        session.pc = label_index(step.on_no)
+        return _run(session, [])           # the decline path speaks for itself
+
+    if isinstance(step, Ask):
+        key = _ask_key(step)
+        session.missing.setdefault("asks", {})[key] = reason
+        if step.kind != "number":
+            session.answers.setdefault(key, "(not answered)")
+        # A missing readiness ruler leaves session.readiness unset; the
+        # protocol's _after_ruler route skips the ruler follow-ups.
+        logger.info("[clinical] ask unanswerable (%s): %s", reason, key)
+        session.pc += 1
+        return _run(session, [skip_line])
+
+    return repeat_step(session)            # end/unknown: nothing to skip
 
 
 def absorb(session: ClinicalSession, out: TurnOut) -> None:

@@ -18,6 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from . import coding
 from .instruments import BY_KEY, PRE_SCREEN
 
 # What a turn's utterance can BE, relative to the machine's current ask:
@@ -39,9 +40,16 @@ from .instruments import BY_KEY, PRE_SCREEN
 #                  the corrected item, `code` its new option. The engine
 #                  overwrites, re-derives skips/score from the declarative
 #                  data, and records old→new for audit.
+#   dont_know    — they cannot or prefer not to answer THIS question ("i
+#                  don't know", "can't remember", "skip that one") — a first-
+#                  class result, NOT unclear (T25/F1). The engine probes once
+#                  with a recall anchor (WHO manual p.18: estimate from the
+#                  heaviest period in the past year), then marks the item
+#                  missing and MOVES ON — never an endless re-ask. Distinct
+#                  from abort (stopping everything) and from answering "no".
 #   unclear      — none of the above is safe to assume (reply gently re-asks)
 Action = Literal["answer", "continuation", "question", "tangent", "crisis",
-                 "abort", "correction", "unclear"]
+                 "abort", "correction", "dont_know", "unclear"]
 
 
 class TurnOut(BaseModel):
@@ -64,6 +72,14 @@ class TurnOut(BaseModel):
     slots: dict[str, str] = Field(default_factory=dict)
     # For open single-capture asks: the captured answer text.
     text: str | None = None
+    # T26 extraction fields (the model EXTRACTS, coding.py buckets): for
+    # frequency items `value` + `per` ("every week" -> 1, "week"); for
+    # drink-quantity items `value` + `unit` [+ `beverage`] ("one liter of
+    # whiskey" -> 1, "liter", "whiskey"; "ten or more" -> 10, "drinks").
+    value: float | None = None
+    per: str | None = None
+    unit: str | None = None
+    beverage: str | None = None
     # What the avatar says THIS turn. For `answer`: a short acknowledgment
     # only (the engine's own next utterances follow it). For question/
     # tangent/continuation/unclear: the complete bounded response (answer
@@ -74,6 +90,13 @@ class TurnOut(BaseModel):
     # the option's exact wording, so a T20 confirm item commits without a
     # read-back.
     exact: bool = False
+    # Set by validate()'s deterministic derivation only (also force-cleared
+    # from model output): a conversion default entered the coding / the
+    # value sat near a bucket edge — either one earns a read-back (F5) —
+    # and the spoken conversion note for it (F6).
+    assumed: bool = False
+    boundary: bool = False
+    note: str = ""
 
     @field_validator("reply", "text", mode="before")
     @classmethod
@@ -85,7 +108,10 @@ def _unclear(out: TurnOut, why: str) -> TurnOut:
     """Downgrade to unclear, KEEPING the model's reply (it is usually already
     a sensible clarification); the engine treats unclear as hold-and-re-ask."""
     return out.model_copy(update={"action": "unclear", "code": None,
-                                  "item": None, "slots": {}, "text": None})
+                                  "item": None, "slots": {}, "text": None,
+                                  "value": None, "per": None, "unit": None,
+                                  "beverage": None, "assumed": False,
+                                  "boundary": False, "note": ""})
 
 
 def expected_item(expect):
@@ -122,9 +148,12 @@ def validate(out: TurnOut, expect) -> TurnOut:
         # everything else carries only a reply.
         if out.action == "continuation":
             return out
-        if out.code is not None or out.item is not None or out.slots or out.text:
+        if (out.code is not None or out.item is not None or out.slots
+                or out.text or out.value is not None):
             return out.model_copy(update={"code": None, "item": None,
-                                          "slots": {}, "text": None})
+                                          "slots": {}, "text": None,
+                                          "value": None, "per": None,
+                                          "unit": None, "beverage": None})
         return out
 
     kind = expect.kind
@@ -134,6 +163,23 @@ def validate(out: TurnOut, expect) -> TurnOut:
         return _unclear(out, f"{kind} needs yes(1)/no(0)")
     if kind == "option":
         item = expected_item(expect)
+        if item.coding != "choice" and not out.exact:
+            # T26/F4: for frequency/quantity scales a semantic answer is
+            # never taken as a model-claimed code — the code is COMPUTED
+            # from the extracted fields (coding.py), or the turn stays
+            # unclear. "Legal but wrong" buckets cannot pass here.
+            derived = coding.derive(item.coding, value=out.value,
+                                    per=out.per, unit=out.unit,
+                                    beverage=out.beverage)
+            if derived is None:
+                return _unclear(
+                    out, f"{item.coding} answer not derivable from "
+                         f"extraction (value={out.value!r} per={out.per!r} "
+                         f"unit={out.unit!r} beverage={out.beverage!r})")
+            return out.model_copy(update={
+                "code": derived.code, "assumed": derived.assumed,
+                "boundary": derived.boundary, "note": derived.note,
+                "slots": {}, "text": None})
         if isinstance(out.code, int) and 0 <= out.code < len(item.options):
             return out
         return _unclear(out, "option code out of range")
