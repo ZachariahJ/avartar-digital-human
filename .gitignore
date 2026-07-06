@@ -13,6 +13,10 @@ checkpoints
 tmp/
 results/
 
+# Test suite: kept LOCAL, deliberately untracked (see README "Tests" for how
+# to rematerialize it from git history)
+tests/
+
 # Consent audit trail (per-deployment record, never in the repo)
 records/
 

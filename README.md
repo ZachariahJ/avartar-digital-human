@@ -91,7 +91,7 @@ digital-human/
 │       └── prompt.py        #   build_system_prompt() — now used for crisis turns
 ├── scripts/
 │   └── sim_conversation.py  # text-layer acceptance sim (real LLM, no GPU stack)
-├── tests/                   # pytest: gold-standard case cards + integration
+├── tests/                   # pytest suite — LOCAL ONLY, untracked (see "Tests")
 ├── static/
 │   ├── index.html           # Frontend UI
 ├── assets/
@@ -146,21 +146,36 @@ cached clip automatically (sidecar text check).
 
 ## Tests
 
+The pytest suite is deliberately **not tracked** in this repo (`tests/` is
+gitignored; the repo ships lean). It lives in git history — rematerialize it
+into your working tree with:
+
+```bash
+# Restore tests/ from the parent of the commit that removed it (the grep
+# survives history rewrites; the suite lands untracked, hidden by .gitignore):
+git restore --source="$(git log --format=%H -1 --all --grep='removed test files')^" -- tests/
+```
+
+Then:
+
 ```bash
 # Deterministic core (no GPU/network needed):
 python -m pytest tests/ -q
 # Full suite incl. real-Pipeline integration (needs the float env's deps):
 ~/.conda/envs/float/bin/python -m pytest tests/ -q
 # Conversation-quality acceptance at the text layer (REAL LLM, no GPU stack;
-# replays the field transcript that motivated the turn-engine refactor):
+# replays the field transcript that motivated the turn-engine refactor —
+# this one IS tracked in the repo):
 python scripts/sim_conversation.py
 ```
 
 Gold-standard fixtures under `tests/fixtures/` are hand-scored from the case
-cards in `SBIRT_Reference/` — fix code, never fixtures. The float-env suite
-also locks the generation budget: a full session renders dynamic clips only
-for the acks/composed asks/BI summaries — fixed content plays from
-`assets/clips/` with ZERO runtime FLOAT renders.
+cards in `SBIRT_Reference/` — fix code, never fixtures. Run the suite before
+touching anything under `modules/sbirt/` (scores/zones/skip rules have no
+other guardrail). The float-env suite also locks the generation budget: a
+full session renders dynamic clips only for the acks/composed asks/BI
+summaries — fixed content plays from `assets/clips/` with ZERO runtime FLOAT
+renders.
 
 ## Running
 
