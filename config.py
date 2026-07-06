@@ -105,19 +105,6 @@ CONSENT_LOG_PATH = os.getenv(
     os.path.join(RECORDS_DIR, "consent_log.jsonl"),
 )
 
-# T24: encrypted-at-rest session state, keyed by pseudonymous sid, so a crash
-# or reconnect resumes mid-protocol instead of restarting (research data
-# integrity — coded answers survive the process). Files are Fernet-encrypted;
-# the key comes from SBIRT_STATE_KEY (a urlsafe-base64 32-byte Fernet key) or,
-# as a single-host fallback, is generated once into records/state.key with
-# mode 0600. Production deployments should inject the key from a secrets
-# manager instead of keeping it beside the data.
-SESSION_STATE_DIR = os.getenv(
-    "SESSION_STATE_DIR", os.path.join(RECORDS_DIR, "sessions"))
-SESSION_STATE_KEY = os.getenv("SBIRT_STATE_KEY", "")
-SESSION_STATE_KEY_PATH = os.getenv(
-    "SESSION_STATE_KEY_PATH", os.path.join(RECORDS_DIR, "state.key"))
-
 # --- EOU: semantic end-of-utterance / turn detection (smart-turn v3) ---
 # When enabled, a VAD-detected pause is only treated as the end of the user's turn
 # if the smart-turn model agrees the utterance is semantically complete. This stops

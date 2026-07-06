@@ -6,5 +6,4 @@ scipy
 starlette
 uvicorn
 onnxruntime   # CPU-only; for smart-turn v3 EOU (semantic end-of-utterance) in modules/eou.py
-cryptography  # Fernet encryption of at-rest session state (T24) in modules/privacy.py
 pytest        # dev/test only: tests/ (deterministic clinical core + pipeline integration)

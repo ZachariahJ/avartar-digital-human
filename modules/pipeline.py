@@ -120,19 +120,6 @@ class Pipeline:
         # decides every transition; the LLM never does.
         self.clinical = runtime.ClinicalSession()
         runtime.start(self.clinical)
-        # T24: a crash/restart resumes this sid's persisted state instead of
-        # restarting the protocol. Any restore problem degrades to fresh.
-        self._resume_pending = False
-        saved = privacy.load_session_state(audit_key)
-        if saved is not None:
-            try:
-                self.clinical = runtime.from_state_dict(saved)
-                self._resume_pending = True
-                logger.info("[clinical] restored persisted state at node %s",
-                            self.clinical.node)
-            except Exception as e:
-                logger.warning("state restore failed (%s) — fresh session",
-                               type(e).__name__)
         self._lock = threading.Lock()
         # Serializes protocol turns: coding -> machine advance -> delivery.
         # Two concurrent turns (voice + typed, or a barge-in racing a slow
@@ -152,13 +139,6 @@ class Pipeline:
     def _aborted(self, turn):
         """True if this response was cancelled or superseded by a newer turn."""
         return self.cancel_event.is_set() or turn != self._turn
-
-    def _persist(self):
-        """T24: write the authoritative clinical state (encrypted) so a crash
-        or reconnect resumes here. Failures are logged inside privacy and
-        never break the turn."""
-        privacy.save_session_state(self.audit_key,
-                                   runtime.to_state_dict(self.clinical))
 
     def on_speech_start(self):
         """Called by main.ws_audio when user starts speaking (barge-in)."""
@@ -237,23 +217,11 @@ class Pipeline:
     def _process_greeting(self, turn):
         """Deliver the fixed opening from the cached clip — no LLM/TTS/FLOAT. Records
         it as the assistant's first turn so the conversation flows straight into the
-        user's yes/no consent reply. A session restored mid-protocol (T24) is
-        RESUMED instead: welcome back + the pending question, not a restart."""
+        user's yes/no consent reply."""
         try:
             if self._aborted(turn):
                 self.state = "idle"
                 return
-            c = self.clinical
-            if (self._resume_pending and c.consent == "yes"
-                    and not c.crisis and c.expect.kind != "end"):
-                self._resume_pending = False
-                step = runtime.resume(c)
-                utts = (runtime.Say("session.resumed",
-                                    templates.FIXED["session.resumed"]),
-                        ) + tuple(step.utterances)
-                return self._deliver_step(
-                    None, runtime.Step(step.node, utts, step.expect), turn)
-            self._resume_pending = False
             text = config.GREETING_TEXT
             video = ensure_fixed_clip(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
             # Record the fixed opening as the assistant's first turn in both histories.
@@ -280,7 +248,6 @@ class Pipeline:
         """User declined consent: record their reply + the FIXED thank-you line, play
         the cached decline clip, and end the turn. No screening, no dynamic LLM."""
         self._history_begin(user_text)          # record the user's "no"
-        self._persist()
         text = config.DECLINE_TEXT
         video = ensure_fixed_clip(text, config.DECLINE_VIDEO_PATH)
         self._history_set_assistant(text)
@@ -311,7 +278,6 @@ class Pipeline:
         # Pause the clinical protocol permanently for this session; later
         # turns run the full counselor with the crisis protocol.
         runtime.enter_crisis(self.clinical)
-        self._persist()
         text = crisis.RESPONSES[hit.category]
         video = ensure_fixed_clip(text, crisis_clip_path(hit.category))
         self._history_set_assistant(text)
@@ -697,12 +663,9 @@ class Pipeline:
         strictly in order. `ack` (when the turn was an answer) is prepended
         as its own short Speak so the person hears they were heard BEFORE the
         next protocol content — and, being the turn's first short segment, it
-        rides the FLOAT_NFE_FIRST fast path. `user_text=None` means a turn
-        with no user utterance (the T24 resume greeting)."""
-        if user_text is not None:
-            self._history_begin(user_text)
+        rides the FLOAT_NFE_FIRST fast path."""
+        self._history_begin(user_text)
         self.state = "processing"
-        self._persist()
         utterances = step.utterances
         if ack:
             utterances = (runtime.Speak(ack),) + tuple(utterances)
@@ -893,9 +856,6 @@ class Pipeline:
         self.ended = False
         self.clinical = runtime.ClinicalSession()
         runtime.start(self.clinical)
-        # Explicit reset = start over: forget the persisted state too (T24).
-        self._resume_pending = False
-        privacy.clear_session_state(self.audit_key)
         while not self.video_queue.empty():
             try:
                 self.video_queue.get_nowait()

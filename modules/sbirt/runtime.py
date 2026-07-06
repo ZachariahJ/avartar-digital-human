@@ -38,8 +38,7 @@ from . import templates
 from .flow import (ARM_INSTRUMENT, ARM_ORDER, Ask, End, Gate, Label, PROTOCOL,
                    RunItems, Route, Tell, close_unit, label_index)
 from .instruments import (assess, Assessment, BY_KEY, InvalidResponse,
-                          is_complete, next_item_index, option_score,
-                          PRE_SCREEN)
+                          next_item_index, option_score, PRE_SCREEN)
 from .turn import TurnOut
 
 logger = logging.getLogger(__name__)
@@ -588,110 +587,6 @@ def correct(session: ClinicalSession, out: TurnOut) -> Step | None:
     # Re-run from the paused RunItems step: the next unanswered, unskipped
     # item is recomputed under the corrected skip landscape.
     return _run(session, [])
-
-
-# --------------- State persistence (T24) ---------------
-# Serialization lives HERE (beside the state it serializes); encryption and
-# storage live in privacy.py. Assessments and last_step are NOT serialized —
-# both are derivable (scores recompute from the coded responses; the paused
-# ask re-emits via resume()), so the persisted dict can never disagree with
-# the deterministic layer.
-
-_STATE_VERSION = 1
-
-
-def to_state_dict(session: ClinicalSession) -> dict:
-    e = session.expect
-    return {
-        "v": _STATE_VERSION,
-        "pc": session.pc,
-        "node": session.node,
-        "expect": {"kind": e.kind, "instrument": e.instrument,
-                   "item_index": e.item_index, "ask_key": e.ask_key,
-                   "slots": list(e.slots), "missing": list(e.missing)},
-        "consent": session.consent,
-        "prescreen": dict(session.prescreen),
-        "arms": list(session.arms),
-        "arm": session.arm,
-        "responses": {k: {str(i): c for i, c in v.items()}
-                      for k, v in session.responses.items()},
-        "readiness": dict(session.readiness),
-        "declined": list(session.declined),
-        "corrections": [dict(c) for c in session.corrections],
-        "covered": sorted(session.covered),
-        "answers": dict(session.answers),
-        "slots": {k: dict(v) for k, v in session.slots.items()},
-        "last_ask_key": session.last_ask_key,
-        "pending_confirm": (dict(session.pending_confirm)
-                            if session.pending_confirm else None),
-        "crisis": session.crisis,
-        "aborted": session.aborted,
-    }
-
-
-def from_state_dict(d: dict) -> ClinicalSession:
-    """Rebuild a session from a persisted dict. Raises on version mismatch
-    or malformed data — the caller treats that as 'no saved state'."""
-    if d.get("v") != _STATE_VERSION:
-        raise ValueError(f"unsupported state version {d.get('v')!r}")
-    e = d["expect"]
-    s = ClinicalSession(
-        pc=int(d["pc"]),
-        node=d["node"],
-        expect=Expect(e["kind"], e.get("instrument"), e.get("item_index"),
-                      e.get("ask_key"), tuple(e.get("slots") or ()),
-                      tuple(e.get("missing") or ())),
-        consent=d.get("consent"),
-        prescreen=dict(d.get("prescreen") or {}),
-        arms=list(d.get("arms") or []),
-        arm=d.get("arm"),
-        responses={k: {int(i): c for i, c in v.items()}
-                   for k, v in (d.get("responses") or {}).items()},
-        readiness=dict(d.get("readiness") or {}),
-        declined=list(d.get("declined") or []),
-        corrections=[dict(c) for c in d.get("corrections") or []],
-        covered=set(d.get("covered") or []),
-        answers=dict(d.get("answers") or {}),
-        slots={k: dict(v) for k, v in (d.get("slots") or {}).items()},
-        last_ask_key=d.get("last_ask_key"),
-        pending_confirm=d.get("pending_confirm") or None,
-        crisis=bool(d.get("crisis")),
-        aborted=bool(d.get("aborted")),
-    )
-    for key, resp in s.responses.items():
-        if is_complete(BY_KEY[key], resp):
-            s.assessments[key] = assess(BY_KEY[key], resp)
-    return s
-
-
-def resume(session: ClinicalSession) -> Step:
-    """Re-emit the paused ask after a restore (T24): the machine does not
-    move; the pending question (or read-back, or crisis turn) is spoken
-    again so the person continues exactly where the session broke."""
-    if session.crisis:
-        return crisis_step(session)
-    if session.expect.kind == "end":
-        return _pause(session, session.node, [], Expect("end"))
-    if session.pending_confirm:
-        return _confirm_pause(session)
-    step = _run(session, [])
-    if not step.utterances:
-        # An ask_included Gate/Ask: its ask text was spoken by the Tell just
-        # before it in the original turn — re-emit THAT unit, through the
-        # same resolver (so e.g. the screen-permission variant still honors
-        # whether the drink definition was actually covered, T9). The
-        # consent gate has no preceding Tell: the pipeline replays the
-        # greeting clip for a pre-consent resume instead.
-        prog = PROTOCOL[session.pc]
-        included = (getattr(prog, "ask_included", False)
-                    or getattr(prog, "ask", "") == "included")
-        if included and session.pc > 0:
-            prev = PROTOCOL[session.pc - 1]
-            if isinstance(prev, Tell):
-                step = Step(step.node, tuple(_tell_beats(session, prev.unit)),
-                            step.expect)
-                session.last_step = step
-    return step
 
 
 def absorb(session: ClinicalSession, out: TurnOut) -> None:

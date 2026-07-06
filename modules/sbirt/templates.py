@@ -121,12 +121,6 @@ FIXED: dict[str, str] = {
     # Brief-intervention closer (source line; the flow Tells it right before
     # listening for the open answer).
     "bi.leaves_you": "So where does this leave you?",
-    # Spoken before re-posing the pending question when a session is restored
-    # after a disconnect/restart (T24). PENDING CLINICIAN REVIEW.
-    "session.resumed": (
-        "Welcome back — thanks for your patience. Let's pick up right where "
-        "we left off."
-    ),
 }
 
 

@@ -72,12 +72,10 @@ uncommitted until the person confirms — a "no" re-collects the item; exact-
 wording answers skip the read-back (T20). "Actually it's more like three
 times a week" corrects the earlier item, re-derives the skip landscape from
 the declarative rules, and logs old→new for audit (T21). "I'm done" anywhere
-closes gracefully with partial data kept and the abort recorded (T22). The
-authoritative session state is Fernet-encrypted to `records/sessions/` after
-every turn and keyed by the pseudonymous `sid`, so a crash or reconnect
-RESUMES at the pending question ("Welcome back…") instead of restarting
-(T24); the key comes from `SBIRT_STATE_KEY` or a generated
-`records/state.key` (move to a secrets manager for production).
+closes gracefully with partial data kept and the abort recorded (T22).
+(Encrypted at-rest state persistence with crash/reconnect resume — T24 —
+was built and then shelved for the research phase; recover it from git
+history, commit message "Persist encrypted session state".)
 
 Server: Starlette + uvicorn (single port 17861, HTTP + two WebSocket routes).
 Frontend: `static/index.html`, plain HTML/JS, no build step.
@@ -96,7 +94,7 @@ digital-human/
 │   ├── llm.py               # OpenRouter: the per-turn NLU+voice call + bounded utterances (+ crisis chat)
 │   ├── tts.py               # edge-tts (en-US-GuyNeural)
 │   ├── avatar.py            # FLOAT GPU pool + idle video
-│   ├── privacy.py           # PHI-safe logging (no opt-out) + consent audit + encrypted session state
+│   ├── privacy.py           # PHI-safe logging (no opt-out) + consent audit trail
 │   └── sbirt/               # SBIRT clinical framework — the deterministic core
 │       ├── instruments.py   #   structured tools + deterministic scoring in one file
 │       ├── flow.py          #   the study protocol as ONE declarative step program
@@ -156,8 +154,6 @@ All other settings live in `config.py`. Common knobs:
 | `VAD_THRESHOLD` | `0.5` | Silero VAD trigger threshold |
 | `VAD_SILENCE_DURATION` | `0.35` | Seconds of silence to mark sentence end |
 | `CONSENT_LOG_PATH` | `records/consent_log.jsonl` | Consent audit trail |
-| `SESSION_STATE_DIR` | `records/sessions/` | Encrypted per-sid session state (crash/reconnect resume) |
-| `SBIRT_STATE_KEY` | (generated `records/state.key`) | Fernet key for at-rest state; inject from a secrets manager in production |
 | `SYSTEM_PROMPT` | built from `modules/sbirt/` | Crisis-turn counselor prompt — **do not edit the string**; edit the clinical data modules under `modules/sbirt/` and it rebuilds automatically |
 
 Clinical content (questions, options, scores, zones, feedback wording) lives in
@@ -234,6 +230,3 @@ On startup:
 - `numpy` must be <2, `opencv-python` must be <4.11.
 - `edge-tts` is async; when calling from a synchronous thread you need `asyncio.run` or a thread pool. See `modules/tts.py`.
 - On first launch, `assets/idle_loop.mp4` is auto-generated if missing — this requires the FLOAT checkpoint to already be in place.
-- Losing `records/state.key` (when no `SBIRT_STATE_KEY` is set) makes every
-  persisted session state unreadable — sessions then silently start fresh.
-  Back the key up, or inject it via `SBIRT_STATE_KEY`.
