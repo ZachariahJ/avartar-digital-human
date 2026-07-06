@@ -58,6 +58,14 @@ FIXED: dict[str, str] = {
         "past year? In these questions a drink refers to the standard drink "
         "definition we just discussed."
     ),
+    # Spoken INSTEAD of the line above when the user declined the standard-
+    # drink education: it must not claim a definition "we just discussed" was
+    # discussed. The flow picks the variant from state.covered. Wording is the
+    # source line minus the false reference. PENDING CLINICIAN REVIEW.
+    "alcohol.screen.permission.no_defn": (
+        "May I ask you a few more questions about your use of alcohol in the "
+        "past year?"
+    ),
     "alcohol.feedback.permission": (
         "May I give you feedback on the questions you just answered about "
         "your alcohol use?"
@@ -74,10 +82,21 @@ FIXED: dict[str, str] = {
         "about your drug use?"
     ),
 
-    # Close (spoken at the end of every completed session)
+    # Close (spoken at the end of a COMPLETED session — study text verbatim;
+    # its "few more questions about your experiences" refers to the study's
+    # post-session experience survey)
     "close": (
         "Thank you for participating in this process. We have a few more "
         "questions to ask you about your experiences."
+    ),
+    # Close spoken when the session ends because the user DECLINED a screening/
+    # feedback/BI permission: it must not promise more questions right after
+    # "that's your call" (the session actually ends here — the old close
+    # contradicted itself on this path). Source has no dedicated text; minimal
+    # autonomy-respecting goodbye. PENDING CLINICIAN REVIEW.
+    "close.declined": (
+        "Thank you for your time today. Your provider can pick any of this "
+        "up with you during your visit, whenever you're ready."
     ),
     # All pre-screens negative: the source dialogue has no dedicated text, so a
     # minimal neutral affirmation precedes the standard close. PENDING
@@ -92,6 +111,9 @@ FIXED: dict[str, str] = {
     "permission.declined": (
         "That's completely your call, and that's fine."
     ),
+    # Brief-intervention closer (source line; the flow Tells it right before
+    # listening for the open answer).
+    "bi.leaves_you": "So where does this leave you?",
 }
 
 
@@ -212,7 +234,50 @@ def bi_why_not_higher(value: int) -> str:
     return f"Why are you a {value} and not a 9 or 10?"
 
 
-BI_LEAVES_YOU = "So where does this leave you?"
+BI_LEAVES_YOU = FIXED["bi.leaves_you"]   # single source: the FIXED entry
+
+
+# --------------- Content units (T8): what a turn must convey ---------------
+# A Unit is ONE thing the counselor delivers in a turn. verbatim=True units
+# speak `literal` exactly (study fidelity; cacheable as a clip). verbatim=False
+# units give the LLM `points` — the clinical content it must cover in its own
+# words for THIS person (typically grounded in state the engine passes along,
+# e.g. the user's own likes/dislikes wording). The LLM may rephrase points;
+# it may not drop, extend, or contradict them.
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Unit:
+    id: str
+    verbatim: bool
+    literal: str = ""             # verbatim=True: the exact text
+    points: tuple[str, ...] = ()  # verbatim=False: content the LLM must cover
+
+
+# Non-verbatim units: the brief-intervention reflections/summaries the LLM
+# phrases each time (these were inline instructions in runtime.py; as data
+# they are reviewable and testable). {likes}/{dislikes}/{ruler}... slots are
+# filled by the engine from captured state before handing to the LLM.
+POINTS_UNITS: dict[str, Unit] = {
+    u.id: u for u in (
+        Unit("bi.summary.balance", verbatim=False, points=(
+            "Summarize back FIRST what the person said they LIKE about their "
+            "use, THEN what they DISLIKE, using their own words where possible.",
+            "One or two sentences. No advice, no new clinical content.",
+        )),
+        Unit("bi.summary.rulers", verbatim=False, points=(
+            "Summarize the person's reasons for not being a 9 or 10, then "
+            "their reasons for not being a 1 or 2, using their own words.",
+            "One or two sentences. No advice.",
+        )),
+        Unit("bi.reflect", verbatim=False, points=(
+            "In one brief sentence, reflect what the person just said about "
+            "where this leaves them. No new questions.",
+        )),
+    )
+}
 
 
 def all_fixed_utterances() -> dict[str, str]:
@@ -243,5 +308,4 @@ def all_fixed_utterances() -> dict[str, str]:
     for v in range(11):
         out[f"bi.why_not_lower.{v}"] = bi_why_not_lower(v)
         out[f"bi.why_not_higher.{v}"] = bi_why_not_higher(v)
-    out["bi.leaves_you"] = BI_LEAVES_YOU
-    return out
+    return out   # bi.leaves_you arrives via FIXED

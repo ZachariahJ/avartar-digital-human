@@ -60,9 +60,11 @@ def test_parameterized_bi_lines():
 
 def test_all_fixed_utterances_enumeration():
     cat = templates.all_fixed_utterances()
-    # 12 FIXED + 8 feedback + 3 prescreen + 2 preambles + 20 items
-    # + 2*5 BI arm lines + 22 ruler variants + leaves_you = 78
-    assert len(cat) == 78, f"enumeration changed: {len(cat)} keys"
+    # 15 FIXED (12 original + T9 screen-permission no-defn variant + T10
+    # declined close + bi.leaves_you folded into FIXED) + 8 feedback
+    # + 3 prescreen + 2 preambles + 20 items + 2*5 BI arm lines
+    # + 22 ruler variants = 80
+    assert len(cat) == 80, f"enumeration changed: {len(cat)} keys"
     for key, text in cat.items():
         assert text and text.strip(), key
     # Every AUDIT/DAST question and all 11 ruler variants are pre-warmable.
