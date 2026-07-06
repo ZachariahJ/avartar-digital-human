@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config                                             # noqa: E402
 from modules import llm                                   # noqa: E402
 from modules.sbirt import crisis, runtime, templates      # noqa: E402
+from modules.sbirt.instruments import BY_KEY              # noqa: E402
 from modules.sbirt.runtime import LLMSay, Say, Speak      # noqa: E402
 
 
@@ -56,6 +57,15 @@ class TextSession:
                 ("alcohol.edu.limits", "recommended_drinking_limits")):
             if unit_key in c.covered:
                 facts[fact_key] = templates.FIXED[unit_key]
+        exp = c.expect
+        if (exp.kind == "option" and exp.instrument
+                and exp.instrument != "prescreen"):
+            items = BY_KEY[exp.instrument].items
+            facts["answers_already_given"] = [
+                {"item": i, "question": items[i].text,
+                 "answer": items[i].options[code].label}
+                for i, code in sorted(
+                    c.responses.get(exp.instrument, {}).items())]
         return facts
 
     def last_ask(self):
@@ -114,6 +124,15 @@ class TextSession:
             reply = self.speak(step.utterances)
             self.transcript.append(("avatar", reply, "ABORT"))
             return reply, "abort"
+
+        if out.action == "correction":
+            step = runtime.correct(self.s, out)
+            if step is not None:
+                reply = self.speak(step.utterances, ack=out.reply)
+                self.transcript.append(
+                    ("avatar", reply, f"correction→{self.s.node}"))
+                return reply, "correction"
+            # fall through to the hold path (clarify which item they mean)
 
         if out.action == "answer":
             step = runtime.advance(self.s, out)

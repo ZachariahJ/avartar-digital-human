@@ -469,6 +469,18 @@ class Pipeline:
                 ("alcohol.edu.limits", "recommended_drinking_limits")):
             if unit_key in c.covered:
                 facts[fact_key] = templates.FIXED[unit_key]
+        # Mid-instrument: what they already answered, so a correction turn
+        # ("actually it's more like three times a week") can name its target
+        # item (T21). Deterministic state only — item text + coded label.
+        exp = c.expect
+        if (exp.kind == "option" and exp.instrument
+                and exp.instrument != "prescreen"):
+            items = BY_KEY[exp.instrument].items
+            facts["answers_already_given"] = [
+                {"item": i, "question": items[i].text,
+                 "answer": items[i].options[code].label}
+                for i, code in sorted(
+                    c.responses.get(exp.instrument, {}).items())]
         return facts
 
     def _protocol_turn(self, user_text, turn):
@@ -535,6 +547,21 @@ class Pipeline:
                 self._deliver_step(user_text, step, turn)
                 self.ended = True
                 return
+
+            if out.action == "correction":
+                # T21: overwrite the earlier item, let skips/score re-derive,
+                # re-pose the (possibly changed) current item. An inapplicable
+                # target (not an answered item of the active instrument)
+                # holds and clarifies instead of moving anything.
+                try:
+                    step = runtime.correct(clinical, out)
+                except InvalidResponse:
+                    logger.exception("correction failed; holding")
+                    step = None
+                if step is None:
+                    return self._hold(user_text, out.reply, turn)
+                return self._deliver_step(user_text, step, turn,
+                                          ack=out.reply)
 
             if out.action == "answer":
                 if exp.ask_key == "consent.opening":

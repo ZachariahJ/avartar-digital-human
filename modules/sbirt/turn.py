@@ -34,9 +34,14 @@ from .instruments import BY_KEY, PRE_SCREEN
 #                  closes gracefully with partial data kept; never a re-ask,
 #                  never a retention attempt. Distinct from answering "no"
 #                  to the current permission gate (that is an `answer`).
+#   correction   — they are CHANGING an answer they already gave to an
+#                  earlier item of the ACTIVE instrument (T21): `item` names
+#                  the corrected item, `code` its new option. The engine
+#                  overwrites, re-derives skips/score from the declarative
+#                  data, and records old→new for audit.
 #   unclear      — none of the above is safe to assume (reply gently re-asks)
 Action = Literal["answer", "continuation", "question", "tangent", "crisis",
-                 "abort", "unclear"]
+                 "abort", "correction", "unclear"]
 
 
 class TurnOut(BaseModel):
@@ -48,7 +53,11 @@ class TurnOut(BaseModel):
     action: Action
     # For option/yesno items and consent gates: the option INDEX (gates:
     # 0=no, 1=yes). For number asks (readiness ruler): the number itself.
+    # For corrections: the corrected item's NEW option index.
     code: int | None = None
+    # For corrections only: the 0-based index of the already-answered item
+    # being corrected (within the active instrument).
+    item: int | None = None
     # For open slot-asks: whichever declared slots the utterance filled,
     # e.g. {"drink": "whiskey", "amount": "12 oz"}. Unknown slot names are
     # dropped by validate(), never stored.
@@ -71,7 +80,7 @@ def _unclear(out: TurnOut, why: str) -> TurnOut:
     """Downgrade to unclear, KEEPING the model's reply (it is usually already
     a sensible clarification); the engine treats unclear as hold-and-re-ask."""
     return out.model_copy(update={"action": "unclear", "code": None,
-                                  "slots": {}, "text": None})
+                                  "item": None, "slots": {}, "text": None})
 
 
 def expected_item(expect):
@@ -87,14 +96,30 @@ def validate(out: TurnOut, expect) -> TurnOut:
     moves on validated input; the model's claim alone moves nothing).
     Non-answer actions pass through with their payload fields cleared where
     meaningless. `expect` is the engine's runtime.Expect."""
+    if out.action == "correction":
+        # T21: shape-gate only what turn.py CAN know without the session —
+        # active non-prescreen instrument, a real item index other than the
+        # one currently being asked, a legal option code for THAT item.
+        # Whether the item was actually ANSWERED is the engine's check
+        # (runtime.correct); an inapplicable correction holds, never moves.
+        if (expect.kind == "option" and expect.instrument
+                and expect.instrument != "prescreen"
+                and isinstance(out.item, int) and isinstance(out.code, int)):
+            items = BY_KEY[expect.instrument].items
+            if (0 <= out.item < len(items)
+                    and out.item != expect.item_index
+                    and 0 <= out.code < len(items[out.item].options)):
+                return out.model_copy(update={"slots": {}, "text": None})
+        return _unclear(out, "correction needs a known earlier item + option")
+
     if out.action != "answer":
         # Continuations carry slots/text (absorbed into the PREVIOUS capture);
         # everything else carries only a reply.
         if out.action == "continuation":
             return out
-        if out.code is not None or out.slots or out.text:
-            return out.model_copy(update={"code": None, "slots": {},
-                                          "text": None})
+        if out.code is not None or out.item is not None or out.slots or out.text:
+            return out.model_copy(update={"code": None, "item": None,
+                                          "slots": {}, "text": None})
         return out
 
     kind = expect.kind

@@ -106,6 +106,7 @@ class ClinicalSession:
     assessments: dict[str, Assessment] = field(default_factory=dict)
     readiness: dict[str, int] = field(default_factory=dict)   # arm -> 0..10
     declined: list[str] = field(default_factory=list)         # declined permission keys (audit)
+    corrections: list[dict] = field(default_factory=list)     # T21 audit: old→new codes
     covered: set[str] = field(default_factory=set)            # delivered unit ids (T9)
     answers: dict[str, str] = field(default_factory=dict)     # open captures (in-memory only)
     slots: dict[str, dict[str, str]] = field(default_factory=dict)  # slot captures
@@ -132,6 +133,7 @@ class ClinicalSession:
             },
             "readiness": dict(self.readiness),
             "declined": list(self.declined),
+            "corrections": [dict(c) for c in self.corrections],
             "covered": sorted(self.covered),
             "answered": sorted(self.answers),
             "slots_filled": {k: sorted(v) for k, v in self.slots.items()},
@@ -487,6 +489,40 @@ def advance(session: ClinicalSession, out: TurnOut) -> Step:
         raise ProtocolError(
             f"advance() only takes validated answers, got {out.action!r}")
     _consume(session, out)
+    return _run(session, [])
+
+
+def correct(session: ClinicalSession, out: TurnOut) -> Step | None:
+    """Apply a VALIDATED correction (T21): overwrite an already-answered item
+    of the ACTIVE instrument with its new code, record old→new for audit, and
+    re-emit the current pause. The downstream consequences are re-derived, not
+    patched: next_item_index re-reads the declarative skip rules (a corrected
+    Q2/Q3 can un-skip items 4-8 or newly skip them), and the score/zone are
+    only ever computed at completion from the corrected codes. Returns None
+    when the target isn't an answered item of the active instrument — the
+    pipeline then holds and clarifies instead of moving anything."""
+    exp = session.expect
+    if (exp.kind != "option" or not exp.instrument
+            or exp.instrument == "prescreen"):
+        return None
+    responses = session.responses.get(exp.instrument, {})
+    if out.item not in responses or not isinstance(out.code, int):
+        return None
+    instrument = BY_KEY[exp.instrument]
+    # Validates the new code (raises InvalidResponse on a coder bug rather
+    # than silently mis-scoring) — turn.validate already shape-gated it.
+    option_score(instrument, out.item, out.code)
+    old = responses[out.item]
+    if old == out.code:
+        return repeat_step(session)          # no-op change: just re-pose
+    responses[out.item] = out.code
+    session.corrections.append({"instrument": exp.instrument,
+                                "item": out.item, "old": old,
+                                "new": out.code})
+    logger.info("[clinical] correction: %s item %d code %d -> %d",
+                exp.instrument, out.item, old, out.code)
+    # Re-run from the paused RunItems step: the next unanswered, unskipped
+    # item is recomputed under the corrected skip landscape.
     return _run(session, [])
 
 

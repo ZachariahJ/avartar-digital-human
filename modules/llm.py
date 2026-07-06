@@ -220,7 +220,7 @@ Session facts (the ONLY source for factual claims in your reply):
 {facts}
 
 Read the user's utterance and output ONLY a compact JSON object:
-{{"action": "...", "code": null, "slots": {{}}, "text": null, "reply": "..."}}
+{{"action": "...", "code": null, "item": null, "slots": {{}}, "text": null, "reply": "..."}}
 
 action — exactly one of:
   "answer"       it answers the current ask (even partially for slots)
@@ -231,6 +231,9 @@ action — exactly one of:
   "abort"        they clearly want to stop the WHOLE conversation ("stop",
                  "i'm done", "i don't want to do this anymore") — NOT a
                  plain "no" to the current may-I question (that's "answer")
+  "correction"   they are CHANGING an answer they already gave to an earlier
+                 question ("actually it's more like three times a week") —
+                 see answers_already_given in the session facts
   "unclear"      none of the above is safe to assume
 
 Coding rules (guess-free — a wrong code corrupts a validated screening):
@@ -252,6 +255,10 @@ Coding rules (guess-free — a wrong code corrupts a validated screening):
   slot needs a usable rough quantity: a bare "more than one" / "a lot", or
   an answer in the wrong dimension (a count of TIMES when asked how many
   DRINKS) -> action "unclear", never a capture.
+- correction: "item" = the item number being corrected (from
+  answers_already_given in the session facts) and "code" = its NEW option
+  number — BOTH only when unambiguous. If you cannot tell which question
+  they mean or which option is now right, use "unclear" and ask which.
 
 reply rules — you speak WITH the person, warm and plain-spoken:
 - answer: reply is ONLY a brief acknowledgment of what they said, at most 8
@@ -268,6 +275,8 @@ reply rules — you speak WITH the person, warm and plain-spoken:
   return to the current ask.
 - continuation: briefly acknowledge the added detail, then re-pose the
   current ask in a few words.
+- correction: confirm the change in a few words (say the new answer back);
+  the engine re-poses the current question after you.
 - unclear: ONE short clarifying question aimed at exactly what is missing.
   If their words sit between specific choices, name those choices ("Would
   that be five or six drinks, or more like seven to nine?"); if they
