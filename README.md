@@ -145,10 +145,13 @@ disk on every request, so a browser refresh (hard-refresh; no `Cache-Control`
 is set) picks up UI edits immediately.
 
 ```bash
-# 1. stop whoever holds the port (graceful; uvicorn drains in ~2s)
-kill -TERM $(ss -lptnH "sport = :17861" | grep -oP 'pid=\K[0-9]+')
+# 1. stop whoever holds the port, and WAIT for it to actually exit
+PID=$(ss -lptnH "sport = :17861" | grep -oP 'pid=\K[0-9]+')
+kill -TERM $PID
+while kill -0 $PID 2>/dev/null; do sleep 1; done   # uvicorn drains in ~2s
 
-# 2. start it detached, capturing BOTH stdout and stderr
+# 2. rotate the log, then start detached, capturing BOTH stdout and stderr
+mv -f run.log run.log.1 2>/dev/null
 LD_LIBRARY_PATH=:/usr/local/cuda/lib64 PYTHONUNBUFFERED=1 \
   setsid nohup /home/ryu11/.conda/envs/float/bin/python main.py \
   > run.log 2>&1 < /dev/null &
@@ -160,6 +163,12 @@ grep -q "Model pre-warm complete" run.log && \
 
 `conda activate float && python main.py` is the equivalent foreground form; the
 absolute interpreter path above is what the detached command needs.
+
+Do not skip the wait loop or the rotation. Truncating `run.log` with `>` while
+the old process still holds it open makes the kernel NUL-pad the file up to that
+process's write offset: the log becomes binary, and plain `grep` refuses to read
+it (`grep -a` still works). Waiting for the exit also avoids racing the old
+process for the port.
 
 Stop it by **port owner**, not by name: `pgrep -f "...main.py"` also matches the
 shell running the command whenever that pattern appears in its own command line,
