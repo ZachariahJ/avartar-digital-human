@@ -40,17 +40,28 @@ def protocol_clip_path(key: str) -> str:
 _fixed_clip_lock = threading.Lock()
 
 
+def clip_stamp(text: str) -> str:
+    """The full cache key for a rendered clip: the spoken text AND the reference
+    portrait it was rendered from. A clip is a function of both, so keying on
+    text alone was a face-swap trap — repointing config.AVATAR_IMAGE left every
+    cached clip replaying the OLD face forever, because no text had changed.
+    Stored verbatim in the clip's sidecar .txt."""
+    return f"avatar:{config.avatar_fingerprint()}\n{text}"
+
+
 def ensure_fixed_clip(text, path):
     """Render a FIXED line (`text`) to a cached clip at `path` ONCE and reuse it —
-    no per-session LLM/TTS/FLOAT, plays instantly. Regenerates only if the text
-    changed (tracked via a sidecar .txt). Returns the cached path, or None on failure.
-    Used for the always-identical greeting and consent-decline clips."""
+    no per-session LLM/TTS/FLOAT, plays instantly. Regenerates if the text OR the
+    reference portrait changed (both tracked via the sidecar .txt, see clip_stamp).
+    Returns the cached path, or None on failure. Used for the always-identical
+    greeting and consent-decline clips."""
     sidecar = path + ".txt"
+    stamp = clip_stamp(text)
     with _fixed_clip_lock:
         try:
             if os.path.exists(path) and os.path.exists(sidecar):
                 with open(sidecar, encoding="utf-8") as f:
-                    if f.read() == text:
+                    if f.read() == stamp:
                         return path  # cached and up to date
         except OSError:
             pass
@@ -67,7 +78,7 @@ def ensure_fixed_clip(text, path):
             if result is None:
                 return None
             with open(sidecar, "w", encoding="utf-8") as f:
-                f.write(text)
+                f.write(stamp)
             logger.info("Fixed clip cached at %s", path)
             return path
         except Exception as e:

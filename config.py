@@ -1,4 +1,5 @@
 import os
+import hashlib
 import threading
 from dotenv import load_dotenv
 
@@ -25,7 +26,31 @@ CERTS_DIR = os.path.join(BASE_DIR, "certs")
 
 FLOAT_DIR = os.path.join(os.path.dirname(BASE_DIR), "float")   # sibling repo, off-limits to edit
 FLOAT_CKPT = os.path.join(FLOAT_DIR, "checkpoints", "float.pth")
-AVATAR_IMAGE = os.path.join(ASSETS_DIR, "avatar.png")
+# The reference portrait the digital human is rendered from. MUST be a synthetic
+# (AI-generated) face that does not depict, and is not recognisably modelled on,
+# an identifiable real person — rendering a real person's likeness into a
+# clinician persona is a portrait-rights (肖像权) exposure. The former avatar.png /
+# avatar2.png / avatar3.png were celebrity-likeness renders and have been deleted
+# for exactly that reason — do not restore them from git history and point this
+# at them. avatar1.png and avatar5.png are the synthetic, non-identifiable faces.
+AVATAR_IMAGE = os.path.join(ASSETS_DIR, "avatar1.png")
+
+
+def avatar_fingerprint() -> str:
+    """Content digest of AVATAR_IMAGE — the cache key for everything FLOAT renders.
+
+    Every cached artifact (the fixed protocol clips, greeting/decline/crisis
+    clips, the idle loop) is a function of BOTH the spoken text AND this
+    portrait. The caches therefore key on this digest as well as the text, so
+    swapping the portrait invalidates them and they re-render on next startup.
+    Keying on text alone was a face-swap trap: changing AVATAR_IMAGE left every
+    cached clip silently replaying the OLD face.
+    """
+    try:
+        with open(AVATAR_IMAGE, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()[:16]
+    except OSError:
+        return "no-avatar"
 
 # LLM
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")

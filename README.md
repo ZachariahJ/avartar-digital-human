@@ -67,7 +67,9 @@ modules/
     intervention.py        MI/OARS, FRAMES, readiness-ruler reference data
     referral.py            ASAM levels of care, MAT, crisis protocol reference data
 assets/
-  avatar*.png              Source portrait(s) the avatar is rendered from
+  avatar*.png              Source portrait(s) the avatar is rendered from. MUST be
+                           synthetic faces with no identifiable real person behind
+                           them (portrait-rights / 肖像权). config.AVATAR_IMAGE picks one.
   idle_loop.mp4            Ambient idle loop shown between turns
 static/
   index.html               The single-page browser client (mic, video, chat)
@@ -133,6 +135,14 @@ Then open `https://<host>:17861/`. The first run is slow on purpose: it
 downloads Silero VAD via torch.hub, generates the idle loop, and pre-renders
 every fixed protocol line into a cached clip under `assets/clips/` —
 after that, fixed content plays instantly with zero per-session synthesis.
+
+Each cached clip is stamped in a sidecar `.txt` with both its spoken text and a
+digest of the reference portrait (`config.avatar_fingerprint()`). Change
+`GREETING_TEXT`, a protocol line, **or** `config.AVATAR_IMAGE` and the affected
+clips — including `idle_loop.mp4` — regenerate on the next start. Swapping the
+portrait therefore costs one full re-render (~89 clips, ~15 min on a single
+FLOAT GPU), which is the point: a face swap can never leave stale clips playing
+the old face.
 
 Press **Start** in the UI: the avatar speaks the fixed greeting and asks for
 consent; from there the protocol engine drives the whole screening.

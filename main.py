@@ -595,12 +595,25 @@ if __name__ == "__main__":
     import uvicorn
 
     try:
-        # Generate idle video if it doesn't exist
-        if not os.path.exists(config.IDLE_VIDEO_PATH):
-            logger.info("Generating idle loop video (first-time setup)...")
+        # Generate the idle loop if it is missing OR was rendered from a different
+        # reference portrait. Same stamp discipline as the fixed clips (see
+        # pipeline.clip_stamp): the loop is a function of config.AVATAR_IMAGE, so
+        # an existence check alone would leave the ambient video showing the OLD
+        # face after a portrait swap.
+        idle_sidecar = config.IDLE_VIDEO_PATH + ".txt"
+        idle_stamp = f"avatar:{config.avatar_fingerprint()}"
+        try:
+            with open(idle_sidecar, encoding="utf-8") as f:
+                idle_cached = f.read()
+        except OSError:
+            idle_cached = None
+        if not os.path.exists(config.IDLE_VIDEO_PATH) or idle_cached != idle_stamp:
+            logger.info("Generating idle loop video (missing or reference portrait changed)...")
             from modules import avatar
             try:
                 avatar.generate_idle_video(duration=config.IDLE_VIDEO_DURATION)
+                with open(idle_sidecar, "w", encoding="utf-8") as f:
+                    f.write(idle_stamp)
                 logger.info(f"Idle video saved to {config.IDLE_VIDEO_PATH}")
             except Exception as e:
                 logger.warning(f"Could not generate idle video: {e}")
