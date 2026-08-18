@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Usability Testing-Randomized Case Selection</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { background: #1a1a2e; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; padding: 24px 16px 48px; }
+
+.wrap { max-width: 560px; margin: 0 auto; }
+
+.page-head { padding-bottom: 16px; border-bottom: 1px solid #0f3460; margin-bottom: 20px; }
+.page-head h1 { font-size: 1.15em; color: #e94560; letter-spacing: 0.01em; }
+.page-head p { margin-top: 6px; font-size: 0.85em; color: #99a; line-height: 1.5; }
+
+.bar { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+.btn-refresh { padding: 10px 22px; border: none; border-radius: 6px; background: #e94560; color: #fff; font-size: 0.95em; font-weight: 600; cursor: pointer; }
+.btn-refresh:hover { opacity: 0.85; }
+.btn-refresh:active { transform: translateY(1px); }
+.draw-count { font-size: 0.8em; color: #778; }
+
+/* Empty state — shown until the first Refresh click. */
+.empty { padding: 40px 20px; text-align: center; border: 1px dashed #0f3460; border-radius: 12px; color: #778; font-size: 0.9em; line-height: 1.6; }
+
+.cc-card { background: #16213e; border: 1px solid #0f3460; border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4); }
+.cc-card[hidden] { display: none; }
+.cc-head { padding: 14px 18px; border-bottom: 1px solid #0f3460; }
+.cc-head .cc-id { font-size: 0.7em; letter-spacing: 0.08em; text-transform: uppercase; color: #888; margin-bottom: 3px; }
+.cc-head h2 { font-size: 1.05em; color: #e94560; }
+.cc-body { padding: 14px 18px; font-size: 0.9em; line-height: 1.55; }
+.cc-body p { margin-bottom: 10px; }
+.cc-body ul { margin: 0 0 12px 18px; }
+.cc-body li { margin-bottom: 6px; }
+.cc-body .cc-label { margin-bottom: 5px; font-size: 0.76em; font-weight: 600; letter-spacing: 0.07em; text-transform: uppercase; color: #7f9bc0; }
+.cc-body .cc-play { margin-bottom: 10px; padding: 8px 10px; background: rgba(15, 52, 96, 0.5); border-left: 2px solid #4ecca3; color: #cfd6e4; font-size: 0.86em; }
+.cc-body .cc-note { margin: 0; padding-top: 10px; border-top: 1px solid #0f3460; color: #99a; font-size: 0.85em; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div class="page-head">
+    <h1>Usability Testing-Randomized Case Selection</h1>
+    <p>Click Refresh to draw a case at random. Reloading this page does not draw
+       anything — only the button does.</p>
+  </div>
+
+  <div class="bar">
+    <button class="btn-refresh" id="btnRefresh" type="button">Refresh</button>
+    <span class="draw-count" id="drawCount"></span>
+  </div>
+
+  <div class="empty" id="emptyState">No case selected yet.<br>Click <strong>Refresh</strong> to draw one.</div>
+
+  <div class="cc-card" id="ccCard" hidden>
+    <div class="cc-head">
+      <div class="cc-id" id="ccId"></div>
+      <h2 id="ccTitle"></h2>
+    </div>
+    <div class="cc-body" id="ccBody"></div>
+  </div>
+</div>
+
+<script>
+(function() {
+  // ============ Usability Testing — Randomized Case Selection ============
+  // A role-play brief for the PERSON being screened: click Refresh to draw one
+  // case at random and answer the counselor in character, so a run exercises a
+  // known protocol branch instead of whatever the tester invents.
+  //
+  // MODEL-ISOLATED BY CONSTRUCTION. This page is a static file with NO network
+  // calls of any kind — no fetch, no WebSocket, no form post. The cards exist
+  // only in this file and in the reader's eyes, so there is no path by which
+  // card text can reach the server, the chat history, or the LLM's context.
+  // Keep it that way: never add an outbound call to this page.
+  //
+  // Card wording supplied by the study team (2026-08-17). The AUDIT and DAST-10
+  // answers are numbered in the order the engine actually administers them
+  // (modules/sbirt/instruments.py), so the tester can answer item by item.
+  const CASE_CARDS = [
+    {
+      id: 'Case 1',
+      title: 'Alcohol — Brief Intervention',
+      sections: [
+        { label: 'Reason for visit', text: 'Depression.' },
+        { label: 'Readiness to change (0–10)', text: '8 — fairly motivated.' },
+        { label: 'SBIRT 3 questions', items: [
+          'Cigarettes or other tobacco: no.',
+          'Last time you had more than 4 drinks in a day: at a birthday party this past weekend.',
+          'Illegal drugs or non-medical prescription use in the past year: none.',
+        ] },
+        { label: 'AUDIT answers', items: [
+          '1. How often you drink: 2–3 or more times a week.',
+          '2. Drinks on a typical drinking day: about 3.',
+          '3. Six or more on one occasion: a couple of times a year.',
+          '4. Unable to stop once you started: never.',
+          '5. Failed to do what was expected of you: less than monthly.',
+          '6. Needed a drink in the morning: never.',
+          '7. Guilt or remorse after drinking: once in a while — less than monthly.',
+          '8. Unable to remember the night before: no.',
+          '9. You or someone else injured: no.',
+          '10. Anyone concerned or suggested you cut down: yes — your spouse, partner or friend has said once or twice that you drink too much sometimes.',
+        ] },
+        { label: 'Only if asked', items: [
+          'Usually 2–3 glasses of wine, 2–3 times per week.',
+          'Plus 6–10 margaritas at parties, roughly 10 times a year.',
+        ] },
+        { label: 'Likes and dislikes', items: [
+          'Likes: it helps you relax and socialize with friends.',
+          'Dislikes: it costs too much, and your spouse complains.',
+        ] },
+      ],
+      play: 'A moderate-risk drinker with few consequences and real willingness to change — a straightforward brief intervention.',
+    },
+    {
+      id: 'Case 2',
+      title: 'Drug — Brief Intervention',
+      sections: [
+        { label: 'Reason for visit', text: 'Low energy, feeling depressed. You are NOT suicidal — say no if you are asked.' },
+        { label: 'Readiness to change (0–10)', text: '5 — genuinely ambivalent.' },
+        { label: 'SBIRT 3 questions', items: [
+          'Cigarettes or other tobacco: no.',
+          'Last time you had more than 4 drinks in a day: “I don’t drink.”',
+          'Illegal drugs or non-medical prescription use in the past year: “a lot of times.”',
+        ] },
+        { label: 'DAST answers (past 12 months)', items: [
+          '1. Used drugs other than those required for medical reasons: yes.',
+          '2. Used more than one drug at a time: yes.',
+          '3. Unable to stop using when you want to: yes.',
+          '4. Blackouts or flashbacks from drug use: yes.',
+          '5. Feel bad or guilty about your drug use: no.',
+          '6. Spouse or parents complain about it: yes.',
+          '7. Neglected your family because of drugs: yes.',
+          '8. Illegal activities to obtain drugs: yes — stealing money, and pills to sell.',
+          '9. Withdrawal symptoms when you stopped: no.',
+          '10. Medical problems from your drug use: no.',
+        ] },
+        { label: 'Only if asked', items: [
+          'You smoke crack and marijuana — about $30 worth of crack and 1–2 blunts at a time.',
+          'Crack 4–5 times per week; marijuana every other day.',
+        ] },
+        { label: 'Likes and dislikes', items: [
+          'Likes: relaxation and socializing.',
+          'Dislikes: you spend too much, and your family complains.',
+        ] },
+      ],
+      play: 'A high DAST score with legal and family consequences but no physical withdrawal, paired with a lukewarm 5 — this one is for practicing with ambivalence.',
+    },
+    {
+      id: 'Case 3',
+      title: 'Alcohol — Complete Case 3',
+      sections: [
+        { label: 'Reason for visit', text: 'Anxiety, stress, relationship conflict.' },
+        { label: 'Readiness to change (0–10)', text: '4 — resistant.' },
+        { label: 'SBIRT 3 questions', items: [
+          'Cigarettes or other tobacco: no.',
+          'Last time you had more than 4 drinks in a day: last night.',
+          'Illegal drugs or non-medical prescription use in the past year: none.',
+        ] },
+        { label: 'AUDIT answers', items: [
+          '1. How often you drink: 4 or more times a week.',
+          '2. Drinks on a typical drinking day: maybe 5 or 6.',
+          '3. Six or more on one occasion: almost every day.',
+          '4. Unable to stop once you started: sometimes on weekends — a couple of times a week.',
+          '5. Failed to do what was expected of you: most every weekend.',
+          '6. Needed a drink in the morning: most Mondays — “Mondays can be pretty tough.”',
+          '7. Guilt or remorse after drinking: about once a week.',
+          '8. Unable to remember the night before: at least weekly.',
+          '9. You or someone else injured: yes — a car accident a few months ago.',
+          '10. Anyone concerned or suggested you cut down: yes — after the accident your mom said she thought you were drinking too much.',
+        ] },
+        { label: 'Only if asked', items: [
+          'Liquor drinks — roughly two half-gallons a week.',
+          '5–6 drinks every day, more on weekends.',
+        ] },
+        { label: 'Likes and dislikes', items: [
+          'Likes: relaxation and socializing.',
+          'Dislikes: it costs too much, and your family complains.',
+        ] },
+      ],
+      play: 'Clear high-risk or dependent drinking — morning drinking, weekly blackouts, a car accident — combined with low motivation. This is the referral-to-treatment scenario, and the point is practicing under resistance.',
+    },
+    {
+      id: 'Case 4',
+      title: 'Drug — Complete Case 3',
+      sections: [
+        { label: 'Reason for visit', text: 'Racing thoughts, can’t sleep.' },
+        { label: 'Readiness to change (0–10)', text: '7 — reasonably willing.' },
+        { label: 'SBIRT 3 questions', items: [
+          'Cigarettes or other tobacco: no.',
+          'Last time you had more than 4 drinks in a day: “I don’t drink.”',
+          'Illegal drugs or non-medical prescription use: you last used today.',
+        ] },
+        { label: 'DAST answers (past 12 months)', items: [
+          '1. Used drugs other than those required for medical reasons: yes.',
+          '2. Used more than one drug at a time: yes.',
+          '3. Unable to stop using when you want to: yes.',
+          '4. Blackouts or flashbacks from drug use: yes.',
+          '5. Feel bad or guilty about your drug use: no.',
+          '6. Spouse or parents complain about it: yes.',
+          '7. Neglected your family because of drugs: yes.',
+          '8. Illegal activities to obtain drugs: yes — you have stolen from people in the past.',
+          '9. Withdrawal symptoms when you stopped: no.',
+          '10. Medical problems from your drug use: no.',
+        ] },
+        { label: 'Only if asked', items: [
+          'Marijuana (a lot) and crack at about $300 a week.',
+          '4 blunts a day, every day; $100 of crack three times a week.',
+        ] },
+        { label: 'Likes and dislikes', items: [
+          'Likes: relaxation and socializing.',
+          'Dislikes: you spend too much, and your family complains constantly.',
+        ] },
+      ],
+      play: 'The heaviest use of the four, daily and ongoing as of today, but with relatively strong motivation — good for running the full sequence through referral and a follow-up plan.',
+    },
+  ];
+
+  const CARD_NOTE = 'Answer the digital human in character. If it asks something '
+    + 'this card does not cover, improvise — but keep your answers consistent for '
+    + 'the whole session. Do not read the card aloud; it does not know any of this.';
+
+  const btnRefresh = document.getElementById('btnRefresh');
+  const emptyState = document.getElementById('emptyState');
+  const drawCount = document.getElementById('drawCount');
+  const ccCard = document.getElementById('ccCard');
+  const ccId = document.getElementById('ccId');
+  const ccTitle = document.getElementById('ccTitle');
+  const ccBody = document.getElementById('ccBody');
+
+  let draws = 0;
+
+  // Every draw is independent: a fresh CSPRNG read, with no reference to what
+  // came before. Nothing is persisted, so repeats are possible and expected —
+  // that is what uniform random means, not a bug.
+  function drawCard() {
+    const i = (window.crypto && crypto.getRandomValues)
+      ? crypto.getRandomValues(new Uint32Array(1))[0] % CASE_CARDS.length
+      : Math.floor(Math.random() * CASE_CARDS.length);
+    return CASE_CARDS[i];
+  }
+
+  function render(card) {
+    // Built with textContent, never innerHTML: card wording is content, not markup.
+    ccId.textContent = card.id;
+    ccTitle.textContent = card.title;
+    ccBody.textContent = '';
+    card.sections.forEach((sec) => {
+      const label = document.createElement('h3');
+      label.className = 'cc-label';
+      label.textContent = sec.label;
+      ccBody.appendChild(label);
+      if (sec.text) {
+        const p = document.createElement('p');
+        p.textContent = sec.text;
+        ccBody.appendChild(p);
+      }
+      if (sec.items) {
+        const ul = document.createElement('ul');
+        sec.items.forEach((entry) => {
+          const li = document.createElement('li');
+          li.textContent = entry;
+          ul.appendChild(li);
+        });
+        ccBody.appendChild(ul);
+      }
+    });
+    const play = document.createElement('p');
+    play.className = 'cc-play';
+    play.textContent = 'How to play it: ' + card.play;
+    ccBody.appendChild(play);
+    const note = document.createElement('p');
+    note.className = 'cc-note';
+    note.textContent = CARD_NOTE;
+    ccBody.appendChild(note);
+  }
+
+  btnRefresh.addEventListener('click', () => {
+    draws += 1;
+    render(drawCard());
+    emptyState.hidden = true;
+    ccCard.hidden = false;
+    drawCount.textContent = draws === 1 ? '1 draw' : draws + ' draws';
+    window.scrollTo(0, 0);
+  });
+
+  // No draw on load, by design: a page reload leaves the empty state in place.
+})();
+</script>
+</body>
+</html>

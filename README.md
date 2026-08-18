@@ -4,7 +4,7 @@ A real-time, voice-driven digital human that administers an SBIRT
 (Screening, Brief Intervention, Referral to Treatment) substance-use
 screening over the browser: the avatar speaks, listens, and walks the person
 through a validated clinical protocol — pre-screen, AUDIT / DAST-10,
-zone feedback, and a brief intervention — then hands the results to their
+zone feedback, and a brief intervention — then hands the results to their·
 provider.
 
 The design principle throughout: **the clinical protocol is deterministic
@@ -137,11 +137,61 @@ after that, fixed content plays instantly with zero per-session synthesis.
 Press **Start** in the UI: the avatar speaks the fixed greeting and asks for
 consent; from there the protocol engine drives the whole screening.
 
+### Restart the running service
+
+Every module is loaded into memory at startup, so **Python changes need a
+restart — frontend changes do not**: `GET /` re-reads `static/index.html` from
+disk on every request, so a browser refresh (hard-refresh; no `Cache-Control`
+is set) picks up UI edits immediately.
+
+```bash
+# 1. stop whoever holds the port (graceful; uvicorn drains in ~2s)
+kill -TERM $(ss -lptnH "sport = :17861" | grep -oP 'pid=\K[0-9]+')
+
+# 2. start it detached, capturing BOTH stdout and stderr
+LD_LIBRARY_PATH=:/usr/local/cuda/lib64 PYTHONUNBUFFERED=1 \
+  setsid nohup /home/ryu11/.conda/envs/float/bin/python main.py \
+  > run.log 2>&1 < /dev/null &
+
+# 3. wait for the models, then confirm it answers
+grep -q "Model pre-warm complete" run.log && \
+  curl -sk -o /dev/null -w "%{http_code}\n" https://127.0.0.1:17861/
+```
+
+`conda activate float && python main.py` is the equivalent foreground form; the
+absolute interpreter path above is what the detached command needs.
+
+Stop it by **port owner**, not by name: `pgrep -f "...main.py"` also matches the
+shell running the command whenever that pattern appears in its own command line,
+so `kill -TERM $(pgrep -f ...)` can take out your own session instead.
+
+Startup takes about 20 s — FLOAT onto its GPU, SenseVoice ASR, and the
+smart-turn EOU ONNX model all pre-warm before the first turn. `2>&1` is not
+optional: the application log goes to **stderr**, so a plain
+`python main.py > run.log` captures nothing but the banner.
+
+Smoke-test the environment *before* stopping the old process — a missing
+transitive dependency only surfaces at startup, once the running instance is
+already gone:
+
+```bash
+python -c "import uvicorn, starlette, click, funasr, onnxruntime" && echo OK
+```
+
+(`click` is uvicorn's own dependency and is not listed in `requirements.txt`
+by name; it has gone missing from the env before, which turns any restart into
+an outage.)
+
+One GPU caveat: stopping the server releases its ~4.6 GB, and the restart has
+to take that memory back. If the box is otherwise near capacity, another job
+can claim the gap — restart when you can watch it come back up, not blind.
+
 ## HTTP / WebSocket surface
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | Browser client |
+| `GET /static/case_card.html` | Usability Testing-Randomized Case Selection — the tester's role-play card. Static page, no server or model involvement; **Refresh** draws one case at random, a page reload draws nothing. |
 | `WS /ws/audio` | Mic audio in (16 kHz PCM), VAD/EOU/barge-in server-side |
 | `WS /ws/state` | Push channel: video segments, captions, session state |
 | `POST /api/greet` | Start a session (plays the greeting, arms consent) |
