@@ -1,358 +1,92 @@
-2026-08-18 10:33:44,902 [__main__] INFO: Generating idle loop video (missing or reference portrait changed)...
-2026-08-18 10:33:44,902 [modules.avatar] INFO: Loading FLOAT on GPU 3...
+2026-08-18 11:27:19,145 [__main__] INFO: Serving on https://0.0.0.0:17861  (open https://<your-host>:17861/ from the public internet)
+INFO:     Started server process [3828109]
+INFO:     Waiting for application startup.
+2026-08-18 11:27:19,164 [__main__] INFO: Pre-warming models (FLOAT pool on GPUs [3] + ASR on GPU 3)...
+2026-08-18 11:27:19,165 [modules.avatar] INFO: Loading FLOAT on GPU 3...
+INFO:     Application startup complete.
+INFO:     Uvicorn running on https://0.0.0.0:17861 (Press CTRL+C to quit)
 Some weights of Wav2VecModel were not initialized from the model checkpoint at /home/ryu11/new_Avatar/float/checkpoints/wav2vec2-base-960h and are newly initialized: ['wav2vec2.masked_spec_embed']
 You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
-2026-08-18 10:33:48,750 [modules.avatar] INFO: FLOAT GPU pool ready: [3]
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/tmp/tmph0h4qzt6.mp4
-2026-08-18 10:34:01,992 [__main__] INFO: Idle video saved to /home/ryu11/new_Avatar/digital-human/assets/idle_loop.mp4
-2026-08-18 10:34:01,993 [__main__] INFO: Serving on https://0.0.0.0:17861  (open https://<your-host>:17861/ from the public internet)
-INFO:     Started server process [3809810]
-INFO:     Waiting for application startup.
-2026-08-18 10:34:02,057 [__main__] INFO: Pre-warming models (FLOAT pool on GPUs [3] + ASR on GPU 3)...
-funasr version: 1.3.1.
-Check update of funasr, and it would cost few times. You may disable it by set `disable_update=True` in AutoModelINFO:     Application startup complete.
-
-INFO:     Uvicorn running on https://0.0.0.0:17861 (Press CTRL+C to quit)
-New version is available: 1.4.2.
-Please use the command "pip install -U funasr" to upgrade.
-2026-08-18 10:34:02,108 [root] INFO: download models from model hub: ms
-Downloading Model from https://www.modelscope.cn to directory: /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall
-2026-08-18 10:34:07,254 [root] WARNING: trust_remote_code: True
-Loading remote code failed: model, No module named 'model'
-2026-08-18 10:34:09,097 [root] INFO: Loading pretrained params from /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall/model.pt
-2026-08-18 10:34:09,101 [root] INFO: ckpt: /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall/model.pt
-2026-08-18 10:34:09,736 [root] INFO: scope_map: ['module.', 'None']
-2026-08-18 10:34:09,736 [root] INFO: excludes: None
-2026-08-18 10:34:09,794 [root] INFO: Loading ckpt: /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall/model.pt, status: <All keys matched successfully>
-2026-08-18 10:34:10,067 [modules.eou] INFO: EOU (smart-turn v3) loaded from /home/ryu11/new_Avatar/digital-human/checkpoints/smart-turn/smart-turn-v3.2-cpu.onnx
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/greeting.mp4
-2026-08-18 10:34:36,936 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/greeting.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/decline.mp4
-2026-08-18 10:34:43,421 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/decline.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_suicide.mp4
-2026-08-18 10:35:08,179 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_suicide.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_overdose.mp4
-2026-08-18 10:35:32,451 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_overdose.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_withdrawal.mp4
-2026-08-18 10:35:54,858 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_withdrawal.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_acute_danger.mp4
-2026-08-18 10:36:13,595 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/crisis_acute_danger.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.edu.permission.mp4
-2026-08-18 10:36:19,716 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.edu.permission.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.edu.standard_drink.mp4
-2026-08-18 10:36:34,930 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.edu.standard_drink.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.edu.limits.mp4
-2026-08-18 10:37:09,994 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.edu.limits.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.screen.permission.mp4
-2026-08-18 10:37:24,752 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.screen.permission.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.screen.permission.no_defn.mp4
-2026-08-18 10:37:30,447 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.screen.permission.no_defn.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.feedback.permission.mp4
-2026-08-18 10:37:38,103 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/alcohol.feedback.permission.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/drugs.kind.mp4
-2026-08-18 10:37:41,873 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/drugs.kind.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/drugs.screen.permission.mp4
-2026-08-18 10:37:48,228 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/drugs.screen.permission.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/drugs.feedback.permission.mp4
-2026-08-18 10:37:55,363 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/drugs.feedback.permission.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/close.mp4
-2026-08-18 10:38:05,801 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/close.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/close.declined.mp4
-2026-08-18 10:38:15,485 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/close.declined.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.all_negative.mp4
-2026-08-18 10:38:27,111 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.all_negative.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/permission.declined.mp4
-2026-08-18 10:38:31,903 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/permission.declined.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/close.aborted.mp4
-2026-08-18 10:38:47,009 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/close.aborted.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/item.skipped.mp4
-2026-08-18 10:38:55,803 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/item.skipped.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.leaves_you.mp4
-2026-08-18 10:38:59,945 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.leaves_you.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.healthy.mp4
-2026-08-18 10:39:21,781 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.healthy.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.risky.mp4
-2026-08-18 10:39:49,163 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.risky.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.harmful.mp4
-2026-08-18 10:40:17,478 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.harmful.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.dependent.mp4
-2026-08-18 10:40:46,387 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.audit.dependent.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.healthy.mp4
-2026-08-18 10:41:04,555 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.healthy.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.risky.mp4
-2026-08-18 10:41:31,965 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.risky.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.harmful.mp4
-2026-08-18 10:41:58,330 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.harmful.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.dependent.mp4
-2026-08-18 10:42:24,465 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/feedback.dast_10.dependent.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.tobacco.mp4
-2026-08-18 10:42:32,244 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.tobacco.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.alcohol.mp4
-2026-08-18 10:42:37,999 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.alcohol.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.drugs.mp4
-2026-08-18 10:42:48,708 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/prescreen.drugs.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.preamble.mp4
-2026-08-18 10:42:57,304 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.preamble.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.0.mp4
-2026-08-18 10:43:03,237 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.0.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.1.mp4
-2026-08-18 10:43:11,068 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.1.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.2.mp4
-2026-08-18 10:43:17,298 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.2.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.3.mp4
-2026-08-18 10:43:25,862 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.3.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.4.mp4
-2026-08-18 10:43:35,074 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.4.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.5.mp4
-2026-08-18 10:43:44,734 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.5.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.6.mp4
-2026-08-18 10:43:52,183 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.6.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.7.mp4
-2026-08-18 10:44:00,599 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.7.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.8.mp4
-2026-08-18 10:44:08,139 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.8.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.9.mp4
-2026-08-18 10:44:17,784 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/audit.item.9.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.preamble.mp4
-2026-08-18 10:44:24,208 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.preamble.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.0.mp4
-2026-08-18 10:44:30,047 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.0.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.1.mp4
-2026-08-18 10:44:35,763 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.1.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.2.mp4
-2026-08-18 10:44:41,175 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.2.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.3.mp4
-2026-08-18 10:44:47,396 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.3.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.4.mp4
-2026-08-18 10:44:53,812 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.4.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.5.mp4
-2026-08-18 10:45:02,109 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.5.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.6.mp4
-2026-08-18 10:45:08,818 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.6.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.7.mp4
-2026-08-18 10:45:17,438 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.7.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.8.mp4
-2026-08-18 10:45:25,691 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.8.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.9.mp4
-2026-08-18 10:45:36,103 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/dast_10.item.9.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.permission.alcohol.mp4
-2026-08-18 10:45:41,689 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.permission.alcohol.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.likes.alcohol.mp4
-2026-08-18 10:45:47,547 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.likes.alcohol.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.dislikes.alcohol.mp4
-2026-08-18 10:45:51,758 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.dislikes.alcohol.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.recommend.alcohol.mp4
-2026-08-18 10:46:00,370 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.recommend.alcohol.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.ruler.alcohol.mp4
-2026-08-18 10:46:15,428 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.ruler.alcohol.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.permission.drugs.mp4
-2026-08-18 10:46:22,010 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.permission.drugs.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.likes.drugs.mp4
-2026-08-18 10:46:26,195 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.likes.drugs.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.dislikes.drugs.mp4
-2026-08-18 10:46:30,297 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.dislikes.drugs.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.recommend.drugs.mp4
-2026-08-18 10:46:38,786 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.recommend.drugs.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.ruler.drugs.mp4
-2026-08-18 10:46:53,165 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.ruler.drugs.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.0.mp4
-2026-08-18 10:46:58,842 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.0.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.0.mp4
-2026-08-18 10:47:04,245 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.0.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.1.mp4
-2026-08-18 10:47:11,884 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.1.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.1.mp4
-2026-08-18 10:47:16,934 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.1.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.2.mp4
-2026-08-18 10:47:21,314 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.2.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.2.mp4
-2026-08-18 10:47:25,231 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.2.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.3.mp4
-2026-08-18 10:47:29,836 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.3.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.3.mp4
-2026-08-18 10:47:34,500 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.3.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.4.mp4
-2026-08-18 10:47:39,579 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.4.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.4.mp4
-2026-08-18 10:47:44,042 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.4.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.5.mp4
-2026-08-18 10:47:49,659 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.5.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.5.mp4
-2026-08-18 10:47:54,072 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.5.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.6.mp4
-2026-08-18 10:47:59,228 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.6.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.6.mp4
-2026-08-18 10:48:03,582 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.6.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.7.mp4
-2026-08-18 10:48:08,645 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.7.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.7.mp4
-2026-08-18 10:48:13,255 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.7.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.8.mp4
-2026-08-18 10:48:20,529 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.8.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.8.mp4
-2026-08-18 10:48:25,558 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.8.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.9.mp4
-2026-08-18 10:48:30,686 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.9.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.9.mp4
-2026-08-18 10:48:34,950 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.9.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.10.mp4
-2026-08-18 10:48:39,555 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_lower.10.mp4
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.10.mp4
-2026-08-18 10:48:44,042 [modules.pipeline] INFO: Fixed clip cached at /home/ryu11/new_Avatar/digital-human/assets/clips/bi.why_not_higher.10.mp4
-2026-08-18 10:48:44,042 [__main__] INFO: Model pre-warm complete; first response will be fast.
-INFO:     127.0.0.1:52182 - "GET / HTTP/1.1" 200 OK
-INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
-INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
-INFO:     129.62.65.70:0 - "GET /video/assets/idle_loop.mp4 HTTP/1.1" 200 OK
-INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=a0eaaf0a-e1c1-448a-a02b-32c37dc4653d" [accepted]
-2026-08-18 10:54:08,976 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
+INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=b6e1211f-0f67-4acc-9f91-627f5d89139e" [accepted]
+2026-08-18 11:27:19,920 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
 INFO:     connection open
 Using cache found in /home/ryu11/.cache/torch/hub/snakers4_silero-vad_master
-2026-08-18 10:54:09,463 [__main__] INFO: New session a0eaaf0a-e1c1-448a-a02b-32c37dc4653d (total sessions: 1)
-2026-08-18 10:54:09,463 [__main__] INFO: State WebSocket client connected (session clients: 1)
-2026-08-18 10:54:10,552 [__main__] INFO: Mic toggled: on
-INFO:     129.62.65.70:0 - "POST /api/toggle?sid=a0eaaf0a-e1c1-448a-a02b-32c37dc4653d HTTP/1.1" 200 OK
-INFO:     129.62.65.70:0 - "POST /api/greet?sid=a0eaaf0a-e1c1-448a-a02b-32c37dc4653d HTTP/1.1" 200 OK
-2026-08-18 10:54:12,102 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
-INFO:     129.62.65.70:0 - "GET /favicon.ico HTTP/1.1" 404 Not Found
-INFO:     129.62.65.70:0 - "WebSocket /ws/audio?sid=a0eaaf0a-e1c1-448a-a02b-32c37dc4653d" [accepted]
+2026-08-18 11:27:20,138 [__main__] INFO: New session b6e1211f-0f67-4acc-9f91-627f5d89139e (total sessions: 1)
+2026-08-18 11:27:20,138 [__main__] INFO: State WebSocket client connected (session clients: 1)
+2026-08-18 11:27:24,001 [modules.avatar] INFO: FLOAT GPU pool ready: [3]
+funasr version: 1.3.1.
+Check update of funasr, and it would cost few times. You may disable it by set `disable_update=True` in AutoModel
+New version is available: 1.4.2.
+Please use the command "pip install -U funasr" to upgrade.
+2026-08-18 11:27:24,106 [root] INFO: download models from model hub: ms
+Downloading Model from https://www.modelscope.cn to directory: /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall
+2026-08-18 11:27:27,566 [root] WARNING: trust_remote_code: True
+Loading remote code failed: model, No module named 'model'
+2026-08-18 11:27:29,079 [root] INFO: Loading pretrained params from /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall/model.pt
+2026-08-18 11:27:29,085 [root] INFO: ckpt: /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall/model.pt
+2026-08-18 11:27:29,817 [root] INFO: scope_map: ['module.', 'None']
+2026-08-18 11:27:29,817 [root] INFO: excludes: None
+2026-08-18 11:27:29,897 [root] INFO: Loading ckpt: /home/ryu11/.cache/modelscope/hub/models/iic/SenseVoiceSmall/model.pt, status: <All keys matched successfully>
+2026-08-18 11:27:30,288 [modules.eou] INFO: EOU (smart-turn v3) loaded from /home/ryu11/new_Avatar/digital-human/checkpoints/smart-turn/smart-turn-v3.2-cpu.onnx
+2026-08-18 11:27:30,331 [__main__] INFO: Model pre-warm complete; first response will be fast.
+INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
+2026-08-18 11:28:09,096 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
+INFO:     connection closed
+INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=b8c966c1-e1cb-4fda-bdbd-73aa6f460c2b" [accepted]
+2026-08-18 11:28:09,230 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
 INFO:     connection open
-2026-08-18 10:54:12,160 [__main__] INFO: Audio WebSocket client connected
-2026-08-18 10:54:12,167 [__main__] INFO: [latency] deliver greeting.mp4 after 0.06s in queue
-INFO:     129.62.65.70:0 - "GET /video/clips/greeting.mp4 HTTP/1.1" 200 OK
-2026-08-18 10:54:12,255 [__main__] INFO: [AudioDebug] chunk #1: len=2730, max=89, rms=9.9
-2026-08-18 10:54:12,436 [__main__] INFO: [AudioDebug] chunk #2: len=2730, max=3141, rms=1124.2
-2026-08-18 10:54:12,594 [__main__] INFO: [AudioDebug] chunk #3: len=2730, max=4160, rms=1303.1
-INFO:     129.62.65.70:0 - "GET /static/case_card.html HTTP/1.1" 200 OK
-2026-08-18 10:54:19,505 [modules.vad] INFO: [eou] P=0.98 silent=0.19s streak=1/2 -> hold
-2026-08-18 10:54:19,639 [modules.vad] INFO: [eou] P=0.98 silent=0.35s streak=2/2 -> END
-2026-08-18 10:54:19,647 [__main__] INFO: [AudioDebug] speech_end: duration=0.80s, rms=0.0185, max=0.0716
-  0%|[34m          [0m| 0/1 [00:00<?, ?it/s]100%|[34m██████████[0m| 1/1 [00:00<00:00,  8.12it/s]{'load_data': '0.000', 'extract_feat': '0.003', 'forward': '0.123', 'batch_size': '1', 'rtf': '0.158'}, : 100%|[34m██████████[0m| 1/1 [00:00<00:00,  8.12it/s]rtf_avg: 0.158: 100%|[34m██████████[0m| 1/1 [00:00<00:00,  8.12it/s]                                                                                          rtf_avg: 0.158: 100%|[34m██████████[0m| 1/1 [00:00<00:00,  7.91it/s]
-2026-08-18 10:54:19,851 [modules.pipeline] INFO: [latency] ASR done at +0.20s -> <phi 1w/3c>
-2026-08-18 10:54:20,827 [httpx] INFO: HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-18 10:54:21,010 [modules.sbirt.runtime] INFO: [clinical] -> prescreen.tobacco (expect option)
-2026-08-18 10:54:21,014 [modules.pipeline] INFO: [latency] dynamic render #1 this session
-2026-08-18 10:54:21,503 [httpx] INFO: HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
-> [Done] Preprocess.
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/tmp/tmpxy3so8s6.mp4
-2026-08-18 10:54:26,747 [__main__] INFO: [latency] deliver tmpxy3so8s6.mp4 after 0.02s in queue
-2026-08-18 10:54:26,748 [__main__] INFO: [latency] deliver prescreen.tobacco.mp4 after 0.02s in queue
-INFO:     129.62.65.70:0 - "GET /video/tmp/tmpxy3so8s6.mp4 HTTP/1.1" 200 OK
-2026-08-18 10:54:33,862 [modules.vad] INFO: [eou] P=0.98 silent=0.19s streak=1/2 -> hold
-2026-08-18 10:54:34,002 [modules.vad] INFO: [eou] P=0.96 silent=0.35s streak=2/2 -> END
-2026-08-18 10:54:34,009 [__main__] INFO: [AudioDebug] speech_end: duration=0.51s, rms=0.0346, max=0.1369
-  0%|[34m          [0m| 0/1 [00:00<?, ?it/s]{'load_data': '0.000', 'extract_feat': '0.002', 'forward': '0.082', 'batch_size': '1', 'rtf': '0.152'}, : 100%|[34m██████████[0m| 1/1 [00:00<00:00, 12.18it/s]rtf_avg: 0.152: 100%|[34m██████████[0m| 1/1 [00:00<00:00, 12.14it/s]                                                                                          rtf_avg: 0.152: 100%|[34m██████████[0m| 1/1 [00:00<00:00, 11.76it/s]
-2026-08-18 10:54:34,167 [modules.pipeline] INFO: [latency] ASR done at +0.16s -> <phi 1w/4c>
-2026-08-18 10:54:34,167 [modules.sbirt.runtime] INFO: [clinical] -> prescreen.alcohol (expect option)
-2026-08-18 10:54:34,208 [__main__] INFO: [latency] deliver prescreen.alcohol.mp4 after 0.04s in queue
-2026-08-18 10:54:34,363 [modules.vad] INFO: [eou] P=0.99 silent=0.19s streak=1/2 -> hold
-2026-08-18 10:54:34,514 [modules.vad] INFO: [eou] P=0.99 silent=0.35s streak=2/2 -> END
-2026-08-18 10:54:34,516 [__main__] INFO: [AudioDebug] speech_end: duration=0.38s, rms=0.0177, max=0.0970
-  0%|[34m          [0m| 0/1 [00:00<?, ?it/s]{'load_data': '0.000', 'extract_feat': '0.002', 'forward': '0.079', 'batch_size': '1', 'rtf': '0.219'}, : 100%|[34m██████████[0m| 1/1 [00:00<00:00, 12.68it/s]rtf_avg: 0.219: 100%|[34m██████████[0m| 1/1 [00:00<00:00, 12.64it/s]                                                                                          rtf_avg: 0.219: 100%|[34m██████████[0m| 1/1 [00:00<00:00, 12.54it/s]
-2026-08-18 10:54:34,666 [modules.pipeline] INFO: [latency] ASR done at +0.15s -> <phi 1w/1c>
-2026-08-18 10:54:34,676 [httpx] INFO: HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-18 10:54:34,797 [modules.pipeline] INFO: [patient] profile now: keys=['tobacco_use']
-2026-08-18 10:54:35,563 [httpx] INFO: HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
-2026-08-18 10:54:35,791 [modules.pipeline] INFO: [latency] dynamic render #2 this session
-2026-08-18 10:54:36,634 [httpx] INFO: HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
-> [Done] Preprocess.
-2026-08-18 10:54:36,733 [modules.pipeline] INFO: [patient] profile now: keys=['tobacco_use']
-2026-08-18 10:54:39,989 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
-INFO:     129.62.65.70:0 - "POST /api/reset?sid=a0eaaf0a-e1c1-448a-a02b-32c37dc4653d HTTP/1.1" 200 OK
-2026-08-18 10:54:40,017 [__main__] INFO: Audio WebSocket disconnected: (<CloseCode.NO_STATUS_RCVD: 1005>, '')
+Using cache found in /home/ryu11/.cache/torch/hub/snakers4_silero-vad_master
+2026-08-18 11:28:09,607 [__main__] INFO: New session b8c966c1-e1cb-4fda-bdbd-73aa6f460c2b (total sessions: 2)
+2026-08-18 11:28:09,608 [__main__] INFO: State WebSocket client connected (session clients: 1)
+2026-08-18 11:28:10,058 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
 INFO:     connection closed
-> [Done] result saved at /home/ryu11/new_Avatar/digital-human/tmp/tmp6hc5_jm0.mp4
+INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
+INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=c290ae1e-9564-4bd3-9927-70d05ee1589c" [accepted]
+2026-08-18 11:28:24,613 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
+INFO:     connection open
+Using cache found in /home/ryu11/.cache/torch/hub/snakers4_silero-vad_master
+2026-08-18 11:28:24,845 [__main__] INFO: New session c290ae1e-9564-4bd3-9927-70d05ee1589c (total sessions: 3)
+2026-08-18 11:28:24,845 [__main__] INFO: State WebSocket client connected (session clients: 1)
+INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
+2026-08-18 11:28:25,718 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
+INFO:     connection closed
+INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=a975a925-f20d-4ec2-8623-3a0b7321a0c9" [accepted]
+2026-08-18 11:28:25,809 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
+INFO:     connection open
+Using cache found in /home/ryu11/.cache/torch/hub/snakers4_silero-vad_master
+2026-08-18 11:28:26,046 [__main__] INFO: New session a975a925-f20d-4ec2-8623-3a0b7321a0c9 (total sessions: 4)
+2026-08-18 11:28:26,047 [__main__] INFO: State WebSocket client connected (session clients: 1)
+2026-08-18 11:28:27,941 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
+INFO:     connection closed
+INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
+INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=4ad293fd-c007-4c75-92c9-7bb5bb0d66a8" [accepted]
+2026-08-18 11:28:32,812 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
+INFO:     connection open
+Using cache found in /home/ryu11/.cache/torch/hub/snakers4_silero-vad_master
+2026-08-18 11:28:33,043 [__main__] INFO: New session 4ad293fd-c007-4c75-92c9-7bb5bb0d66a8 (total sessions: 5)
+2026-08-18 11:28:33,043 [__main__] INFO: State WebSocket client connected (session clients: 1)
+2026-08-18 11:28:35,625 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
+INFO:     connection closed
+INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
+INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=8bd749c8-d45b-44a4-a1f9-9e5e6bba67d4" [accepted]
+2026-08-18 11:32:45,395 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
+INFO:     connection open
+Using cache found in /home/ryu11/.cache/torch/hub/snakers4_silero-vad_master
+2026-08-18 11:32:45,805 [__main__] INFO: New session 8bd749c8-d45b-44a4-a1f9-9e5e6bba67d4 (total sessions: 6)
+2026-08-18 11:32:45,805 [__main__] INFO: State WebSocket client connected (session clients: 1)
+2026-08-18 11:32:47,271 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
+INFO:     connection closed
+INFO:     129.62.65.70:0 - "GET / HTTP/1.1" 200 OK
+INFO:     129.62.65.70:0 - "WebSocket /ws/state?sid=7b93b1b4-c8c5-40ce-9aa5-acc722c2593f" [accepted]
+2026-08-18 11:32:50,542 [modules.sbirt.runtime] INFO: [clinical] -> consent (expect consent)
+INFO:     connection open
+Using cache found in /home/ryu11/.cache/torch/hub/snakers4_silero-vad_master
+2026-08-18 11:32:50,785 [__main__] INFO: New session 7b93b1b4-c8c5-40ce-9aa5-acc722c2593f (total sessions: 7)
+2026-08-18 11:32:50,786 [__main__] INFO: State WebSocket client connected (session clients: 1)
+2026-08-18 11:32:51,239 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
+INFO:     connection closed
+INFO:     127.0.0.1:49320 - "GET /video/assets/idle_loop.mp4 HTTP/1.1" 200 OK
 INFO:     Shutting down
-2026-08-18 10:55:22,764 [__main__] INFO: State WebSocket client disconnected (session clients: 0)
-INFO:     connection closed
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
-INFO:     Finished server process [3809810]
+INFO:     Finished server process [3828109]

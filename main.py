@@ -105,7 +105,28 @@ async def serve_video(request: Request):
     if not os.path.isfile(filepath):
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    return FileResponse(filepath, media_type="video/mp4")
+    # no-cache is REQUIRED, not an optimisation opt-out. Every one of these URLs
+    # is stable (/video/assets/idle_loop.mp4, /video/clips/greeting.mp4, ...) while
+    # its BYTES are mutable — re-rendering after a GREETING_TEXT edit or an
+    # AVATAR_IMAGE swap rewrites the file behind an unchanged URL. Starlette's
+    # FileResponse sets etag/last-modified but no Cache-Control, so the browser
+    # falls back to HEURISTIC freshness and replays its stale copy WITHOUT
+    # revalidating: the server serves the new face and the user still sees the old
+    # one. "no-cache" means "revalidate before use", not "don't store".
+    #
+    # Cost, measured not assumed: Starlette 0.52.1's FileResponse emits an etag but
+    # implements NO conditional-request handling, so an If-None-Match revalidation
+    # comes back 200 with the full body, never 304. That is acceptable here only
+    # because each clip URL is fetched once per page session anyway (a clip plays
+    # once; the idle loop loads once and then loops in-place), so the loss is
+    # cross-session reuse — which is precisely the reuse that served the stale face.
+    # If cross-session caching ever matters, add real 304 handling here rather than
+    # weakening this header.
+    return FileResponse(
+        filepath,
+        media_type="video/mp4",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 async def api_toggle(request: Request):
