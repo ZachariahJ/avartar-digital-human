@@ -122,6 +122,11 @@ TEMP_CLEAN_INTERVAL_SEC = 30
 # default — the synchronous disk write was stalling the audio event loop.
 DEBUG_SAVE_AUDIO = os.getenv("DEBUG_SAVE_AUDIO", "0").lower() in ("1", "true", "yes")
 
+# Write patient/clinical content to the logs VERBATIM instead of the redacted
+# "<phi 7w/41c>" shape summary. Off by default. For local debugging only: with
+# this on, transcripts land in run.log in the clear.
+LOG_PHI = os.getenv("LOG_PHI", "0").lower() in ("1", "true", "yes")
+
 # Consent audit trail (append-only JSONL): decision + timestamp + exact-wording
 # version per session. No transcripts, no screening data. records/ is
 # gitignored; the directory is created on first write.

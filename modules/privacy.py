@@ -34,13 +34,22 @@ logger = logging.getLogger(__name__)
 # --------------- PHI-safe logging ---------------
 
 def phi(value) -> str:
-    """Render user/clinical content for a log line without leaking it."""
+    """Render user/clinical content for a log line without leaking it.
+
+    With config.LOG_PHI set, the value is logged verbatim instead (local
+    debugging only — transcripts then sit in run.log in the clear).
+    """
     s = str(value)
+    if config.LOG_PHI:
+        return s
     return f"<phi {len(s.split())}w/{len(s)}c>"
 
 
 def phi_keys(mapping) -> str:
-    """Render a PHI-bearing dict for logs as its key list only."""
+    """Render a PHI-bearing dict for logs as its key list only (verbatim when
+    config.LOG_PHI is set)."""
+    if config.LOG_PHI:
+        return repr(mapping)
     try:
         return "keys=" + repr(sorted(mapping.keys()))
     except Exception:
