@@ -84,8 +84,8 @@ FIXED: dict[str, str] = {
     # its "few more questions about your experiences" refers to the study's
     # post-session experience survey)
     "close": (
-        "Thank you for participating in this process. We have a few more "
-        "questions to ask you about your experiences."
+        "Thank you for participating in this process. "
+        "Our staff will follow up with you about your experiences."
     ),
     # Close spoken when the session ends because the user DECLINED a screening/
     # feedback/BI permission: it must not promise more questions right after

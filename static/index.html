@@ -293,7 +293,11 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     if (current && current.idle) {
       waitingForNext = false;
       responseEnded = false;
-      return;                 // already idle — nothing to dissolve to
+      // Nothing to dissolve to — but the pause() above stopped the idle loop, and
+      // no other path restarts it (onEnded never fires on a paused element), so the
+      // avatar would freeze on that frame until the next clip arrived. Resume it.
+      activeVideo.play().catch(() => {});
+      return;
     }
     waitingForNext = true;    // hold the current last frame until idle is ready
     responseEnded = true;     // lets loadNextIntoPreload prepare the idle clip
