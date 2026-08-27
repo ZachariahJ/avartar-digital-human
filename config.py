@@ -92,6 +92,13 @@ FLOAT_NFE_FIRST = 6       # Lower NFE for the FIRST sentence only — buys ~30-4
 VAD_THRESHOLD = 0.5
 VAD_SILENCE_DURATION = 0.35  # seconds of silence to trigger speech_end (lower = snappier)
 
+# Discard the first N seconds of every mic stream before the VAD ever sees them.
+# Opening the mic emits a start-up transient (device pop + AGC ramping down from
+# max gain); measured on this box it runs ~0.5s and clips full scale (chunk #3 hit
+# max=32719 with the room silent). Silero scores it as speech, so the avatar
+# answers an utterance the user never spoke. 0 disables the discard.
+MIC_WARMUP_DISCARD = float(os.getenv("MIC_WARMUP_DISCARD", "0.5"))
+
 # --- Barge-in during avatar playback (ASR-confirmed / semantic) ---
 # While the avatar is speaking the VAD onset (speech_start) is unreliable — its own
 # audio can keep the VAD "in speech", and the onset heuristic misses — so barge-in

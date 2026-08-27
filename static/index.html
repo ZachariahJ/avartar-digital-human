@@ -51,6 +51,11 @@ body.with-card .card-panel { display: block; }
 .btn-clear { background: #333; color: #ccc; }
 .controls button:hover { opacity: 0.85; }
 .controls button:active { transform: translateY(1px); }
+/* Typed input — alternates with the mic (see the `typing` flag in the script). */
+.text-input { flex: 1; min-width: 0; padding: 7px 10px; border-radius: 6px; border: 1px solid #0f3460; background: #16213e; color: #e0e0e0; font-family: inherit; font-size: 0.85em; }
+.text-input::placeholder { color: #667; }
+.text-input:focus { outline: none; border-color: #4ecca3; }
+.text-input:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .status-bar { text-align: center; padding: 8px 5px 14px; font-size: 0.8em; color: #778; }
 .btn-card { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); padding: 5px 10px; border-radius: 6px; border: 1px solid #0f3460; background: transparent; color: #99a; font-size: 0.75em; font-family: inherit; cursor: pointer; white-space: nowrap; }
@@ -84,6 +89,8 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
 <div class="controls">
   <button class="btn-start" id="btnStart">Start</button>
   <button class="btn-clear" id="btnClear">Clear</button>
+  <input class="text-input" id="textInput" type="text" autocomplete="off"
+         placeholder="Type your reply, then press Enter" disabled>
 </div>
 <div class="status-bar" id="statusBar">Click Start to begin</div>
 
@@ -110,10 +117,16 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   const btnClear = document.getElementById('btnClear');
   const statusBar = document.getElementById('statusBar');
   const btnCard = document.getElementById('btnCard');
+  const textInput = document.getElementById('textInput');
   const cardFrame = document.getElementById('cardFrame');
 
   const IDLE_VIDEO_URL = '/video/assets/idle_loop.mp4';
   let micActive = false;
+  let userGestured = false;
+  const markGesture = () => { userGestured = true; };
+  document.addEventListener('pointerdown', markGesture, { once: true });
+  document.addEventListener('keydown', markGesture, { once: true });
+  let typing = false;           // text box focused — mic frames are held back
   let endedByDecline = false;   // session ended (consent declined) — next Start is fresh
 
   // Per-browser session id: isolates this tab's conversation/avatar/mic on the
@@ -160,10 +173,10 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     waitingForNext = false;
 
     activeVideo.loop = !!current.idle;
-    activeVideo.muted = current.idle ? !micActive : false;
+    activeVideo.muted = !userGestured;
     // Always start from the beginning: without autoplay the buffer won't have
     // advanced, but reset defensively so a swapped-in clip never starts mid-way.
-    try { activeVideo.currentTime = 0; } catch (e) {}
+    // try { activeVideo.currentTime = 0; } catch (e) {}
     activeVideo.play().catch(() => {});
     subtitle.textContent = current.text || '';
     if (current.idle) {
@@ -259,7 +272,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     preloadReady = false;
     waitingForNext = false;
     activeVideo.loop = true;
-    activeVideo.muted = !micActive;
+    activeVideo.muted = !userGestured;
     if (!activeVideo.src.endsWith('idle_loop.mp4')) {
       activeVideo.src = IDLE_VIDEO_URL;
     }
@@ -353,6 +366,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
         micActive = false;
         btnStart.textContent = 'Start';
         btnStart.classList.remove('active');
+        disableTextInput();
       }
     }
   }
@@ -423,48 +437,38 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          // AEC (echo cancellation) cancels the avatar's own voice leaking from the
-          // speaker back into the mic -> prevents false barge-in. ANC = noise
-          // suppression. AGC = auto gain. Advanced {ideal:true} form so unsupported
-          // constraints degrade instead of failing getUserMedia.
           echoCancellation: { ideal: true },
           noiseSuppression: { ideal: true },
-          autoGainControl: { ideal: true },
-          // Chrome ML 'voice isolation' — stronger background-noise removal where
-          // available; silently ignored elsewhere.
-          voiceIsolation: { ideal: true },
         }
       });
-      // Use native sample rate and resample to 16kHz
-      audioCtx = new AudioContext();
-      const nativeSR = audioCtx.sampleRate;
-      console.log('[Audio] Native sample rate:', nativeSR);
+
+      audioCtx = new AudioContext({ sampleRate: 16000 });
+      const ctxSR = audioCtx.sampleRate;
+      console.log('[Audio] AudioContext sample rate:', ctxSR);
+      if (ctxSR !== 16000) {
+        console.error('[Audio] expected 16000, got', ctxSR);
+        alert('Audio init failed: sample rate ' + ctxSR);
+        return false;
+      }
+
       source = audioCtx.createMediaStreamSource(mediaStream);
 
-      // Use larger buffer for higher native sample rates
-      const bufSize = nativeSR > 16000 ? 8192 : 4096;
+      const bufSize = 2048; 
       processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
       processor.onaudioprocess = (e) => {
+        if (typing) return;
         if (audioWs && audioWs.readyState === WebSocket.OPEN) {
           const f32 = e.inputBuffer.getChannelData(0);
-          // Resample to 16kHz
-          const ratio = nativeSR / 16000;
-          const outLen = Math.floor(f32.length / ratio);
-          const i16 = new Int16Array(outLen);
-          for (let i = 0; i < outLen; i++) {
-            const srcIdx = i * ratio;
-            const idx = Math.floor(srcIdx);
-            const frac = srcIdx - idx;
-            const s0 = f32[idx] || 0;
-            const s1 = f32[Math.min(idx + 1, f32.length - 1)] || 0;
-            const s = s0 + frac * (s1 - s0); // linear interpolation
-            const clamped = Math.max(-1, Math.min(1, s));
-            i16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+          const i16 = new Int16Array(f32.length);
+          for (let i = 0; i < f32.length; i++) {
+            const c = Math.max(-1, Math.min(1, f32[i]));
+            i16[i] = c < 0 ? c * 0x8000 : c * 0x7FFF;
           }
           audioWs.send(i16.buffer);
         }
       };
       source.connect(processor);
+      // silentGain 那四行原样保留
       // Connect through silent gain to avoid feedback (mic → speaker loop)
       const silentGain = audioCtx.createGain();
       silentGain.gain.value = 0;
@@ -506,6 +510,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
           btnStart.textContent = 'Stop';
           btnStart.classList.add('active');
           statusBar.textContent = 'Listening…';
+          textInput.disabled = false;
           // Unmute video after user interaction
           activeVideo.muted = false;
           // Counselor leads: greet now that the mic is confirmed live. (Kept
@@ -523,8 +528,41 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       micActive = false;
       btnStart.textContent = 'Start';
       btnStart.classList.remove('active');
+      disableTextInput();
       statusBar.textContent = 'Stopped';
     }
+  });
+
+  // ============ Text input ============
+  // Enabled only while the mic session is live, so a typed turn always lands in a
+  // session that has already greeted. The user's message is NOT rendered locally:
+  // it comes back through the state WS chat delta, same as a spoken turn.
+  function disableTextInput() {
+    typing = false;
+    textInput.value = '';
+    textInput.disabled = true;
+    textInput.blur();
+  }
+
+  function sendText() {
+    const text = textInput.value.trim();
+    if (!text) return;
+    textInput.value = '';
+    interruptPlayback();          // typing barges in, like speaking over the avatar
+    fetch('/api/text' + SID_Q, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    }).catch(() => {});
+  }
+
+  textInput.addEventListener('focus', () => { typing = true; });
+  textInput.addEventListener('blur', () => { typing = false; });
+  textInput.addEventListener('keydown', (e) => {
+    // isComposing/229 guard: Enter that commits an IME candidate must not send.
+    if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    sendText();
   });
 
   // ============ Case card side panel ============
@@ -560,6 +598,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       btnStart.textContent = 'Start';
       btnStart.classList.remove('active');
     }
+    disableTextInput();
   });
 })();
 </script>

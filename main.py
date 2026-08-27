@@ -240,6 +240,10 @@ async def ws_audio(websocket: WebSocket):
     logger.info("Audio WebSocket client connected")
     session.speech_started_notified = False
     _chunk_count = 0
+    # Mic warm-up, scoped to THIS connection: the client opens a fresh /ws/audio on
+    # every mic start, so the counter resets exactly when a new transient arrives.
+    _warmup_needed = int(config.MIC_WARMUP_DISCARD * 16000)
+    _warmup_samples = 0
 
     try:
         while True:
@@ -257,6 +261,17 @@ async def ws_audio(websocket: WebSocket):
                 logger.info(f"[AudioDebug] chunk #{_chunk_count}: len={len(audio_chunk)}, "
                            f"max={np.max(np.abs(audio_chunk))}, "
                            f"rms={np.sqrt(np.mean(audio_chunk.astype(np.float32)**2)):.1f}")
+
+            # Drop the head of the stream: the mic start-up transient is loud enough
+            # to clip and Silero reads it as speech, which turns into a phantom
+            # utterance the user never spoke. Discard BEFORE process_chunk so the VAD
+            # never enters is_speaking on it and no buffer state has to be unwound.
+            if _warmup_samples < _warmup_needed:
+                _warmup_samples += len(audio_chunk)
+                if _warmup_samples >= _warmup_needed:
+                    logger.info("[AudioDebug] mic warm-up: discarded %.2fs (%d chunks)",
+                                _warmup_samples / 16000, _chunk_count)
+                continue
 
             # Run Silero VAD in a worker thread so its inference doesn't block the
             # asyncio event loop (which also pushes video to the frontend — VAD on
