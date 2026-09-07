@@ -11,7 +11,11 @@ import re
 import numpy as np
 
 import config
-from modules import asr, llm, tts, avatar, privacy
+from modules import asr, llm, tts, privacy
+# modules.avatar is imported lazily inside render_clip, never at module scope:
+# importing it pulls in torch plus the whole sibling float/ repo (face_alignment,
+# torchvision, librosa, the MuseTalk model classes). Voice-only mode must not fail to
+# start, or pay that import, because of a repo it will never call.
 from modules.privacy import phi, phi_keys
 from modules.sbirt import crisis, runtime, state_view, templates
 from modules.sbirt.instruments import BY_KEY, InvalidResponse, PRE_SCREEN
@@ -24,9 +28,27 @@ logger = logging.getLogger(__name__)
 _CLIPS_DIR = config.CLIPS_DIR
 
 
+def clip_ext() -> str:
+    """File extension of a cached clip in the CURRENT mode.
+
+    Voice-only clips are the raw TTS mp3, so the two modes must not share a
+    filename: a greeting.mp4 holding mp3 bytes would be served as video/mp4 and
+    fail to decode, and flipping the flag back would find a stale file of the
+    wrong type sitting on a valid-looking sidecar. Separate extensions keep both
+    caches on disk simultaneously, so toggling the flag costs nothing.
+    """
+    return ".mp4" if config.ENABLE_VIDEO_AVATAR else ".mp3"
+
+
+def clip_path(base: str) -> str:
+    """Re-point a configured clip path (always written as .mp4) at the current
+    mode's file. config.GREETING_VIDEO_PATH and friends stay single-valued."""
+    return os.path.splitext(base)[0] + clip_ext()
+
+
 def crisis_clip_path(category: str) -> str:
     """Cached clip location for one crisis category's fixed response."""
-    return os.path.join(_CLIPS_DIR, f"crisis_{category}.mp4")
+    return os.path.join(_CLIPS_DIR, f"crisis_{category}" + clip_ext())
 
 
 _KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]")
@@ -35,7 +57,7 @@ _KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 def protocol_clip_path(key: str) -> str:
     """Cached clip location for a fixed protocol utterance (runtime.Say key).
     Content-addressed by the stable key, shared across ALL sessions."""
-    return os.path.join(_CLIPS_DIR, _KEY_SAFE.sub("_", key) + ".mp4")
+    return os.path.join(_CLIPS_DIR, _KEY_SAFE.sub("_", key) + clip_ext())
 
 _fixed_clip_lock = threading.Lock()
 
@@ -45,16 +67,51 @@ def clip_stamp(text: str) -> str:
     portrait it was rendered from. A clip is a function of both, so keying on
     text alone was a face-swap trap — repointing config.AVATAR_IMAGE left every
     cached clip replaying the OLD face forever, because no text had changed.
-    Stored verbatim in the clip's sidecar .txt."""
+    Stored verbatim in the clip's sidecar .txt.
+
+    A voice-only clip has no portrait in it, so it is deliberately NOT keyed on
+    the fingerprint — swapping the avatar image must not invalidate audio that
+    cannot possibly show a face."""
+    if not config.ENABLE_VIDEO_AVATAR:
+        return f"audio-only\n{text}"
     return f"avatar:{config.avatar_fingerprint()}\n{text}"
+
+
+def render_clip(tts_path: str, output_path: str | None = None) -> str | None:
+    """Turn a finished TTS file into the clip the browser will play, and take
+    ownership of `tts_path` either way.
+
+    Video mode: MuseTalk renders a talking head and the mp3 is consumed (deleted).
+    Voice-only mode: the mp3 IS the clip — moved to `output_path` for a cached
+    fixed clip, or handed back as-is for a per-sentence render, where the temp
+    janitor reclaims it after config.TEMP_FILE_TTL_SEC. It must NOT be deleted
+    here: unlike video mode, this file is the deliverable.
+    """
+    if config.ENABLE_VIDEO_AVATAR:
+        from modules import avatar
+        try:
+            return avatar.generate_video(tts_path, output_path=output_path)
+        finally:
+            try:
+                os.remove(tts_path)
+            except OSError:
+                pass
+    if output_path is None:
+        return tts_path
+    os.replace(tts_path, output_path)
+    return output_path
 
 
 def ensure_fixed_clip(text, path):
     """Render a FIXED line (`text`) to a cached clip at `path` ONCE and reuse it —
-    no per-session LLM/TTS/FLOAT, plays instantly. Regenerates if the text OR the
+    no per-session LLM/TTS/MuseTalk, plays instantly. Regenerates if the text OR the
     reference portrait changed (both tracked via the sidecar .txt, see clip_stamp).
     Returns the cached path, or None on failure. Used for the always-identical
-    greeting and consent-decline clips."""
+    greeting and consent-decline clips.
+
+    `path` is passed in as the configured .mp4 name; clip_path() re-points it at
+    the current mode's file so both caches can coexist on disk."""
+    path = clip_path(path)
     sidecar = path + ".txt"
     stamp = clip_stamp(text)
     with _fixed_clip_lock:
@@ -70,11 +127,7 @@ def ensure_fixed_clip(text, path):
             if not tts_path:
                 return None
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            result = avatar.generate_video(tts_path, output_path=path)
-            try:
-                os.remove(tts_path)
-            except OSError:
-                pass
+            result = render_clip(tts_path, output_path=path)
             if result is None:
                 return None
             with open(sidecar, "w", encoding="utf-8") as f:
@@ -91,7 +144,7 @@ def prewarm_fixed_clips():
     crisis responses, and ALL protocol utterances (questions, education,
     zone feedback, BI lines incl. the 11 ruler variants). First boot renders
     them one time; afterwards the sidecar text check makes this a no-op, and
-    at runtime the protocol costs ZERO FLOAT renders for fixed content."""
+    at runtime the protocol costs ZERO MuseTalk renders for fixed content."""
     from modules.sbirt import templates
     ensure_fixed_clip(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
     ensure_fixed_clip(config.DECLINE_TEXT, config.DECLINE_VIDEO_PATH)
@@ -125,7 +178,7 @@ class Pipeline:
         # Set when the user declines consent: the server then turns the mic off and
         # tells the client to stop, ending the session until Start is pressed again.
         self.ended = False
-        # Dynamic (non-cached) TTS+FLOAT renders this session — the generation
+        # Dynamic (non-cached) TTS+MuseTalk renders this session — the generation
         # budget observable (T18). Fixed content contributes zero at runtime.
         self.dynamic_renders = 0
         # THE clinical state: protocol node, coded answers, deterministic
@@ -278,7 +331,7 @@ class Pipeline:
         self._processing_thread.start()
 
     def _process_greeting(self, turn):
-        """Deliver the fixed opening from the cached clip — no LLM/TTS/FLOAT. Records
+        """Deliver the fixed opening from the cached clip — no LLM/TTS/MuseTalk. Records
         it as the assistant's first turn so the conversation flows straight into the
         user's yes/no consent reply."""
         try:
@@ -332,7 +385,7 @@ class Pipeline:
         """Deterministic crisis net fired: speak the FIXED response for the
         category from its cached clip — no LLM anywhere on this path — and stay
         in the conversation (the counselor's crisis protocol owns later turns).
-        Falls back to the normal TTS+FLOAT render if the cached clip is missing,
+        Falls back to the normal TTS+MuseTalk render if the cached clip is missing,
         and to on-screen text if even that fails; the fixed TEXT always lands in
         both histories either way."""
         logger.warning("[crisis] deterministic net fired: category=%s pattern=%s",
@@ -349,11 +402,7 @@ class Pipeline:
             # Cache miss (e.g. pre-warm failed): render it now rather than stay silent.
             tts_path = tts.synthesize(text, None, self.cancel_event)
             if tts_path is not None:
-                video = avatar.generate_video(tts_path)
-                try:
-                    os.remove(tts_path)
-                except OSError:
-                    pass
+                video = render_clip(tts_path)
         if video and not self._aborted(turn):
             self.video_queue.put({
                 "video": video,
@@ -426,7 +475,7 @@ class Pipeline:
                 hist.append({"role": "assistant", "content": text})
 
     def _process_speech(self, audio_array, turn):
-        """Full pipeline: ASR → LLM stream → TTS+FLOAT (pipelined) → video queue."""
+        """Full pipeline: ASR → LLM stream → TTS+MuseTalk (pipelined) → video queue."""
         try:
             # Step 1: ASR
             if self._aborted(turn):
@@ -462,7 +511,7 @@ class Pipeline:
             self.state = "idle"
 
     def _process_text(self, user_text, turn):
-        """Text-only pipeline: skip ASR, go straight to LLM → TTS+FLOAT (pipelined)."""
+        """Text-only pipeline: skip ASR, go straight to LLM → TTS+MuseTalk (pipelined)."""
         try:
             if self._aborted(turn):
                 self.state = "idle"
@@ -769,7 +818,7 @@ class Pipeline:
             turn)
 
     def _render_dynamic(self, text):
-        """TTS + FLOAT for a non-cached utterance; None on failure/cancel.
+        """TTS + MuseTalk for a non-cached utterance; None on failure/cancel.
         Counts every dynamic render (T18): fixed content must stay at zero
         runtime renders, so this counter IS the session's generation budget."""
         self.dynamic_renders += 1
@@ -778,12 +827,7 @@ class Pipeline:
         tts_path = tts.synthesize(text, None, self.cancel_event)
         if tts_path is None:
             return None
-        video = avatar.generate_video(tts_path)
-        try:
-            os.remove(tts_path)
-        except OSError:
-            pass
-        return video
+        return render_clip(tts_path)
 
     def _deliver_step(self, user_text, step, turn, ack=""):
         """Speak one machine step: fixed utterances come from the shared clip
@@ -792,8 +836,7 @@ class Pipeline:
         utterances are phrased by the bounded LLM then rendered. Enqueued
         strictly in order. `ack` (when the turn was an answer) is prepended
         as its own short Speak so the person hears they were heard BEFORE the
-        next protocol content — and, being the turn's first short segment, it
-        rides the FLOAT_NFE_FIRST fast path."""
+        next protocol content."""
         self._history_begin(user_text)
         self.state = "processing"
         utterances = step.utterances
@@ -836,42 +879,47 @@ class Pipeline:
         if not self._aborted(turn):
             self.video_queue.put(None)
             self.state = "speaking"
+            if step.expect.kind == "end":
+                # Terminal node (flow.End): the close was just queued, so the
+                # session is OVER — end it the same way a consent decline does
+                # (server drops the mic, client stops capturing and resets to
+                # Start once the goodbye finishes playing). Without this the
+                # counselor said its goodbye and then kept listening forever,
+                # and every further utterance burnt an LLM+TTS turn on the
+                # "session is already complete" reply below.
+                self.ended = True
 
     def _run_crisis_synthesis(self, messages, turn):
         """CRISIS turns only — the sole remaining full-LLM synthesis path (every
         normal turn goes through the clinical protocol instead). Streams
         sentences from the LLM (chat text appears live in
-        <1s) AND render each sentence's TTS+FLOAT concurrently across the whole
+        <1s) AND render each sentence's TTS+MuseTalk concurrently across the whole
         GPU pool, while enqueuing strictly in sentence order.
 
         A producer thread pulls sentences off the LLM stream and submits each as a
-        TTS->FLOAT job to a pool sized to len(FLOAT_GPUS); this consumer reads the
+        TTS->MuseTalk job to a pool sized to len(MUSETALK_GPUS); this consumer reads the
         resulting futures IN ORDER and enqueues the finished clips. So sentence 1
-        starts playing after just 1 TTS + 1 FLOAT, while sentences 2..N are already
+        starts playing after just 1 TTS + 1 MuseTalk render, while sentences 2..N are already
         rendering on the other GPUs -> no stall between segments.
         """
         futures_q = queue.Queue()
         SENTINEL = object()
-        n_gpus = max(1, len(config.FLOAT_GPUS))
+        n_gpus = max(1, len(config.MUSETALK_GPUS))
 
         def _render(sentence, idx):
             if self._aborted(turn) or config.SHUTTING_DOWN.is_set():
                 return None
-            # First sentence renders at a lower NFE to get the avatar talking sooner.
-            nfe = config.FLOAT_NFE_FIRST if idx == 0 else config.FLOAT_NFE
             t_tts0 = time.perf_counter()
             tts_path = tts.synthesize(sentence, None, self.cancel_event)
             if tts_path is None or self._aborted(turn):
                 return None
-            t_float0 = time.perf_counter()
-            video_path = avatar.generate_video(tts_path, nfe=nfe)
-            # The wav is consumed by FLOAT; drop it now so tmp/ doesn't fill up.
-            try:
-                os.remove(tts_path)
-            except OSError:
-                pass
-            logger.info("[latency] seg %d rendered: tts=%.2fs float=%.2fs (nfe=%d)",
-                        idx, t_float0 - t_tts0, time.perf_counter() - t_float0, nfe)
+            t_render0 = time.perf_counter()
+            # render_clip takes ownership of tts_path: MuseTalk consumes and
+            # deletes it in video mode, and in voice-only mode the mp3 IS the clip
+            # and the janitor reclaims it, so tmp/ does not fill up either way.
+            video_path = render_clip(tts_path)
+            logger.info("[latency] seg %d rendered: tts=%.2fs render=%.2fs",
+                        idx, t_render0 - t_tts0, time.perf_counter() - t_render0)
             return video_path
 
         def _producer(executor):
@@ -925,7 +973,7 @@ class Pipeline:
                 try:
                     video_path = fut.result()
                 except Exception:
-                    # A single sentence's TTS/FLOAT failing must NOT abort the whole
+                    # A single sentence's TTS/MuseTalk failing must NOT abort the whole
                     # turn (which would skip the video_end sentinel below and freeze
                     # the avatar on its last frame). Skip this clip and continue.
                     logger.exception("segment render failed; skipping this clip")

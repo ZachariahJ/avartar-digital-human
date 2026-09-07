@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SBIRT Counselor</title>
+<!-- Server-injected settings (main._app_config); must precede the app script. -->
+<!--APP_CONFIG-->
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html { background: #1a1a2e; height: 100%; }
@@ -33,6 +35,12 @@ body.with-card .card-panel { display: block; }
 .video-container video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 12px; transition: opacity 0.1s linear; background: #111; }
 .video-container video.hidden-video { opacity: 0; z-index: 0; }
 .video-container video.active-video { opacity: 1; z-index: 1; }
+/* Voice-only mode: the <video> elements still drive playback (an audio-only
+   source fires canplay/ended exactly like an mp4), they just have nothing to
+   show, so the still portrait sits on top of them. */
+#portrait { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            object-fit: contain; border-radius: 12px; z-index: 2; background: #111; }
+body.audio-only #portrait { display: block; }
 .subtitle-bar { width: 100%; max-width: 500px; text-align: center; padding: 8px 16px; font-size: 0.95em; min-height: 32px; color: #ccc; }
 
 /* Chat panel — bottom, scrollable */
@@ -78,6 +86,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     <div class="video-container">
       <video id="videoA" class="active-video" muted playsinline></video>
       <video id="videoB" class="hidden-video" muted playsinline></video>
+      <img id="portrait" alt="">
     </div>
     <div class="subtitle-bar" id="subtitle"></div>
   </div>
@@ -119,15 +128,26 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   const btnCard = document.getElementById('btnCard');
   const textInput = document.getElementById('textInput');
   const cardFrame = document.getElementById('cardFrame');
+  const portrait = document.getElementById('portrait');
 
-  const IDLE_VIDEO_URL = '/video/assets/idle_loop.mp4';
+  // Injected by the server (see main._app_config). The fallback keeps the file
+  // usable if it is ever served without the substitution.
+  const APP_CONFIG = window.APP_CONFIG || {};
+  const VIDEO_AVATAR = APP_CONFIG.videoAvatar !== false;
+  const IDLE_VIDEO_URL = APP_CONFIG.idleUrl || '/video/assets/idle_loop.mp4';
+  if (!VIDEO_AVATAR) {
+    document.body.classList.add('audio-only');
+    if (APP_CONFIG.portraitUrl) portrait.src = APP_CONFIG.portraitUrl;
+  }
   let micActive = false;
   let userGestured = false;
   const markGesture = () => { userGestured = true; };
   document.addEventListener('pointerdown', markGesture, { once: true });
   document.addEventListener('keydown', markGesture, { once: true });
   let typing = false;           // text box focused — mic frames are held back
-  let endedByDecline = false;   // session ended (consent declined) — next Start is fresh
+  let sessionEnded = false;     // server ended the session (consent declined, user
+                                // aborted, or the protocol reached its close) — the
+                                // next Start begins a fresh conversation
 
   // Per-browser session id: isolates this tab's conversation/avatar/mic on the
   // server from every other connected user. Sent on both WebSockets and all
@@ -361,17 +381,21 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       interruptPlayback();
       statusBar.textContent = 'Click Start to begin';
     } else if (msg.type === 'stop') {
-      // Conversation ended (consent declined): stop capturing and reset to Start,
-      // but do NOT interrupt playback — let the goodbye clip finish, then it
+      // The server ended the session — consent declined, the user asked to stop,
+      // or the protocol ran to its close. Stop capturing and reset to Start, but
+      // do NOT interrupt playback — let the goodbye clip finish, then it
       // dissolves to idle on its own. The next Start begins a fresh session.
-      endedByDecline = true;
+      sessionEnded = true;
       if (micActive) {
         stopMic();
         micActive = false;
         btnStart.textContent = 'Start';
         btnStart.classList.remove('active');
-        disableTextInput();
       }
+      // The text box closes even if the mic was never on: the session is over
+      // server-side, so anything typed now only draws the "already complete"
+      // reply — an LLM turn spent telling the person there is nothing left to do.
+      disableTextInput();
     }
   }
 
@@ -422,8 +446,9 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   let audioWs = null;
   let audioCtx = null;
   let mediaStream = null;
-  let processor = null;
-  let source = null;
+  let micSource = null;
+  let micNode = null;
+  let micSink = null;
 
   function connectAudioWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -441,10 +466,25 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          echoCancellation: { ideal: true },
+          // `exact`, not `ideal`. Echo cancellation is load-bearing here: the mic
+          // stays open while the avatar speaks, and barge-in works by running ASR
+          // on what it hears (BARGE_IN_ASR in config.py). As an `ideal` hint a
+          // browser could silently hand back an uncancelled stream and nothing on
+          // this side could tell — `exact` makes getUserMedia reject instead, so
+          // the failure is loud and lands before the session starts.
+          echoCancellation: { exact: true },
           noiseSuppression: { ideal: true },
         }
       });
+
+      // `exact` covers the constraint being unsatisfiable; this covers the rest.
+      // What actually got applied is now visible instead of assumed.
+      const settings = mediaStream.getAudioTracks()[0].getSettings();
+      console.log('[Audio] echoCancellation:', settings.echoCancellation,
+                  ' noiseSuppression:', settings.noiseSuppression);
+      if (settings.echoCancellation === false) {
+        console.warn('[Audio] echo cancellation is OFF — the avatar will hear itself');
+      }
 
       audioCtx = new AudioContext({ sampleRate: 16000 });
       const ctxSR = audioCtx.sampleRate;
@@ -455,41 +495,44 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
         return false;
       }
 
-      source = audioCtx.createMediaStreamSource(mediaStream);
-
-      const bufSize = 2048; 
-      processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
-      processor.onaudioprocess = (e) => {
+      await audioCtx.audioWorklet.addModule('/static/mic-worklet.js');
+      micNode = new AudioWorkletNode(audioCtx, 'mic-capture', {
+        numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+      });
+      micNode.port.onmessage = (e) => {
         if (typing) return;
-        if (audioWs && audioWs.readyState === WebSocket.OPEN) {
-          const f32 = e.inputBuffer.getChannelData(0);
-          const i16 = new Int16Array(f32.length);
-          for (let i = 0; i < f32.length; i++) {
-            const c = Math.max(-1, Math.min(1, f32[i]));
-            i16[i] = c < 0 ? c * 0x8000 : c * 0x7FFF;
-          }
-          audioWs.send(i16.buffer);
-        }
+        if (audioWs && audioWs.readyState === WebSocket.OPEN) audioWs.send(e.data.buffer);
       };
-      source.connect(processor);
-      // silentGain 那四行原样保留
-      // Connect through silent gain to avoid feedback (mic → speaker loop)
-      const silentGain = audioCtx.createGain();
-      silentGain.gain.value = 0;
-      processor.connect(silentGain);
-      silentGain.connect(audioCtx.destination);
+
+      micSource = audioCtx.createMediaStreamSource(mediaStream);
+      micSource.connect(micNode);
+      // A worklet only runs while something downstream pulls it, so the node has
+      // to reach the destination — through a silent gain, or the mic would go
+      // straight back out of the speakers. (Same trick, and the same reason, as
+      // the ScriptProcessor this replaces.)
+      micSink = audioCtx.createGain();
+      micSink.gain.value = 0;
+      micNode.connect(micSink);
+      micSink.connect(audioCtx.destination);
+
       connectAudioWS();
       return true;
     } catch (err) {
       console.error('[Audio] Failed:', err);
-      alert('Microphone access failed: ' + err.message);
+      if (err.name === 'OverconstrainedError') {
+        alert('This browser or microphone cannot do echo cancellation, which this '
+            + 'app needs in order to hear you over the avatar. Try Chrome, or headphones.');
+      } else {
+        alert('Microphone access failed: ' + err.message);
+      }
       return false;
     }
   }
 
   function stopMic() {
-    if (processor) { processor.disconnect(); processor = null; }
-    if (source) { source.disconnect(); source = null; }
+    if (micSource) { micSource.disconnect(); micSource = null; }
+    if (micNode) { micNode.port.onmessage = null; micNode.disconnect(); micNode = null; }
+    if (micSink) { micSink.disconnect(); micSink = null; }
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
     if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
     if (audioWs) { audioWs.close(); audioWs = null; }
@@ -500,8 +543,8 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     if (!micActive) {
       // If the previous session ended by a consent decline, Start begins fresh:
       // clear the server conversation so the greeting fires again.
-      if (endedByDecline) {
-        endedByDecline = false;
+      if (sessionEnded) {
+        sessionEnded = false;
         await fetch('/api/reset' + SID_Q, { method: 'POST' });
       }
       // Toggle mic on server

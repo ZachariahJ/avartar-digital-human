@@ -13,12 +13,20 @@ async def _synthesize(text: str, voice: str, output_path: str) -> str:
 
 def synthesize(text: str, output_path: str | None = None,
                cancel_event: threading.Event | None = None) -> str | None:
-    """Synthesize text to speech. Returns path to wav file, or None if cancelled."""
+    """Synthesize text to speech. Returns path to an mp3, or None if cancelled.
+
+    The suffix is .mp3 because edge-tts emits MPEG layer III, full stop — the
+    voice is 24kHz mono at 48kbit/s. It used to be named .wav, which was
+    harmless only as long as the sole consumer was ffmpeg (it sniffs content and
+    ignores the name). In voice-only mode (config.ENABLE_VIDEO_AVATAR=0) this
+    file is served straight to the browser, which honours the extension and the
+    Content-Type derived from it — a .wav name there means a decode error.
+    """
     if cancel_event and cancel_event.is_set():
         return None
 
     if output_path is None:
-        output_path = tempfile.mktemp(suffix=".wav", dir=config.TEMP_DIR)
+        output_path = tempfile.mktemp(suffix=".mp3", dir=config.TEMP_DIR)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

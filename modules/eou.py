@@ -6,7 +6,7 @@ as a turn end. We use it to gate VAD's speech_end: a pause is only treated as th
 end of a turn if the model agrees the utterance is semantically complete.
 
 Runs as a tiny (~9MB) ONNX model on CPU (~28ms/consult), fully isolated from the
-FLOAT GPUs. If the model or onnxruntime is unavailable, predict_complete() returns
+MuseTalk GPUs. If the model or onnxruntime is unavailable, predict_complete() returns
 None and the VAD transparently falls back to its silence-duration behavior — EOU
 is a strict add-on that can never brick the pipeline.
 

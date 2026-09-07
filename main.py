@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import time
+import subprocess
 import json
 import asyncio
 import logging
@@ -19,7 +20,7 @@ os.makedirs(config.TEMP_DIR, exist_ok=True)
 
 from starlette.applications import Starlette
 from starlette.routing import Route, WebSocketRoute, Mount
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, HTMLResponse
 from starlette.requests import Request
 from starlette.websockets import WebSocket
 from starlette.staticfiles import StaticFiles
@@ -81,12 +82,51 @@ async def session_for(scope) -> Session:
 
 # --------------- HTTP routes ---------------
 
+def _app_config() -> dict:
+    """Server settings the page needs BEFORE its first frame.
+
+    Injected into the HTML rather than pushed over the state WebSocket: the page
+    picks its ambient clip during initial script execution (startIdle), which
+    happens well before any socket opens. Fetching it asynchronously would mean
+    the browser first requests the wrong mode's idle clip and 404s.
+    """
+    idle_name = os.path.basename(config.idle_media_path())
+    return {
+        "videoAvatar": config.ENABLE_VIDEO_AVATAR,
+        "idleUrl": "/video/assets/" + idle_name,
+        "portraitUrl": "/video/assets/" + os.path.basename(config.AVATAR_IMAGE),
+    }
+
+
 async def index(request: Request):
-    return FileResponse(os.path.join(BASE_DIR, "static", "index.html"))
+    with open(os.path.join(BASE_DIR, "static", "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    html = html.replace(
+        "<!--APP_CONFIG-->",
+        "<script>window.APP_CONFIG = %s;</script>" % json.dumps(_app_config()),
+    )
+    # no-store for the same reason the clips are no-cache: the injected config
+    # changes with the server's mode, and a cached page would keep asking for the
+    # other mode's media.
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+
+_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
 
 
 async def serve_video(request: Request):
-    """Serve video files from tmp/ (per-sentence) and assets/clips/ (fixed clips)."""
+    """Serve clips from tmp/ (per-sentence) and assets/clips/ (fixed clips).
+
+    Named for the video case but mode-agnostic: in voice-only mode the exact same
+    routes carry mp3 clips, plus the still portrait the page shows in place of
+    the talking head."""
     subdir = request.path_params["subdir"]
     filename = request.path_params["filename"]
 
@@ -122,9 +162,14 @@ async def serve_video(request: Request):
     # cross-session reuse — which is precisely the reuse that served the stale face.
     # If cross-session caching ever matters, add real 304 handling here rather than
     # weakening this header.
+    # Content-Type follows the extension, it is not assumed. In voice-only mode
+    # these same URLs carry mp3 clips (and the still portrait), and a browser
+    # handed mp3 bytes labelled video/mp4 raises a decode error instead of playing.
+    media_type = _MEDIA_TYPES.get(os.path.splitext(filename)[1].lower(),
+                                  "application/octet-stream")
     return FileResponse(
         filepath,
-        media_type="video/mp4",
+        media_type=media_type,
         headers={"Cache-Control": "no-cache"},
     )
 
@@ -440,8 +485,10 @@ async def _poll_session(session: Session):
     # re-serialized and re-sent in full every tick.
     await _push_chat_delta(session)
 
-    # Consent declined: end the session — turn the mic off server-side and tell the
-    # client to stop capturing (it lets the goodbye clip finish, then resets to Start).
+    # The pipeline ended the session — consent declined, the user aborted, or the
+    # protocol reached a terminal node and spoke its close. Turn the mic off
+    # server-side and tell the client to stop capturing (it lets the goodbye clip
+    # finish, then resets to Start).
     if pipeline.ended:
         pipeline.ended = False
         session.mic_enabled = False
@@ -506,16 +553,25 @@ async def state_poller():
 
 def _warmup_models():
     """Load the heavy models at startup so the FIRST user interaction is fast.
-    Otherwise the first request pays a one-time ~10s+ cold load of the FLOAT GPU
-    pool (and the ASR model). Runs in a daemon thread so the server starts
+    Otherwise the first request pays a one-time cold load of the MuseTalk GPU
+    pool (and the ASR model). On the FIRST boot after a driving-video change that
+    load also prepares the driving material, which takes minutes. Runs in a daemon thread so the server starts
     listening immediately; get_pool()/get_model() are lock-guarded, so a user
     request arriving mid-warmup just waits on the same load (no double load).
     """
     try:
-        logger.info("Pre-warming models (FLOAT pool on GPUs %s + ASR on GPU %s)...",
-                    config.FLOAT_GPUS, config.ASR_GPU)
-        from modules import avatar, asr
-        avatar.get_pool()
+        from modules import asr
+        if config.ENABLE_VIDEO_AVATAR:
+            logger.info("Pre-warming models (MuseTalk pool on GPUs %s + ASR on GPU %s)...",
+                        config.MUSETALK_GPUS, config.ASR_GPU)
+            from modules import avatar
+            avatar.get_pool()
+        else:
+            # Voice-only: MuseTalk is never imported, so no GPU memory, no UNet
+            # or VAE checkpoints, no driving-material preparation, and no
+            # multi-minute first-boot clip render.
+            logger.info("Voice-only mode (ENABLE_VIDEO_AVATAR=0): skipping MuseTalk; "
+                        "pre-warming ASR on GPU %s...", config.ASR_GPU)
         if config.SHUTTING_DOWN.is_set():
             return
         asr.get_model()
@@ -523,7 +579,7 @@ def _warmup_models():
             from modules import eou
             eou.get_model()  # self-handles failure -> falls back to silence VAD
         # Pre-render the fixed greeting + decline clips to cache once, so the opening
-        # and a consent-decline both play instantly (no LLM/TTS/FLOAT at request time).
+        # and a consent-decline both play instantly (no LLM/TTS/MuseTalk at request time).
         if not config.SHUTTING_DOWN.is_set():
             from modules.pipeline import prewarm_fixed_clips
             prewarm_fixed_clips()
@@ -555,11 +611,68 @@ def _reap_idle_sessions():
                 logger.info("Reaped idle session %s (total sessions: %d)", sid, len(sessions))
 
 
+def _ensure_idle_media():
+    """Make sure the ambient clip the frontend loops between answers exists.
+
+    Video mode: a seamless short section of the driving clip with natural head
+    and eye motion but a stabilized smiling mouth, regenerated if it is missing
+    OR was made from a different driving video. Same stamp discipline as the
+    fixed clips (see pipeline.clip_stamp): the loop is a function of
+    config.AVATAR_VIDEO, so an existence check alone would leave the ambient video
+    showing the OLD face after a driving-video swap.
+
+    Voice-only mode: a couple of seconds of silence, encoded once by ffmpeg. The
+    frontend's playback state machine pivots on having an idle item to loop, so
+    giving it silence keeps the swap/drain/barge-in logic identical across modes
+    instead of forking it.
+    """
+    if not config.ENABLE_VIDEO_AVATAR:
+        if os.path.exists(config.IDLE_AUDIO_PATH):
+            return
+        logger.info("Generating idle silence clip...")
+        os.makedirs(os.path.dirname(config.IDLE_AUDIO_PATH), exist_ok=True)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "lavfi",
+                 "-i", "anullsrc=r=24000:cl=mono",
+                 "-t", str(config.IDLE_AUDIO_DURATION),
+                 "-c:a", "libmp3lame", "-b:a", "48k",
+                 config.IDLE_AUDIO_PATH],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            logger.info("Idle silence saved to %s", config.IDLE_AUDIO_PATH)
+        except (OSError, subprocess.CalledProcessError) as e:
+            logger.warning("Could not generate idle silence: %s", e)
+        return
+
+    idle_sidecar = config.IDLE_VIDEO_PATH + ".txt"
+    idle_stamp = (f"motion-smile-v1:{config.IDLE_VIDEO_DURATION}:"
+                  f"{config.IDLE_SMILE_FRAME_SEC}:"
+                  f"{config.avatar_fingerprint()}")
+    try:
+        with open(idle_sidecar, encoding="utf-8") as f:
+            idle_cached = f.read()
+    except OSError:
+        idle_cached = None
+    if not os.path.exists(config.IDLE_VIDEO_PATH) or idle_cached != idle_stamp:
+        logger.info("Generating idle loop video (missing or driving video changed)...")
+        from modules import avatar
+        try:
+            avatar.generate_idle_video(duration=config.IDLE_VIDEO_DURATION)
+            with open(idle_sidecar, "w", encoding="utf-8") as f:
+                f.write(idle_stamp)
+            logger.info(f"Idle video saved to {config.IDLE_VIDEO_PATH}")
+        except Exception as e:
+            logger.warning(f"Could not generate idle video: {e}")
+
+
 def _temp_janitor():
     """Delete stale per-sentence clips from TEMP_DIR so long sessions don't fill
-    the disk. Each utterance produces a .wav + .mp4 that are only needed until the
-    browser has fetched and played them; anything older than the TTL is safe to
-    remove. Runs forever in a daemon thread. Also reaps idle sessions.
+    the disk. Each utterance produces an .mp3 (plus an .mp4 in video mode) that is
+    only needed until the browser has fetched and played it; anything older than
+    the TTL is safe to remove. In voice-only mode the mp3 IS the delivered clip,
+    so the TTL is what bounds its lifetime — nothing else deletes it.
+    Runs forever in a daemon thread. Also reaps idle sessions.
     """
     ttl = getattr(config, "TEMP_FILE_TTL_SEC", 180)
     interval = getattr(config, "TEMP_CLEAN_INTERVAL_SEC", 30)
@@ -593,7 +706,7 @@ async def lifespan(app):
     """Start background work on boot and tear it down deterministically on shutdown
     so Ctrl+C exits cleanly — cancels the state poller (else asyncio logs "Task was
     destroyed but it is pending!") and flips SHUTTING_DOWN so the daemon threads,
-    the FLOAT render busy-wait, and the LLM producer stop instead of being killed
+    the MuseTalk render busy-wait, and the LLM producer stop instead of being killed
     mid-work. (Uses the lifespan API, which works across Starlette versions;
     on_startup/on_shutdown were removed in newer Starlette.)"""
     poller = asyncio.create_task(state_poller())
@@ -631,28 +744,7 @@ if __name__ == "__main__":
     import uvicorn
 
     try:
-        # Generate the idle loop if it is missing OR was rendered from a different
-        # reference portrait. Same stamp discipline as the fixed clips (see
-        # pipeline.clip_stamp): the loop is a function of config.AVATAR_IMAGE, so
-        # an existence check alone would leave the ambient video showing the OLD
-        # face after a portrait swap.
-        idle_sidecar = config.IDLE_VIDEO_PATH + ".txt"
-        idle_stamp = f"avatar:{config.avatar_fingerprint()}"
-        try:
-            with open(idle_sidecar, encoding="utf-8") as f:
-                idle_cached = f.read()
-        except OSError:
-            idle_cached = None
-        if not os.path.exists(config.IDLE_VIDEO_PATH) or idle_cached != idle_stamp:
-            logger.info("Generating idle loop video (missing or reference portrait changed)...")
-            from modules import avatar
-            try:
-                avatar.generate_idle_video(duration=config.IDLE_VIDEO_DURATION)
-                with open(idle_sidecar, "w", encoding="utf-8") as f:
-                    f.write(idle_stamp)
-                logger.info(f"Idle video saved to {config.IDLE_VIDEO_PATH}")
-            except Exception as e:
-                logger.warning(f"Could not generate idle video: {e}")
+        _ensure_idle_media()
 
         # Enable HTTPS for public access (browser mic requires a secure context
         # on any non-localhost origin). Falls back to plain HTTP if certs are missing.

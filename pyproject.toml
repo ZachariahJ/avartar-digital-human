@@ -1,0 +1,57 @@
+[project]
+name = "avartar-digital-human"
+version = "0.1.0"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "accelerate==0.28.0",
+    "diffusers==0.30.2",
+    "edge-tts>=7.2.8",
+    "einops==0.8.1",
+    "ffmpeg-python>=0.2,<0.3",
+    "funasr>=1.4.14",
+    "gdown>=5,<6",
+    "imageio[ffmpeg]>=2.34,<3",
+    "librosa==0.11.0",
+    "mmcv @ https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/mmcv-2.0.1-cp310-cp310-manylinux1_x86_64.whl",
+    "mmdet==3.1.0",
+    "mmengine>=0.10,<0.11",
+    "mmpose==1.1.0",
+    "omegaconf>=2.3,<2.4",
+    "onnxruntime>=1.20.1",
+    "openai>=2.48.0",
+    "opencv-python==4.9.0.80",
+    "pytest>=8.4.2",
+    "python-dotenv>=1.2.1",
+    "scipy>=1.13.1",
+    "setuptools>=68,<81",
+    "soundfile==0.12.1",
+    "starlette>=0.49.3",
+    # PINNED, do not float. The sibling float/ repo (off-limits to edit) pins
+    # transformers==4.30.2; its models/wav2vec2.py sets config.output_attentions
+    # directly and its Wav2Vec2ForSpeechClassification uses the pre-5.x
+    # _tied_weights_keys API. transformers 5.x raises AttributeError on load and
+    # 4.56+ rejects output_attentions under sdpa — either way FLOAT never renders
+    # and the avatar goes silent. 4.30.2 itself needs tokenizers 0.13.3, which has
+    # no cp312 wheel, so 4.40.x is the oldest version that installs here.
+    "torch==2.0.1+cu118",
+    "torchaudio==2.0.2+cu118",
+    "torchvision==0.15.2+cu118",
+    "transformers>=4.40,<4.41",
+    "uvicorn>=0.39.0",
+]
+
+[tool.uv.extra-build-dependencies]
+# chumpy 0.70's legacy setup.py imports pip without declaring it. It is pulled
+# in by mmpose, which MuseTalk uses for DWPose facial landmarks.
+chumpy = ["pip"]
+xtcocotools = ["numpy"]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+torchaudio = { index = "pytorch" }
