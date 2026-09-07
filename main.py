@@ -635,19 +635,6 @@ def _warmup_models():
         if config.USE_EOU and not config.SHUTTING_DOWN.is_set():
             from modules import eou
             eou.get_model()  # handles its own failure by falling back to the VAD
-        # TTS is a separate service, and every spoken line depends on it. Report
-        # it unreachable now rather than letting the failure first surface as a
-        # silent avatar.
-        from modules import tts
-        if tts.healthy():
-            logger.info("TTS server reachable at %s", config.TTS_SERVER_URL)
-        else:
-            logger.error("TTS server NOT reachable at %s — start it with "
-                         "scripts/tts_server.sh. Fixed clips cannot be "
-                         "pre-warmed and dynamic replies will be silent "
-                         "(their text still reaches the chat).",
-                         config.TTS_SERVER_URL)
-
         # Refill the clip cache with every fixed utterance. Deliberately not
         # awaited: it renders on the same GPUs that answer people, so it runs in
         # its own thread and yields as soon as anyone speaks. A session that
@@ -725,7 +712,7 @@ def _temp_janitor():
     """
     ttl = config.TEMP_FILE_TTL_SEC
     interval = config.TEMP_CLEAN_INTERVAL_SEC
-    exts = (".wav",)
+    exts = (".mp3",)
     # Waiting on the event rather than sleeping lets Ctrl+C end this thread at
     # once, instead of killing it partway through a sweep.
     while not config.SHUTTING_DOWN.is_set():

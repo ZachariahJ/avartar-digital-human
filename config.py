@@ -87,21 +87,8 @@ LLM_MODEL = "google/gemini-2.5-flash"
 # by editing a prompt string.
 SYSTEM_PROMPT = build_system_prompt()
 
-# GPT-SoVITS runs as its own HTTP service (scripts/tts_server.sh) because it
-# needs torch 2.14/cu126 while MuseTalk pins 2.0.1/cu118 — the two cannot share
-# a virtualenv. modules/tts.py is only a client, so TTS can be restarted or
-# moved to another host by changing this URL.
-TTS_SERVER_URL = os.getenv("TTS_SERVER_URL", "http://127.0.0.1:9880")
-TTS_TIMEOUT_SEC = 60
-TTS_LANG = "en"
-
-# Zero-shot voice cloning: a 3-10s sample plus its transcript. The transcript is
-# the model's alignment prompt, so it must match the audio word for word — a
-# rough description degrades every synthesis. Replace both files together.
-TTS_REF_AUDIO = os.path.join(ASSETS_DIR, "voice", "reference.wav")
-_TTS_REF_TEXT_PATH = os.path.join(ASSETS_DIR, "voice", "reference.txt")
-with open(_TTS_REF_TEXT_PATH, encoding="utf-8") as _f:
-    TTS_REF_TEXT = _f.read().strip()
+# TTS
+TTS_VOICE = "en-US-GuyNeural"
 
 ASR_MODEL = "iic/SenseVoiceSmall"
 
@@ -120,10 +107,6 @@ ASR_GPU = 0
 # and the idle loop (the same file, played natively by a <video> element) then
 # visibly changes speed when the avatar starts talking. Changing this means
 # re-encoding loop.mp4 too, which re-keys avatar_fingerprint().
-#
-# Note this is faster than the renderer: ~17.5 frames/s measured on a V100 at
-# batch size 4, i.e. 0.73x realtime here, so video falls progressively further
-# behind the audio over a long utterance.
 MUSETALK_FPS = 24
 # UNet batch size, and also the streaming granularity: a batch is blended,
 # encoded and pushed as soon as the VAE decoder returns it, so this trades
@@ -139,9 +122,9 @@ MUSETALK_AUDIO_PAD_RIGHT = 2       # frame being generated
 
 MUSETALK_JPEG_QUALITY = 82
 # Frames the client holds before starting the audio clock. Audio cannot pause
-# without an audible gap, so it must not start until there is a lead. Since the
-# renderer runs below realtime (see MUSETALK_FPS) this lead is consumed as the
-# utterance plays; it covers the opening, not the whole sentence.
+# without an audible gap, so playback must not begin until the renderer has a
+# lead. Whether that lead grows or shrinks over an utterance depends on how the
+# deployment's GPU compares with MUSETALK_FPS; measure before changing this.
 STREAM_PREBUFFER_FRAMES = 12
 
 VAD_THRESHOLD = 0.5

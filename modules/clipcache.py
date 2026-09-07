@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 # Every blob is one utterance's audio and the TTS emits a single format, so this
 # is a constant rather than per-blob state. The extension is cosmetic — browsers
 # follow the Content-Type header — but it makes URLs readable in logs.
-MEDIA_TYPE = "audio/wav"
-_MEDIA_EXT = ".wav"
+MEDIA_TYPE = "audio/mpeg"
+_MEDIA_EXT = ".mp3"
 
 
 class Blob:

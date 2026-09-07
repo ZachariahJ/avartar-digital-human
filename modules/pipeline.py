@@ -123,7 +123,7 @@ def _scratch_audio(audio: bytes) -> str:
     every caller deletes the file in a finally.
     """
     os.makedirs(config.RENDER_SCRATCH_DIR, exist_ok=True)
-    fd, path = tempfile.mkstemp(suffix=".wav", dir=config.RENDER_SCRATCH_DIR)
+    fd, path = tempfile.mkstemp(suffix=".mp3", dir=config.RENDER_SCRATCH_DIR)
     with os.fdopen(fd, "wb") as f:
         f.write(audio)
     return path
