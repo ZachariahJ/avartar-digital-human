@@ -15,11 +15,11 @@ What the pipeline may call:
                           capture without moving the machine, for an answer
                           given in two breaths.
   correct(session, out)   overwrite an earlier answer and re-derive from it.
-  enter_crisis(session)   pause the protocol for the rest of the session.
-                          Callable at any point, by the pattern net or by the
-                          model. There is deliberately no automatic resume:
-                          deciding somebody is safe enough to return to
-                          screening is not a decision this code should make.
+  enter_crisis(session)   close the session on a crisis the model flagged:
+                          speak the emergency numbers and stop. There is
+                          deliberately no counseling loop and no resume —
+                          deciding somebody is safe is not a decision this
+                          code, or a model, should make, so it hands off.
   enter_abort(session)    close early, keeping what was coded.
   repeat_step(session)    re-emit the current pause.
 
@@ -405,13 +405,19 @@ def start(session: ClinicalSession) -> Step:
 
 
 def enter_crisis(session: ClinicalSession) -> Step:
-    """Suspend the protocol for the rest of the session.
+    """Close the session because the model flagged a crisis.
 
-    Permanent by design. The pipeline speaks the fixed crisis response, and
-    every later turn is handled by the counselor rather than the screening.
+    Terminal, like enter_abort. The fixed line hands over the emergency numbers
+    and says their provider will follow up; nothing further is spoken and the
+    screening does not resume. What was coded so far stays, and the crisis
+    itself is recorded.
     """
     session.crisis = True
-    return _pause(session, "crisis", [], Expect("open"))
+    key = "close.crisis"
+    session.covered.add(key)
+    logger.warning("[clinical] session closed on crisis at node %s", session.node)
+    return _pause(session, "crisis",
+                  [Say(key, templates.FIXED[key])], Expect("end"))
 
 
 def enter_abort(session: ClinicalSession) -> Step:
@@ -427,21 +433,6 @@ def enter_abort(session: ClinicalSession) -> Step:
     logger.info("[clinical] session aborted by user at node %s", session.node)
     return _pause(session, "aborted",
                   [Say(key, templates.FIXED[key])], Expect("end"))
-
-
-_CRISIS_INSTRUCTION = (
-    "Crisis protocol is active. In one or two sentences, respond with empathy "
-    "and urgency to what the person just said, keep them talking, and repeat "
-    "the crisis lines (call or text 988; call 911 if in immediate danger) "
-    "when appropriate. Do not resume any screening."
-)
-
-
-def crisis_step(session: ClinicalSession) -> Step:
-    """One LLM crisis-protocol turn — every turn while the session is in
-    crisis (whether the deterministic net or the NLU flagged it)."""
-    return _pause(session, "crisis", [LLMSay(_CRISIS_INSTRUCTION)],
-                  Expect("open"))
 
 
 def _consume(session: ClinicalSession, out: TurnOut) -> None:
@@ -529,8 +520,6 @@ def advance(session: ClinicalSession, out: TurnOut) -> Step:
     The answer must already have passed turn.validate; anything else is a
     wiring bug and raises rather than advancing the protocol.
     """
-    if session.crisis:
-        return crisis_step(session)
     if session.expect.kind == "end":
         raise ProtocolError("session already ended; nothing advances")
     if out.action != "answer":

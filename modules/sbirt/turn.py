@@ -31,7 +31,8 @@ from .instruments import BY_KEY, PRE_SCREEN
 #   question     they are asking us something; answered from state, then the
 #                ask is re-posed
 #   tangent      an aside; acknowledged, then back to the ask
-#   crisis       distress or danger, handed to the crisis path
+#   crisis       distress or danger. Ends the session: the engine speaks
+#                the emergency numbers and closes, and does not counsel on.
 #   abort        they want to stop entirely. Distinct from declining the
 #                current permission gate, which is an ordinary answer — the
 #                first ends the session, the second is a screening result.

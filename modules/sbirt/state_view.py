@@ -231,9 +231,9 @@ def _answer_shape(session: ClinicalSession) -> str:
 def _goal_lines(session: ClinicalSession) -> list[str]:
     """What this turn is for: the pending ask, or why there is not one."""
     if session.crisis:
-        return ["Crisis protocol is active — no protocol question is "
-                "pending. Respond with empathy and the crisis lines "
-                "(988; 911 if in immediate danger). No screening resumes."]
+        return ["A crisis was flagged and the session is closed — the "
+                "emergency numbers were given and their provider will follow "
+                "up. No answer is expected."]
     if session.aborted:
         return ["The person ended the session — it is closed. No answer is "
                 "expected; their partial answers stay recorded for the "
@@ -250,7 +250,7 @@ def _goal_lines(session: ClinicalSession) -> list[str]:
 def _phase_lines(session: ClinicalSession) -> list[str]:
     """Where the session is overall, and who owns the decisions that follow."""
     if session.crisis:
-        stage = "CRISIS PAUSE — the protocol is paused for the rest of the session"
+        stage = "CRISIS — closed after a crisis was flagged"
     elif session.aborted:
         stage = "ABORTED — closed early by the person"
     elif session.expect.kind == "end":

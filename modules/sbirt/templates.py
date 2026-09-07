@@ -108,6 +108,18 @@ FIXED: dict[str, str] = {
         "you for your time today. Anything you shared stays confidential, "
         "and your provider can pick this up with you whenever you're ready."
     ),
+    # For a crisis the model flagged. Gives the emergency numbers and closes:
+    # this system cannot keep anybody safe, so it hands off rather than staying
+    # in the conversation. The numbers are spelled as words because the
+    # synthesizer reads "911" as one number, which is useless to somebody
+    # trying to dial. No source text; pending clinician review.
+    "close.crisis": (
+        "Thank you for telling me that. Please get help right now: if you are "
+        "in immediate danger, call nine one one. You can also call or text "
+        "nine eight eight, the Suicide and Crisis Lifeline, at any time. "
+        "I am going to stop here, and your medical provider will follow up "
+        "with you."
+    ),
     # For an item the person still cannot answer after being offered a recall
     # aid. The manual's guidance is to note uncertainty on the record rather
     # than press (SBIRT_REF.pdf p.18). No source text; pending clinician review.

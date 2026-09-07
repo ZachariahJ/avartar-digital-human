@@ -98,9 +98,9 @@ NODES = (
     Node(
         "CRISIS",
         "Ensure immediate safety. Overrides all other nodes.",
-        "Drop screening. Respond with empathy + urgency, give crisis lines, stay until safe.",
-        ("user is safe / stabilized → return to prior node or CLOSE",
-         "acute danger → direct to 911 / 988 now"),
+        "Drop screening. Give the emergency numbers and close; do not counsel on.",
+        ("any crisis cue → give 911 / 988, say their provider will follow up, "
+         "and END the conversation",),
     ),
     Node(
         "CLOSE",

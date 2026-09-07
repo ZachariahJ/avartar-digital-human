@@ -23,7 +23,6 @@ import queue
 import tempfile
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -33,7 +32,7 @@ from modules import asr, clipcache, llm, tts, privacy
 # it pulls in torch and the entire sibling MuseTalk checkout, which voice-only
 # mode must neither pay for nor be able to fail on.
 from modules.privacy import phi, phi_keys
-from modules.sbirt import crisis, runtime, state_view, templates
+from modules.sbirt import runtime, state_view, templates
 from modules.sbirt.instruments import BY_KEY, InvalidResponse, PRE_SCREEN
 
 logger = logging.getLogger(__name__)
@@ -89,11 +88,6 @@ class Segment:
 # Fixed utterances are addressed by a stable key rather than a path, since the
 # clip they name lives in memory. The prefixes keep the three namespaces from
 # colliding.
-
-def crisis_clip_key(category: str) -> str:
-    """Cache key for one crisis category's fixed response."""
-    return f"crisis.{category}"
-
 
 def protocol_clip_key(key: str) -> str:
     """Cache key for a fixed protocol utterance."""
@@ -274,7 +268,6 @@ def fixed_catalogue() -> list:
     """(key, text) for every fixed utterance the protocol can ever speak."""
     items = [(config.GREETING_CLIP_KEY, config.GREETING_TEXT),
              (config.DECLINE_CLIP_KEY, config.DECLINE_TEXT)]
-    items += [(crisis_clip_key(c), t) for c, t in crisis.RESPONSES.items()]
     items += [(protocol_clip_key(k), t)
               for k, t in templates.all_fixed_utterances().items()]
     return items
@@ -666,40 +659,6 @@ class Pipeline:
         # out before it resets.
         self.ended = True
 
-    def _deliver_crisis(self, user_text, hit, turn):
-        """Speak the fixed response for a detected crisis and stay engaged.
-
-        No model is involved anywhere on this path: the wording for each
-        category is fixed, so what a person in crisis hears cannot vary. If the
-        clip is uncached it is rendered; if even that fails the text is still on
-        screen, because it reaches the history before any of this can fail.
-
-        The session continues afterwards under the crisis protocol rather than
-        the screening one.
-        """
-        logger.warning("[crisis] deterministic net fired: category=%s pattern=%s",
-                       hit.category, hit.pattern)  # deliberately no user text
-        self._consume_utterance(turn)
-        self._history_begin(user_text)
-        # Suspends the screening for the rest of the session; there is no path
-        # back into it.
-        runtime.enter_crisis(self.clinical)
-        text = crisis.RESPONSES[hit.category]
-        key = crisis_clip_key(hit.category)
-        seg = fixed_segment(text, key)
-        self._history_set_assistant(text)
-        if seg and not self._aborted(turn):
-            self._enqueue(seg)
-            self.video_queue.put(None)
-        elif not self._aborted(turn):
-            # Render it rather than stay silent, and cache it while we are here.
-            if self._speak_dynamic(text, turn, cache_key=key) is not None:
-                self.video_queue.put(None)
-            else:
-                self.state = "idle"
-        else:
-            self.state = "idle"
-
     # There is one conversation record, and what the model sees is derived from
     # it on demand. Keeping a second, parallel list for the API would introduce
     # an invariant that a barge-in or a failed call could break.
@@ -715,7 +674,7 @@ class Pipeline:
         return win
 
     def _history_begin(self, user_text):
-        """Record the user's turn and return the messages to send the model.
+        """Record the user's turn.
 
         When the previous user message is still unanswered — speech split by a
         pause, so the first half never got a reply — the new text is merged into
@@ -731,12 +690,10 @@ class Pipeline:
             else:
                 hist.append({"role": "user", "content": user_text})
             window = self._api_window()
-            messages = llm.build_messages(window, dict(self.patient))
         # Deliberately not awaited: extraction costs an API call and only
         # affects the next turn's prompt, so it must never delay this one.
         threading.Thread(target=self._extract_patient, args=(window,),
                          name="patient-extract", daemon=True).start()
-        return messages
 
     def _extract_patient(self, history_snapshot):
         """Merge newly extracted patient facts into the profile. Runs in the background."""
@@ -782,15 +739,6 @@ class Pipeline:
                 self.state = "idle"
                 return
 
-            # Runs before everything, including the consent gate: a disclosure
-            # of self-harm must not wait on a screening question. The model has
-            # its own crisis check, and the two are used together rather than
-            # either being trusted alone.
-            hit = crisis.detect(user_text)
-            if hit:
-                self._deliver_crisis(user_text, hit, turn)
-                return
-
             self._protocol_turn(user_text, turn)
 
         except Exception as e:
@@ -804,11 +752,6 @@ class Pipeline:
         try:
             if self._aborted(turn):
                 self.state = "idle"
-                return
-
-            hit = crisis.detect(user_text)
-            if hit:
-                self._deliver_crisis(user_text, hit, turn)
                 return
 
             self._protocol_turn(user_text, turn)
@@ -905,15 +848,6 @@ class Pipeline:
                 return
             clinical = self.clinical
 
-            # Once in crisis the screening never resumes; every remaining turn
-            # is handled by the full counselor.
-            if clinical.crisis:
-                self._consume_utterance(turn)
-                messages = self._history_begin(user_text)
-                self.state = "processing"
-                self._run_crisis_synthesis(messages, turn)
-                return
-
             exp = clinical.expect
             if exp.kind == "end":
                 self._consume_utterance(turn)
@@ -946,13 +880,16 @@ class Pipeline:
             self._consume_utterance(turn)
 
             if out.action == "crisis":
-                # The model's own crisis judgement, used alongside the pattern
-                # check that already ran; either one firing is enough.
+                # Hand off and stop. The fixed close gives the emergency
+                # numbers and says their provider will follow up; this system
+                # does not stay in the conversation trying to keep somebody
+                # safe, and the screening does not resume.
                 logger.warning("[crisis] NLU flagged crisis at node %s",
                                clinical.node)
-                runtime.enter_crisis(clinical)
-                return self._deliver_step(
-                    user_text, runtime.crisis_step(clinical), turn)
+                step = runtime.enter_crisis(clinical)
+                self._deliver_step(user_text, step, turn)
+                self.ended = True
+                return
 
             if out.action == "abort":
                 # The person wants to stop entirely. Close with the fixed
@@ -1227,117 +1164,6 @@ class Pipeline:
                 # every further remark costs a full turn to answer with "the
                 # session is already complete".
                 self.ended = True
-
-    def _run_crisis_synthesis(self, messages, turn):
-        """Speak a free-form counselor reply, used only on the crisis path.
-
-        Every other turn goes through the clinical protocol; this is the one
-        place the model still writes a whole answer.
-
-        Sentences are produced, synthesized and rendered concurrently but
-        enqueued strictly in order. A producer thread pulls sentences off the
-        stream and submits each as a job to a pool sized to the GPU count, while
-        this thread consumes the results in sequence. So the first sentence
-        starts playing after one synthesis and one render, with the rest already
-        under way on the other GPUs.
-        """
-        futures_q = queue.Queue()
-        SENTINEL = object()
-        n_gpus = max(1, len(config.MUSETALK_GPUS))
-
-        def _render(seg, idx):
-            """Fill one segment on a pool thread.
-
-            The consumer announces the segment as soon as its audio exists, so
-            frames stream to the browser while this is still running.
-            """
-            if self._aborted(turn) or config.SHUTTING_DOWN.is_set():
-                seg.cancel()
-                return
-            t_tts0 = time.perf_counter()
-            audio = tts.synthesize(seg.sentence, self.cancel_event)
-            if audio is None or self._aborted(turn):
-                seg.cancel()
-                return
-            t_render0 = time.perf_counter()
-            render_into(seg, audio, abort=seg.cancelled.is_set)
-            logger.info("[latency] seg %d rendered: tts=%.2fs render=%.2fs",
-                        idx, t_render0 - t_tts0, time.perf_counter() - t_render0)
-
-        def _producer(executor):
-            """Read sentences as they stream, submit each to render, update the chat."""
-            full_response = ""
-            try:
-                for idx, sentence in enumerate(
-                    llm.chat_stream(messages, cancel_event=self.cancel_event)
-                ):
-                    if self._aborted(turn) or config.SHUTTING_DOWN.is_set():
-                        break
-                    if idx == 0:
-                        logger.info("[latency] LLM first sentence at +%.2fs",
-                                    time.perf_counter() - self._t0)
-                    full_response += sentence
-                    logger.info("LLM sentence: %s", phi(sentence))
-
-                    self._history_set_assistant(full_response)
-
-                    # Created on this thread, in sentence order, so the consumer
-                    # holds it before its render has even started.
-                    seg = self._new_segment(sentence)
-                    futures_q.put((executor.submit(_render, seg, idx), seg))
-            except Exception:
-                logger.exception("streaming producer failed")
-            finally:
-                # Only finalize if this turn still owns the history; a newer one
-                # has taken it over otherwise. The user's message is never
-                # removed — a turn that produced nothing leaves it for the next
-                # turn to merge into.
-                if full_response.strip() and not self._aborted(turn):
-                    self._history_set_assistant(full_response)
-                futures_q.put(SENTINEL)
-
-        first_seg = True
-        with ThreadPoolExecutor(max_workers=n_gpus) as executor:
-            producer = threading.Thread(
-                target=_producer, args=(executor,), name="llm-producer", daemon=True
-            )
-            producer.start()
-
-            # Strictly in order: later sentences keep rendering in parallel
-            # while this waits on the current one.
-            while True:
-                item = futures_q.get()
-                if item is SENTINEL:
-                    break
-                fut, seg = item
-                if self._aborted(turn):
-                    fut.cancel()
-                    seg.cancel()
-                    continue  # keep draining, or the producer blocks forever
-                # Waiting for audio rather than for the whole render is what
-                # lets one sentence play while the next is still on the GPU.
-                # Also watching the future covers a failed synthesis, where the
-                # audio never arrives at all.
-                while not seg.started.wait(0.02):
-                    if fut.done() or self._aborted(turn) or config.SHUTTING_DOWN.is_set():
-                        break
-                if not seg.started.is_set() or self._aborted(turn):
-                    seg.cancel()
-                    # One failed sentence must not abandon the turn: that would
-                    # skip the end-of-response sentinel below and leave the
-                    # avatar frozen on its last frame.
-                    continue
-                self._enqueue(seg)
-                if first_seg:
-                    first_seg = False
-                    logger.info("[latency] FIRST segment enqueued at +%.2fs",
-                                time.perf_counter() - self._t0)
-
-            producer.join(timeout=1.0)
-
-        if not self._aborted(turn):
-            self.video_queue.put(None)
-            self.state = "speaking"
 
     def get_next_video(self):
         """Take the next segment for delivery, without blocking.

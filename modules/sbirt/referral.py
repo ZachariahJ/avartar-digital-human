@@ -4,8 +4,9 @@ Reference content for the referral end of SBIRT: levels of care, medications,
 national resources and how to hand somebody over, plus the crisis situations
 that take priority over any of it.
 
-Rendered into the system prompt. The executable crisis detection lives in
-crisis.py; this is the guidance the model works from once that has fired.
+Rendered into the system prompt. Spotting a crisis is the model's job — it
+reports the "crisis" action and the engine closes the session with a fixed
+line; this is the guidance the model works from.
 """
 
 from __future__ import annotations

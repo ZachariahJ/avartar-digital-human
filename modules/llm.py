@@ -8,8 +8,10 @@ Three distinct jobs, deliberately kept apart because they fail differently:
     protocol in place rather than corrupting a screening.
   * phrase_utterance() — wording for a single utterance the protocol has
     already decided to deliver.
-  * chat_stream() / chat() / extract_patient_facts() — open-ended generation,
-    now reached only on the crisis path and by background profile extraction.
+  * extract_patient_facts() — background profile extraction, the only
+    open-ended generation left. Nothing here writes a whole reply any more:
+    the protocol decides what is said, and a crisis closes the session with
+    a fixed line.
 
 The clinical protocol lives in modules/sbirt/ and is decided by code. Nothing
 here chooses what to ask, what a score is, or where a session goes next.
@@ -44,23 +46,6 @@ def _client() -> OpenAI:
                     api_key=config.OPENROUTER_API_KEY,
                 )
     return _client_obj
-
-
-def build_messages(history: list[dict], patient: dict | None = None) -> list[dict]:
-    """Assemble a message list: system prompt, known patient facts, then history.
-
-    The patient profile is re-injected on every turn rather than left in the
-    conversation, because the history is a sliding window: facts established
-    early would otherwise scroll out and the model would start re-asking for
-    things it had already been told.
-    """
-    system = config.SYSTEM_PROMPT
-    if patient:
-        system += ("\n\n=== KNOWN PATIENT (persists for the whole session) ===\n"
-                   "These were established earlier — do NOT re-ask a field that is "
-                   "already filled; use them to tailor screening and tone:\n"
-                   + json.dumps(patient, ensure_ascii=False))
-    return [{"role": "system", "content": system}] + list(history)
 
 
 _EXTRACT_SYSTEM = (
@@ -101,86 +86,6 @@ def extract_patient_facts(history: list[dict]) -> dict:
     except Exception as e:
         logger.info("patient extraction skipped (%s)", e)
         return {}
-
-
-def chat(messages: list[dict]) -> str:
-    """One non-streaming completion for a caller-built message list.
-
-    Stateless: the Pipeline owns the conversation and nothing here mutates it.
-    """
-    response = _client().chat.completions.create(
-        model=config.LLM_MODEL,
-        messages=messages,
-    )
-    return response.choices[0].message.content or ""
-
-
-def chat_stream(messages: list[dict],
-                cancel_event: threading.Event | None = None):
-    """Yield whole sentences as the model produces them.
-
-    Args:
-        messages: the complete message list, built by the caller.
-        cancel_event: polled between chunks; when set, the stream is closed and
-            iteration ends.
-
-    Yields:
-        One complete sentence at a time, so the caller can start synthesizing
-        the first while the rest is still generating.
-
-    Stateless: the caller accumulates what it receives and owns the history.
-    """
-    stream = _client().chat.completions.create(
-        model=config.LLM_MODEL,
-        messages=messages,
-        stream=True,
-    )
-
-    buffer = ""
-    # Sentence-final punctuation only. Splitting at commas as well would start
-    # the audio sooner, but every split becomes a separate synthesis and render,
-    # which shows up as a silence gap and a lip-sync seam at each one. The system
-    # prompt instead asks for a short opening sentence, which gets the same fast
-    # start at no cost.
-    sentence_endings = {"。", "！", "？", ".", "!", "?", "\n"}
-
-    for chunk in stream:
-        if cancel_event and cancel_event.is_set():
-            # Close it rather than just breaking out. Abandoning the iterator
-            # leaves the connection open and the model generating — and billing —
-            # into a socket nobody reads.
-            try:
-                stream.close()
-            except Exception:
-                pass
-            return
-
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta.content
-        if delta:
-            buffer += delta
-
-            # One delta can complete more than one sentence, so drain rather
-            # than checking once.
-            while True:
-                split_pos = -1
-                for i, ch in enumerate(buffer):
-                    if ch in sentence_endings:
-                        split_pos = i
-                        break
-
-                if split_pos == -1:
-                    break
-
-                sentence = buffer[: split_pos + 1].strip()
-                buffer = buffer[split_pos + 1 :]
-                if sentence:
-                    yield sentence
-
-    # A final sentence with no terminating punctuation would otherwise be lost.
-    if buffer.strip() and not (cancel_event and cancel_event.is_set()):
-        yield buffer.strip()
 
 
 # Coding a screening answer must never involve a guess: a quantity or timeframe
@@ -548,9 +453,3 @@ def phrase_utterance(instruction: str, history: list[dict],
     except Exception as e:
         logger.warning("phrase_utterance failed (%s); skipping utterance", e)
         return ""
-
-
-if __name__ == "__main__":
-    # Smoke test for credentials and connectivity, not for behaviour.
-    msgs = build_messages([{"role": "user", "content": "Hello, please briefly introduce yourself"}])
-    print(f"LLM reply: {chat(msgs)}")
