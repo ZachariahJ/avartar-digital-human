@@ -17,18 +17,17 @@ import config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-os.makedirs(config.TEMP_DIR, exist_ok=True)
 
 from starlette.applications import Starlette
 from starlette.routing import Route, WebSocketRoute, Mount
-from starlette.responses import FileResponse, JSONResponse, HTMLResponse
+from starlette.responses import FileResponse, JSONResponse, HTMLResponse, Response
 from starlette.requests import Request
 from starlette.websockets import WebSocket
 from starlette.staticfiles import StaticFiles
 
 from modules.pipeline import Pipeline
 from modules.vad import VoiceActivityDetector
-from modules import asr, privacy
+from modules import asr, clipcache, privacy
 
 BASE_DIR = config.BASE_DIR   # single source of truth (config.py); don't redefine the project root here
 
@@ -119,67 +118,59 @@ async def index(request: Request):
     return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
-_MEDIA_TYPES = {
-    ".mp4": "video/mp4",
-    ".mp3": "audio/mpeg",
-    ".wav": "audio/wav",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-}
+# The only files still served from disk: the idle loop, the still portrait, the
+# idle silence clip. Utterances are never files.
+_MEDIA_TYPES = {".mp4": "video/mp4", ".mp3": "audio/mpeg", ".png": "image/png"}
 
 
 async def serve_video(request: Request):
-    """Serve clips from tmp/ (per-sentence) and assets/clips/ (fixed clips).
+    """Serve one static file out of assets/.
 
-    Named for the video case but mode-agnostic: in voice-only mode the exact same
-    routes carry mp3 clips, plus the still portrait the page shows in place of
-    the talking head."""
-    subdir = request.path_params["subdir"]
-    filename = request.path_params["filename"]
+    Utterances do not come through here — they are never files. A rendered
+    segment's audio lives in RAM and is served by serve_media() from a token
+    URL; its frames go down the state socket as bytes.
 
-    # Map URL token -> real directory. filename is a bare basename (str converter
-    # rejects slashes), so no path-traversal guard is needed here.
-    roots = {
-        "tmp": os.path.join(BASE_DIR, "tmp"),
-        "clips": config.CLIPS_DIR,          # assets/clips
-        "assets": config.ASSETS_DIR,        # assets/ root (loop.mp4)
-    }
-    root = roots.get(subdir)
-    if root is None:
+    no-cache is REQUIRED, not an optimisation opt-out: /video/assets/loop.mp4
+    and /video/assets/avatar1.png are stable URLs over MUTABLE bytes, so
+    swapping the avatar must not leave a browser replaying the old face out of
+    heuristic freshness. "no-cache" means "revalidate before use", not "don't
+    store". Starlette's FileResponse emits an etag but implements no
+    conditional-request handling, so a revalidation costs a full body; that is
+    affordable because each of these is fetched once per page load.
+    """
+    if request.path_params["subdir"] != "assets":
         return JSONResponse({"error": "not found"}, status_code=404)
-
-    filepath = os.path.join(root, filename)
+    # filename is a bare basename (the str converter rejects slashes), so there
+    # is no path-traversal guard to write here.
+    filename = request.path_params["filename"]
+    filepath = os.path.join(config.ASSETS_DIR, filename)
     if not os.path.isfile(filepath):
         return JSONResponse({"error": "not found"}, status_code=404)
-
-    # no-cache is REQUIRED, not an optimisation opt-out. Every one of these URLs
-    # is stable (/video/assets/loop.mp4, /video/clips/greeting.mp4, ...) while
-    # its BYTES are mutable — re-rendering after a GREETING_TEXT edit or an
-    # AVATAR_IMAGE swap rewrites the file behind an unchanged URL. Starlette's
-    # FileResponse sets etag/last-modified but no Cache-Control, so the browser
-    # falls back to HEURISTIC freshness and replays its stale copy WITHOUT
-    # revalidating: the server serves the new face and the user still sees the old
-    # one. "no-cache" means "revalidate before use", not "don't store".
-    #
-    # Cost, measured not assumed: Starlette 0.52.1's FileResponse emits an etag but
-    # implements NO conditional-request handling, so an If-None-Match revalidation
-    # comes back 200 with the full body, never 304. That is acceptable here only
-    # because each clip URL is fetched once per page session anyway (a clip plays
-    # once; the idle loop loads once and then loops in-place), so the loss is
-    # cross-session reuse — which is precisely the reuse that served the stale face.
-    # If cross-session caching ever matters, add real 304 handling here rather than
-    # weakening this header.
-    # Content-Type follows the extension, it is not assumed. In voice-only mode
-    # these same URLs carry mp3 clips (and the still portrait), and a browser
-    # handed mp3 bytes labelled video/mp4 raises a decode error instead of playing.
-    media_type = _MEDIA_TYPES.get(os.path.splitext(filename)[1].lower(),
-                                  "application/octet-stream")
     return FileResponse(
         filepath,
-        media_type=media_type,
+        media_type=_MEDIA_TYPES.get(os.path.splitext(filename)[1].lower(),
+                                    "application/octet-stream"),
         headers={"Cache-Control": "no-cache"},
     )
+
+
+async def serve_media(request: Request):
+    """Serve one utterance's audio out of RAM (modules/clipcache.py).
+
+    The token in the URL is minted per publish, so a URL identifies exact bytes
+    and can never be answered with someone else's clip. A miss is a plain 404:
+    a dynamic segment's blob expires after MEDIA_BLOB_TTL_SEC, by which point
+    the browser has long since fetched and played it.
+
+    no-store, not no-cache: what flows through here is counselor speech in a
+    clinical session, and there is no reuse to win — each URL is fetched once,
+    and a fixed clip's token dies with the process anyway.
+    """
+    data = clipcache.fetch(clipcache.token_from_url(request.path_params["name"]))
+    if data is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(data, media_type=clipcache.MEDIA_TYPE,
+                    headers={"Cache-Control": "no-store"})
 
 
 async def api_toggle(request: Request):
@@ -230,41 +221,6 @@ async def api_text(request: Request):
     return JSONResponse({"status": "processing"})
 
 
-async def api_test_asr(request: Request):
-    """Diagnostic: receive raw int16 PCM audio, run ASR, return result."""
-    body = await request.body()
-    audio_i16 = np.frombuffer(body, dtype=np.int16)
-    audio_f32 = audio_i16.astype(np.float32) / 32768.0
-
-    duration = len(audio_f32) / 16000
-    rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
-    max_val = float(np.max(np.abs(audio_f32)))
-
-    logger.info(f"[TestASR] Received {len(audio_i16)} samples, "
-                f"duration={duration:.2f}s, rms={rms:.4f}, max={max_val:.4f}")
-
-    # Save for inspection
-    import scipy.io.wavfile as wavfile
-    debug_path = os.path.join(BASE_DIR, "tmp", "test_asr_input.wav")
-    wavfile.write(debug_path, 16000, audio_i16)
-    logger.info(f"[TestASR] Saved to {debug_path}")
-
-    # Run ASR
-    from modules import asr
-    text = asr.transcribe_array(audio_f32, sample_rate=16000)
-    logger.info("[TestASR] Result: %s", privacy.phi(text))
-
-    return JSONResponse({
-        "text": text,
-        "duration": f"{duration:.2f}",
-        "rms": f"{rms:.4f}",
-        "max": f"{max_val:.4f}",
-    })
-
-
-# --------------- Audio WebSocket ---------------
-
-_word_re = re.compile(r"[^a-z0-9 ]+")
 
 
 def _looks_like_echo(text: str, pipeline) -> bool:
@@ -417,12 +373,6 @@ async def ws_audio(websocket: WebSocket):
                 logger.info(f"[AudioDebug] speech_end: duration={duration:.2f}s, "
                            f"rms={rms:.4f}, max={np.max(np.abs(audio_data)):.4f}")
                 # Optional debug wav — OFF by default. The synchronous disk write
-                # stalled the audio loop on every utterance. Enable: DEBUG_SAVE_AUDIO=1
-                if config.DEBUG_SAVE_AUDIO:
-                    import scipy.io.wavfile as wavfile
-                    debug_path = os.path.join(BASE_DIR, "tmp", "debug_speech.wav")
-                    wavfile.write(debug_path, 16000, (audio_data * 32767).astype(np.int16))
-                    logger.info(f"[AudioDebug] Saved debug audio to {debug_path}")
                 session.pipeline.on_speech_end(audio_data)
 
     except Exception as e:
@@ -494,13 +444,6 @@ async def broadcast_bytes(clients: set, payload: bytes):
     clients.difference_update(disconnected)
 
 
-def _media_url(path: str) -> str:
-    """Map a segment's audio file to the URL serve_video() will answer on."""
-    if path.startswith(os.path.join(BASE_DIR, "tmp")):
-        return "/video/tmp/" + os.path.basename(path)
-    return "/video/clips/" + os.path.basename(path)
-
-
 # Frames per session per poll tick. STATE_POLL_INTERVAL is 0.1s and playback
 # needs MUSETALK_FPS frames a second, so this is ~4x realtime: the pump is never
 # the bottleneck (the renderer is), while still bounding how long one session
@@ -541,7 +484,7 @@ async def _pump_segments(session: Session):
             await broadcast(clients, {
                 "type": "segment",
                 "id": session.seg_id,
-                "audio_url": _media_url(seg.audio_path),
+                "audio_url": seg.audio_url,
                 "fps": seg.fps,
                 "prebuffer": config.STREAM_PREBUFFER_FRAMES,
                 "subtitle": seg.sentence,
@@ -693,11 +636,29 @@ def _warmup_models():
         if getattr(config, "USE_EOU", False) and not config.SHUTTING_DOWN.is_set():
             from modules import eou
             eou.get_model()  # self-handles failure -> falls back to silence VAD
-        # Pre-render the fixed greeting + decline clips to cache once, so the opening
-        # and a consent-decline both play instantly (no LLM/TTS/MuseTalk at request time).
+        # Fill the in-RAM clip cache with every fixed utterance. This does NOT
+        # block the warmup: the cache is memory, so it has to be rebuilt on every
+        # boot, and it renders on the same GPUs that answer people — so it runs
+        # in its own thread at idle priority and hands the GPU back the moment
+        # anyone speaks. A session that arrives before it finishes just renders
+        # whatever it needs on demand (and caches it).
+        # TTS is a separate service (scripts/tts_server.sh). Say so HERE if it
+        # is down, not at the first thing the counselor tries to say — every
+        # dynamic utterance and the whole clip pre-warm depend on it.
+        from modules import tts
+        if tts.healthy():
+            logger.info("TTS server reachable at %s", config.TTS_SERVER_URL)
+        else:
+            logger.error("TTS server NOT reachable at %s — start it with "
+                         "scripts/tts_server.sh. Fixed clips cannot be "
+                         "pre-warmed and dynamic replies will be silent "
+                         "(their text still reaches the chat).",
+                         config.TTS_SERVER_URL)
+
         if not config.SHUTTING_DOWN.is_set():
             from modules.pipeline import prewarm_fixed_clips
-            prewarm_fixed_clips()
+            threading.Thread(target=prewarm_fixed_clips, name="clip-prewarm",
+                             daemon=True).start()
         logger.info("Model pre-warm complete; first response will be fast.")
     except Exception as e:
         logger.warning("Model pre-warm failed (will lazy-load on demand): %s", e)
@@ -758,26 +719,28 @@ def _ensure_idle_media():
 
 
 def _temp_janitor():
-    """Delete stale per-sentence clips from TEMP_DIR so long sessions don't fill
-    the disk. Each utterance produces an .mp3 (plus an .mp4 in video mode) that is
-    only needed until the browser has fetched and played it; anything older than
-    the TTL is safe to remove. In voice-only mode the mp3 IS the delivered clip,
-    so the TTL is what bounds its lifetime — nothing else deletes it.
+    """Expire played-out audio from the in-RAM media store, and sweep the one
+    kind of file that can still appear on disk: a render scratch wav that a
+    crash leaked before its finally could unlink it.
     Runs forever in a daemon thread. Also reaps idle sessions.
     """
     ttl = getattr(config, "TEMP_FILE_TTL_SEC", 180)
     interval = getattr(config, "TEMP_CLEAN_INTERVAL_SEC", 30)
-    exts = (".mp4", ".wav", ".txt", ".mp3")
+    exts = (".wav",)
     # Wait on the shutdown event instead of time.sleep so Ctrl+C exits this daemon
     # thread promptly (a long time.sleep left it to be killed mid-work at teardown).
     while not config.SHUTTING_DOWN.is_set():
         try:
             now = time.time()
             removed = 0
-            for name in os.listdir(config.TEMP_DIR):
+            try:
+                names = os.listdir(config.RENDER_SCRATCH_DIR)
+            except OSError:
+                names = []            # not created yet: nothing to sweep
+            for name in names:
                 if not name.endswith(exts):
                     continue
-                path = os.path.join(config.TEMP_DIR, name)
+                path = os.path.join(config.RENDER_SCRATCH_DIR, name)
                 try:
                     if os.path.isfile(path) and now - os.path.getmtime(path) > ttl:
                         os.remove(path)
@@ -786,6 +749,10 @@ def _temp_janitor():
                     pass
             if removed:
                 logger.info("[janitor] removed %d stale temp files", removed)
+            expired = clipcache.sweep()
+            if expired:
+                logger.info("[janitor] expired %d media blobs; %s",
+                            expired, clipcache.stats())
             _reap_idle_sessions()
         except Exception:
             logger.exception("temp janitor iteration failed; continuing")
@@ -818,11 +785,11 @@ app = Starlette(
     routes=[
         Route("/", index),
         Route("/video/{subdir}/{filename}", serve_video),
+        Route("/media/{name}", serve_media),
         Route("/api/toggle", api_toggle, methods=["POST"]),
         Route("/api/greet", api_greet, methods=["POST"]),
         Route("/api/reset", api_reset, methods=["POST"]),
         Route("/api/text", api_text, methods=["POST"]),
-        Route("/api/test_asr", api_test_asr, methods=["POST"]),
         WebSocketRoute("/ws/audio", ws_audio),
         WebSocketRoute("/ws/state", ws_state),
         Mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static"),

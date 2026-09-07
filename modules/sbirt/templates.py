@@ -5,9 +5,9 @@ zone feedback, brief-intervention lines, closing — transcribed VERBATIM from
 the study's authoritative dialogue ("AI SBIRT app dialogue for study.docx" in
 SBIRT_Reference/). The runtime speaks these strings exactly; the LLM never
 generates or paraphrases them. Because they are fixed, every one of them can
-be pre-rendered to a cached clip (see pipeline.ensure_fixed_clip).
+be pre-rendered into the in-RAM clip cache (see pipeline.prewarm_fixed_clips).
 
-Clip staleness is handled by the sidecar text check in ensure_fixed_clip;
+Clip staleness is handled by pipeline.clip_stamp;
 the consent audit anchors the exact greeting wording by content hash.
 
 Documented normalizations of source-document typos (flagged for clinician
@@ -249,7 +249,6 @@ def bi_why_not_higher(value: int) -> str:
     return f"Why are you a {value} and not a 9 or 10?"
 
 
-BI_LEAVES_YOU = FIXED["bi.leaves_you"]   # single source: the FIXED entry
 
 
 # --------------- Content units (T8): what a turn must convey ---------------

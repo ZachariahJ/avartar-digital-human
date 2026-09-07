@@ -1,4 +1,4 @@
-edge-tts
+requests
 openai
 funasr
 python-dotenv

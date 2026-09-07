@@ -35,7 +35,7 @@ import logging
 from dataclasses import dataclass, field
 
 from . import coding, templates
-from .flow import (ARM_INSTRUMENT, ARM_ORDER, Ask, End, Gate, Label, PROTOCOL,
+from .flow import (ARM_INSTRUMENT, Ask, End, Gate, Label, PROTOCOL,
                    RunItems, Route, Tell, close_unit, label_index)
 from .instruments import (assess, Assessment, BY_KEY, InvalidResponse,
                           next_item_index, option_score, PRE_SCREEN)
@@ -596,10 +596,6 @@ def confirm_reason(session: ClinicalSession, out: TurnOut) -> dict | None:
         return {"reason": "semantic"}
     return None                            # cleanly derived: commit directly
 
-
-def needs_confirm(session: ClinicalSession, out: TurnOut) -> bool:
-    """Compatibility wrapper over confirm_reason (T20 entry point)."""
-    return confirm_reason(session, out) is not None
 
 
 def _confirm_pause(session: ClinicalSession) -> Step:

@@ -19,8 +19,10 @@ SHUTTING_DOWN = threading.Event()
 # path — that silently breaks the moment the clip moves). Move a root → one edit.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # digital-human/
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")           # source imgs + all cached clips live under here
-CLIPS_DIR = os.path.join(ASSETS_DIR, "clips")           # ALL pre-rendered fixed video clips
-TEMP_DIR = os.path.join(BASE_DIR, "tmp")                # per-sentence dynamic renders (transient)
+# NOTE: assets/clips/ was the on-disk fixed-clip cache. Nothing reads or writes
+# it any more (clips live in RAM — see modules/clipcache.py); whatever is left
+# there is dead weight and safe to delete.
+TEMP_DIR = os.path.join(BASE_DIR, "tmp")                # fallback render scratch only (see RENDER_SCRATCH_DIR)
 CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
 RECORDS_DIR = os.path.join(BASE_DIR, "records")
 CERTS_DIR = os.path.join(BASE_DIR, "certs")
@@ -111,8 +113,27 @@ SYSTEM_PROMPT = build_system_prompt()
 # acknowledgment as its own sentence" rule keeps the first clip short for a fast
 # start without needing sub-sentence splits.
 
-# TTS
-TTS_VOICE = "en-US-GuyNeural"
+# --- TTS: local GPT-SoVITS ---
+# Runs as a SEPARATE process (scripts/tts_server.sh) because GPT-SoVITS needs
+# torch 2.14/cu126 while MuseTalk pins 2.0.1/cu118 — one virtualenv cannot hold
+# both. modules/tts.py is an HTTP client to it; a TTS restart therefore does not
+# disturb the avatar, and the model can move to another GPU or host by changing
+# this URL alone.
+TTS_SERVER_URL = os.getenv("TTS_SERVER_URL", "http://127.0.0.1:9880")
+TTS_TIMEOUT_SEC = 60          # a long sentence on a cold model can take a while
+TTS_LANG = "en"
+TTS_BATCH_SIZE = 1            # one sentence per request; nothing to batch
+TTS_SPEED = 1.0
+
+# Zero-shot voice cloning reference: a 3-10s clip and its VERBATIM transcript.
+# The two must agree exactly — the transcript is the model's alignment prompt,
+# not a label. This clip was generated with the previous edge-tts voice
+# (en-US-GuyNeural), so moving to a local model did not change how the
+# counselor sounds; replace both files together to change the voice.
+TTS_REF_AUDIO = os.path.join(ASSETS_DIR, "voice", "reference.wav")
+_TTS_REF_TEXT_PATH = os.path.join(ASSETS_DIR, "voice", "reference.txt")
+with open(_TTS_REF_TEXT_PATH, encoding="utf-8") as _f:
+    TTS_REF_TEXT = _f.read().strip()
 
 # ASR
 ASR_MODEL = "iic/SenseVoiceSmall"
@@ -225,14 +246,45 @@ STATE_POLL_INTERVAL = 0.1   # seconds
 # Counts messages (user+assistant); the system prompt is always kept on top.
 LLM_HISTORY_MAX_MESSAGES = 20
 
-# Temp-file janitor: tmp/ fills with per-sentence .wav/.mp4 clips. A background
-# thread deletes clips older than the TTL so long sessions don't exhaust disk.
+# Temp-file janitor: sweeps whatever still lands in tmp/ (debug dumps, an
+# abandoned render scratch file) plus the expired in-RAM media blobs.
 TEMP_FILE_TTL_SEC = 180
 TEMP_CLEAN_INTERVAL_SEC = 30
 
-# Save a debug .wav of every captured utterance to tmp/debug_speech.wav. Off by
-# default — the synchronous disk write was stalling the audio event loop.
-DEBUG_SAVE_AUDIO = os.getenv("DEBUG_SAVE_AUDIO", "0").lower() in ("1", "true", "yes")
+# --- In-memory media (modules/clipcache.py) ---
+# Nothing the browser plays is written to disk: a rendered utterance is audio
+# bytes plus JPEG frames held in RAM and served from /media/<token>.mp3.
+#
+# How long a DYNAMIC sentence's audio stays reachable after it was published.
+# It only has to outlive the browser fetching and playing it once; a fixed
+# clip's audio is pinned for as long as the clip is cached and ignores this.
+MEDIA_BLOB_TTL_SEC = 300
+# Ceiling on the fixed-clip cache (audio + frames). Past it the least recently
+# used clip is dropped and will be re-rendered on demand. The full protocol is
+# ~81 utterances at roughly 5MB of JPEG each, so the default holds all of them
+# with room to spare; it exists to bound a runaway, not to force eviction.
+CLIP_CACHE_MAX_MB = int(os.getenv("CLIP_CACHE_MAX_MB", "2048"))
+# MuseTalk's whisper feature extraction takes a FILENAME, so each render spills
+# its mp3 to one scratch file and deletes it immediately. /dev/shm is RAM; the
+# fallback is tmp/, which on this deployment sits on GPFS (slow, networked).
+_SHM = "/dev/shm"
+RENDER_SCRATCH_DIR = os.getenv(
+    "RENDER_SCRATCH_DIR",
+    os.path.join(_SHM, f"digital-human-{os.getuid()}") if os.path.isdir(_SHM) else TEMP_DIR,
+)
+
+# --- Fixed-clip pre-warm ---
+# Every fixed utterance is rendered once into the clip cache. The cache is RAM,
+# so this happens on every boot rather than being read back off disk — which is
+# why it runs ONLY while nobody is mid-turn, and hands the GPU straight back
+# (MuseTalk polls the abort hook every batch) the moment someone speaks.
+CLIP_PREWARM = os.getenv("CLIP_PREWARM", "1").lower() not in ("0", "false", "no")
+# Treat the conversation as still live for this long after a turn ends, so the
+# pre-warm doesn't grab a GPU in the gap between two turns of the same exchange.
+CLIP_PREWARM_IDLE_SEC = float(os.getenv("CLIP_PREWARM_IDLE_SEC", "5"))
+CLIP_PREWARM_POLL_SEC = 0.5     # how often the pre-warm re-checks for idle
+CLIP_PREWARM_MAX_ATTEMPTS = 3   # give up on a clip that keeps failing to render
+
 
 # Write patient/clinical content to the logs VERBATIM instead of the redacted
 # "<phi 7w/41c>" shape summary. Off by default. For local debugging only: with
@@ -286,10 +338,11 @@ def idle_media_path() -> str:
     return IDLE_VIDEO_PATH if ENABLE_VIDEO_AVATAR else IDLE_AUDIO_PATH
 
 # Fixed opening the counselor always says first. Because it is IDENTICAL every
-# session, it is rendered to a cached clip ONCE (assets/greeting.mp4) and replayed
-# — no per-session LLM/TTS/MuseTalk, and it appears instantly. Editing GREETING_TEXT
-# regenerates the clip on next startup (a sidecar tracks the text). The spoken part
-# only; the yes/no consent branch is handled by the LLM (see modules/sbirt/workflow.py).
+# session, it is rendered ONCE per process into the in-RAM clip cache and replayed
+# from there — no per-session LLM/TTS/MuseTalk, and it appears instantly. Editing
+# GREETING_TEXT invalidates the cached clip (clip_stamp covers the text), so the
+# next play re-renders it. The spoken part only; the yes/no consent branch is
+# handled by the LLM (see modules/sbirt/workflow.py).
 GREETING_TEXT = (
     "Hello, I am an AI assistant designed to help understand some important factors "
     "that may impact your health. This information will be shared with your medical "
@@ -297,12 +350,12 @@ GREETING_TEXT = (
     "Your answers will be treated as confidential and as protected health information. "
     "May I ask you some questions about your health?"
 )
-GREETING_VIDEO_PATH = os.path.join(CLIPS_DIR, "greeting.mp4")
+GREETING_CLIP_KEY = "greeting"
 
-# Fixed reply when the user DECLINES consent at the greeting. Cached to a clip too,
+# Fixed reply when the user DECLINES consent at the greeting. Cached the same way,
 # so it is verbatim + instant like the greeting (no per-session LLM/TTS/MuseTalk).
 DECLINE_TEXT = "Thank you, and your provider will address these during your visit."
-DECLINE_VIDEO_PATH = os.path.join(CLIPS_DIR, "decline.mp4")
+DECLINE_CLIP_KEY = "decline"
 
 # Server / public access
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # bind all interfaces for public access

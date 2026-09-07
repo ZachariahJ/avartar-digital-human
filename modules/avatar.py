@@ -439,7 +439,11 @@ class MuseTalkGPUPool:
         while True:
             # Bail out promptly on server shutdown so Ctrl+C isn't blocked waiting
             # here for a free GPU (the caller treats 0 frames as a failed render).
-            if config.SHUTTING_DOWN.is_set():
+            # `abort` is polled HERE too, not just once a GPU is in hand: a
+            # barged-in segment must not queue for a GPU it will never use, and
+            # the clip pre-warm — whose abort hook is "someone is talking" — must
+            # not seize the first GPU a live conversation happens to release.
+            if config.SHUTTING_DOWN.is_set() or (abort is not None and abort()):
                 return 0
             for gpu_id in self.gpu_ids:
                 if self.semaphores[gpu_id].acquire(blocking=False):
@@ -478,6 +482,5 @@ def stream_video(audio_path: str, on_frame, abort=None) -> int:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    os.makedirs(config.TEMP_DIR, exist_ok=True)
     pool = get_pool()
     print("MuseTalk GPU pool loaded successfully.")
