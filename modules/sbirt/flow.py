@@ -29,9 +29,7 @@ The step vocabulary:
   RunItems(itemset) administer a whole instrument, one item per turn, applying
                     its skip rules and scoring it on completion. Adding an item
                     to an instrument requires no change here.
-  End(node, close)  stop expecting input, after speaking the close unit. The
-                    consent-refused ending speaks nothing, because the pipeline
-                    owns that fixed goodbye.
+  End(node, close)  stop expecting input, after speaking the close unit.
 """
 
 from __future__ import annotations
@@ -243,7 +241,7 @@ PROTOCOL: tuple = (
     End("closed", close="@close"),
 
     Label("declined"),
-    End("declined"),
+    End("declined", close="close.consent_declined"),
 )
 
 LABELS: dict[str, int] = {

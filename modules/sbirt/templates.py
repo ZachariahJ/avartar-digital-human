@@ -108,6 +108,13 @@ FIXED: dict[str, str] = {
         "you for your time today. Anything you shared stays confidential, "
         "and your provider can pick this up with you whenever you're ready."
     ),
+    # For a refusal of the opening consent, which ends the session before any
+    # screening. Source text, quoted exactly as the study script gives it —
+    # distinct from close.declined above, which is for a session that ran and
+    # only declined a permission along the way.
+    "close.consent_declined": (
+        "Thank you, and your provider will address these during your visit."
+    ),
     # For a crisis the model flagged. Gives the emergency numbers and closes:
     # this system cannot keep anybody safe, so it hands off rather than staying
     # in the conversation. The numbers are spelled as words because the

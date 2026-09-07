@@ -266,8 +266,7 @@ def _prewarm_abort() -> bool:
 
 def fixed_catalogue() -> list:
     """(key, text) for every fixed utterance the protocol can ever speak."""
-    items = [(config.GREETING_CLIP_KEY, config.GREETING_TEXT),
-             (config.DECLINE_CLIP_KEY, config.DECLINE_TEXT)]
+    items = [(config.GREETING_CLIP_KEY, config.GREETING_TEXT)]
     items += [(protocol_clip_key(k), t)
               for k, t in templates.all_fixed_utterances().items()]
     return items
@@ -633,32 +632,6 @@ class Pipeline:
         finally:
             _turn_end()
 
-    def _deliver_decline(self, user_text, turn):
-        """Consent was refused: speak the fixed closing line and end the session.
-
-        No screening and no generated content on this path — the wording is
-        fixed so that a refusal is always answered identically.
-        """
-        self._history_begin(user_text)          # record the user's "no"
-        text = config.DECLINE_TEXT
-        key = config.DECLINE_CLIP_KEY
-        seg = fixed_segment(text, key)
-        self._history_set_assistant(text)
-        if seg and not self._aborted(turn):
-            self._enqueue(seg)
-            self.video_queue.put(None)
-        elif not self._aborted(turn):
-            # Render it now rather than end the session on silence.
-            if self._speak_dynamic(text, turn, cache_key=key) is not None:
-                self.video_queue.put(None)
-            else:
-                self.state = "idle"
-        else:
-            self.state = "idle"
-        # Safe to end now that the closing line is queued: the client plays it
-        # out before it resets.
-        self.ended = True
-
     # There is one conversation record, and what the model sees is derived from
     # it on demand. Keeping a second, parallel list for the API would introduce
     # an invariant that a barge-in or a failed call could break.
@@ -945,7 +918,10 @@ class Pipeline:
                     logger.exception("protocol advance failed; re-asking")
                     return self._hold(user_text, "", turn)
                 if clinical.node == "declined":
-                    return self._deliver_decline(user_text, turn)
+                    # A refusal is answered identically every time, so the
+                    # fixed close is spoken on its own — no model-worded
+                    # acknowledgment in front of it.
+                    return self._deliver_step(user_text, step, turn)
                 return self._deliver_step(user_text, step, turn,
                                           ack=out.reply)
 
@@ -983,8 +959,6 @@ class Pipeline:
         session.
         """
         step = runtime.mark_missing(self.clinical, reason)
-        if self.clinical.node == "declined":
-            return self._deliver_decline(user_text, turn)
         return self._deliver_step(user_text, step, turn)
 
     def _hold_probe(self, user_text, turn):

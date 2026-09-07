@@ -254,11 +254,6 @@ GREETING_TEXT = (
 )
 GREETING_CLIP_KEY = "greeting"
 
-# Spoken when consent is refused, then the session ends. Cached like the
-# greeting, so it plays verbatim and immediately.
-DECLINE_TEXT = "Thank you, and your provider will address these during your visit."
-DECLINE_CLIP_KEY = "decline"
-
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "17861"))
 WS_PORT = int(os.getenv("WS_PORT", "17862"))
