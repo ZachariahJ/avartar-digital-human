@@ -138,7 +138,7 @@ ASR_GPU = 0          # GPU for ASR (currently shared with MuseTalk)
 # MuseTalk render knobs. There is no quality/speed dial like FLOAT's NFE — MuseTalk
 # is a single-step inpainting UNet, so a clip costs one pass per frame regardless.
 MUSETALK_FPS = 24            # MUST match AVATAR_VIDEO's real fps, or lips drift
-MUSETALK_BATCH_SIZE = 20     # frames per UNet batch; higher = faster, more VRAM
+MUSETALK_BATCH_SIZE = 48     # frames per UNet batch; higher = faster, more VRAM
 MUSETALK_BBOX_SHIFT = 0      # v1 only; v15 ignores it (upstream forces 0)
 MUSETALK_EXTRA_MARGIN = 10   # v15: extra pixels below the face box, chin coverage
 MUSETALK_PARSING_MODE = "jaw"      # v15 blend mask mode ("jaw" or "raw")
