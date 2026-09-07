@@ -1,14 +1,31 @@
 import asyncio
+import os
 import tempfile
 import threading
 import edge_tts
 import config
 
 
-async def _synthesize(text: str, voice: str, output_path: str) -> str:
+async def _synthesize(text: str, voice: str, output_path: str,
+                      cancel_event: threading.Event | None = None) -> bool:
+    """Stream the synthesis to disk, abandoning it the moment `cancel_event` fires.
+
+    communicate.save() is deliberately NOT used. It runs the whole request to
+    completion with no way in, so a barge-in could not stop TTS — the flush would
+    cancel the LLM and MuseTalk and then sit waiting for audio nobody would hear.
+    Iterating .stream() gives a cancellation point per chunk.
+
+    Returns True if the file is complete, False if it was abandoned mid-stream
+    (the caller deletes the partial file: half an utterance is worse than none).
+    """
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
-    return output_path
+    with open(output_path, "wb") as f:
+        async for chunk in communicate.stream():
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+    return True
 
 
 def synthesize(text: str, output_path: str | None = None,
@@ -34,20 +51,30 @@ def synthesize(text: str, output_path: str | None = None,
 
     # edge-tts hits a remote Microsoft endpoint per sentence; a transient failure
     # must degrade to "skip this clip" (return None), never raise and freeze the turn.
+    def _run():
+        return asyncio.run(_synthesize(text, config.TTS_VOICE, output_path, cancel_event))
+
     try:
         if loop and loop.is_running():
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                pool.submit(asyncio.run, _synthesize(text, config.TTS_VOICE, output_path)).result()
+                done = pool.submit(_run).result()
         else:
-            asyncio.run(_synthesize(text, config.TTS_VOICE, output_path))
+            done = _run()
     except Exception:
+        done = False
+    if not done:
+        # Cancelled or failed: drop the partial mp3 so nothing downstream can
+        # pick it up and render half a sentence.
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
         return None
     return output_path
 
 
 if __name__ == "__main__":
-    import os
     os.makedirs(config.TEMP_DIR, exist_ok=True)
     path = synthesize("Hello, I am your AI assistant, nice to meet you!")
     print(f"TTS output saved to: {path}")

@@ -32,9 +32,14 @@ body.with-card .card-panel { display: block; }
 /* Avatar panel — top, centered */
 .avatar-panel { display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; flex: 0 0 auto; padding: 16px 0 10px; }
 .video-container { position: relative; width: 280px; height: 280px; }
-.video-container video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 12px; transition: opacity 0.1s linear; background: #111; }
-.video-container video.hidden-video { opacity: 0; z-index: 0; }
-.video-container video.active-video { opacity: 1; z-index: 1; }
+.video-container video, .video-container canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 12px; background: #111; }
+/* The idle loop sits UNDER the canvas and never stops running, so "returning to
+   idle" is a fade of the canvas rather than a swap of a source. That is what
+   makes a barge-in land on a moving, listening face instead of freezing on
+   whatever half-open mouth the last decoded frame happened to be. */
+#idleVideo { z-index: 0; opacity: 1; }
+#stage { z-index: 1; opacity: 0; transition: opacity 0.14s ease-out; }
+#stage.speaking { opacity: 1; }
 /* Voice-only mode: the <video> elements still drive playback (an audio-only
    source fires canplay/ended exactly like an mp4), they just have nothing to
    show, so the still portrait sits on top of them. */
@@ -84,8 +89,9 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
 <div class="main">
   <div class="avatar-panel">
     <div class="video-container">
-      <video id="videoA" class="active-video" muted playsinline></video>
-      <video id="videoB" class="hidden-video" muted playsinline></video>
+      <video id="idleVideo" muted playsinline loop></video>
+      <canvas id="stage" width="512" height="512"></canvas>
+      <audio id="speech" preload="auto"></audio>
       <img id="portrait" alt="">
     </div>
     <div class="subtitle-bar" id="subtitle"></div>
@@ -118,8 +124,10 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
 <script>
 (function() {
   // ============ Elements ============
-  const videoA = document.getElementById('videoA');
-  const videoB = document.getElementById('videoB');
+  const idleVideo = document.getElementById('idleVideo');
+  const stage = document.getElementById('stage');
+  const speech = document.getElementById('speech');
+  const stageCtx = stage.getContext('2d');
   const subtitle = document.getElementById('subtitle');
   const chatMessages = document.getElementById('chatMessages');
   const btnStart = document.getElementById('btnStart');
@@ -134,7 +142,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   // usable if it is ever served without the substitution.
   const APP_CONFIG = window.APP_CONFIG || {};
   const VIDEO_AVATAR = APP_CONFIG.videoAvatar !== false;
-  const IDLE_VIDEO_URL = APP_CONFIG.idleUrl || '/video/assets/idle_loop.mp4';
+  const IDLE_VIDEO_URL = APP_CONFIG.idleUrl || '/video/assets/loop.mp4';
   if (!VIDEO_AVATAR) {
     document.body.classList.add('audio-only');
     if (APP_CONFIG.portraitUrl) portrait.src = APP_CONFIG.portraitUrl;
@@ -164,164 +172,163 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   }
   const SID_Q = '?sid=' + encodeURIComponent(SESSION_ID);
 
-  // ============ Double-buffered Video ============
-  // Two stacked <video> elements. We NEVER change the src of the visible one
-  // (that would blank it to black). New clips are always loaded into the hidden
-  // buffer and shown by swapping opacity once their first frame is decoded.
-  let activeVideo = videoA;     // currently visible element
-  let preloadVideo = videoB;    // hidden buffer being loaded
-  const videoQueue = [];        // items not yet loaded into the buffer
-  let current = null;           // item shown on activeVideo (segment, or idle)
-  let preloadItem = null;       // item loaded/loading into preloadVideo
-  let preloadReady = false;     // preloadVideo has a decodable first frame
-  let responseEnded = false;    // server sent video_end → ok to dissolve to idle when drained
-  let waitingForNext = false;   // a segment ended; holding its last frame until next is ready
+  // ============ Streaming canvas player ============
+  // An utterance ("segment") arrives as ONE audio file plus a live stream of
+  // JPEG frames. The <audio> element is THE clock: every animation frame we draw
+  // frame floor(currentTime * fps). Nothing is muxed, no container is ever
+  // restarted mid-utterance, and the audio never pauses for the video to catch
+  // up — so the sub-second chunks MuseTalk emits produce no seams and no clicks.
+  //
+  // The idle loop is a plain looping <video> UNDERNEATH the canvas, always
+  // running. Showing speech fades the canvas in; a barge-in fades it out onto a
+  // face that is already moving.
+  const SEG_FPS_FALLBACK = 24;
+  const segQueue = [];       // announced, still filling / waiting their turn
+  let playing = null;        // the segment currently on the canvas
+  let drawn = null;          // last bitmap painted (so we redraw only on change)
+  let responseEnded = false; // server sent video_end → idle once the queue drains
 
-  const IDLE_ITEM = { url: IDLE_VIDEO_URL, text: '', idle: true };
+  function makeSeg(msg) {
+    return {
+      id: msg.id,
+      audioUrl: msg.audio_url,
+      fps: msg.fps || SEG_FPS_FALLBACK,
+      prebuffer: msg.prebuffer || 1,
+      text: msg.subtitle || '',
+      frames: [],            // sparse: createImageBitmap resolves out of order
+      have: 0,
+      done: false,           // server sent segment_end
+      dropped: false,        // flushed; ignore anything still in flight
+    };
+  }
 
-  function swapToPreload() {
-    // preloadVideo already holds a decoded frame for preloadItem.
-    activeVideo.classList.replace('active-video', 'hidden-video');
-    preloadVideo.classList.replace('hidden-video', 'active-video');
-    const old = activeVideo;
-    activeVideo = preloadVideo;
-    preloadVideo = old;
+  function segById(id) {
+    if (playing && playing.id === id) return playing;
+    for (const s of segQueue) if (s.id === id) return s;
+    return null;
+  }
 
-    current = preloadItem;
-    preloadItem = null;
-    preloadReady = false;
-    waitingForNext = false;
-
-    activeVideo.loop = !!current.idle;
-    activeVideo.muted = !userGestured;
-    // Always start from the beginning: without autoplay the buffer won't have
-    // advanced, but reset defensively so a swapped-in clip never starts mid-way.
-    // try { activeVideo.currentTime = 0; } catch (e) {}
-    activeVideo.play().catch(() => {});
-    subtitle.textContent = current.text || '';
-    if (current.idle) {
-      // Back to idle: playback has truly drained, so it's the user's turn now.
-      statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
-    }
-
-    // Free the now-hidden buffer and start loading whatever comes next.
-    old.pause();
-    loadNextIntoPreload();
+  function dropSeg(seg) {
+    seg.dropped = true;
+    for (const b of seg.frames) { if (b) { try { b.close(); } catch (e) {} } }
+    seg.frames.length = 0;
   }
 
   function isPlayingSpeech() {
-    return (current && !current.idle) || videoQueue.length > 0 ||
-           (preloadItem && !preloadItem.idle) || waitingForNext;
+    return !!playing || segQueue.length > 0;
   }
 
-  function loadNextIntoPreload() {
-    if (preloadItem) return;                 // buffer already busy
-    let next = null;
-    if (videoQueue.length > 0) {
-      next = videoQueue.shift();
-    } else if (responseEnded && !(current && current.idle)) {
-      next = IDLE_ITEM;                       // response done → prepare clean dissolve to idle
-    } else {
-      return;                                 // nothing to preload yet
-    }
-    preloadItem = next;
-    preloadReady = false;
-    preloadVideo.muted = true;                // keep buffer silent until shown
-    preloadVideo.src = next.url;
-    preloadVideo.load();
+  // ---- frame intake (binary WS messages) ----
+  function handleFrame(buf) {
+    const dv = new DataView(buf);
+    const seg = segById(dv.getUint32(0));
+    // A frame for an utterance we already abandoned. This is the client half of
+    // the cascade flush: the server stops sending, but whatever was already on
+    // the wire still arrives, and it must not be painted over the idle loop.
+    if (!seg || seg.dropped) return;
+    const idx = dv.getUint32(4);
+    createImageBitmap(new Blob([new Uint8Array(buf, 8)], { type: 'image/jpeg' }))
+      .then((bmp) => {
+        if (seg.dropped) { try { bmp.close(); } catch (e) {} return; }
+        if (!seg.frames[idx]) seg.have++;
+        seg.frames[idx] = bmp;
+        maybeStart();
+      })
+      .catch(() => {});
   }
 
-  function onPreloadReady(e) {
-    if (e.target !== preloadVideo || !preloadItem) return;
-    preloadReady = true;
-    // Swap right away if we're idle (new speech arrived) or holding a finished
-    // segment's last frame. Otherwise the swap happens when the current clip ends.
-    if (waitingForNext || (current && current.idle)) {
-      swapToPreload();
-    }
+  // ---- playback ----
+  function maybeStart() {
+    // Start only the head of the queue, and only once enough frames are buffered
+    // that the render is comfortably ahead of the clock. Starting the audio early
+    // cannot be undone: it would run past the frames and desync the lips.
+    if (playing || !segQueue.length) return;
+    const seg = segQueue[0];
+    if (!seg.done && seg.have < seg.prebuffer) return;
+    segQueue.shift();
+    playing = seg;
+    drawn = null;
+    subtitle.textContent = seg.text;
+    if (VIDEO_AVATAR) stage.classList.add('speaking');
+    speech.muted = !userGestured;
+    speech.src = seg.audioUrl;
+    speech.currentTime = 0;
+    speech.play().catch(() => {});
   }
-  videoA.addEventListener('canplay', onPreloadReady);
-  videoB.addEventListener('canplay', onPreloadReady);
 
-  function onEnded(e) {
-    if (e.target !== activeVideo) return;
-    if (current && current.idle) {
-      activeVideo.play().catch(() => {});    // idle should loop; restart defensively
-      return;
-    }
-    // A segment finished.
-    if (preloadReady && preloadItem) {
-      swapToPreload();                        // next clip ready → seamless swap
-    } else {
-      waitingForNext = true;                  // hold last frame (no black flash, no idle bounce)
-      loadNextIntoPreload();                  // ensure something is loading
-    }
+  function finishSegment() {
+    if (playing) { dropSeg(playing); playing = null; }
+    drawn = null;
+    if (segQueue.length) { maybeStart(); return; }
+    if (responseEnded) toIdle();
+    // Otherwise hold the last frame: more of this response is still rendering.
   }
-  videoA.addEventListener('ended', onEnded);
-  videoB.addEventListener('ended', onEnded);
 
-  function onVideoError(e) {
-    // A clip failed to load/decode (404, janitor-deleted, network). Never freeze:
-    // skip a failed buffer clip, or treat a failed active clip like a normal end.
-    if (e.target === preloadVideo && preloadItem && !preloadItem.idle) {
-      preloadItem = null;
-      preloadReady = false;
-      loadNextIntoPreload();
-    } else if (e.target === activeVideo && current && !current.idle) {
-      onEnded({ target: activeVideo });
+  speech.addEventListener('ended', finishSegment);
+  // A missing/expired audio file must never freeze the avatar mid-response.
+  speech.addEventListener('error', () => { if (playing) finishSegment(); });
+
+  function drawTick() {
+    requestAnimationFrame(drawTick);
+    if (!playing || !playing.frames.length) return;
+    const i = Math.floor(speech.currentTime * playing.fps);
+    // Hold the previous frame when the renderer is momentarily behind, rather
+    // than blanking: audio keeps running and the next frame catches up.
+    const bmp = playing.frames[i];
+    if (!bmp || bmp === drawn) return;
+    if (stage.width !== bmp.width || stage.height !== bmp.height) {
+      stage.width = bmp.width;
+      stage.height = bmp.height;
     }
+    stageCtx.drawImage(bmp, 0, 0);
+    drawn = bmp;
   }
-  videoA.addEventListener('error', onVideoError);
-  videoB.addEventListener('error', onVideoError);
+  requestAnimationFrame(drawTick);
 
-  function enqueueVideo(url, text) {
+  function toIdle() {
+    stage.classList.remove('speaking');
+    subtitle.textContent = '';
     responseEnded = false;
-    videoQueue.push({ url, text });
-    // If we were about to dissolve back to idle, cancel that — real speech wins.
-    if (preloadItem && preloadItem.idle) {
-      preloadItem = null;
-      preloadReady = false;
-    }
-    loadNextIntoPreload();
+    idleVideo.play().catch(() => {});
+    statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
   }
 
   function startIdle() {
-    // Initial idle on page load (no swap needed since nothing is playing yet).
-    current = IDLE_ITEM;
-    preloadItem = null;
-    preloadReady = false;
-    waitingForNext = false;
-    activeVideo.loop = true;
-    activeVideo.muted = !userGestured;
-    if (!activeVideo.src.endsWith('idle_loop.mp4')) {
-      activeVideo.src = IDLE_VIDEO_URL;
-    }
-    activeVideo.play().catch(() => {});
+    idleVideo.muted = true;         // the idle loop is silent by design
+    if (!idleVideo.src.endsWith(IDLE_VIDEO_URL)) idleVideo.src = IDLE_VIDEO_URL;
+    idleVideo.play().catch(() => {});
     subtitle.textContent = '';
   }
 
+  function announceSegment(msg) {
+    responseEnded = false;
+    segQueue.push(makeSeg(msg));
+    maybeStart();
+  }
+
+  function endSegment(id) {
+    const seg = segById(id);
+    if (seg) seg.done = true;
+    maybeStart();               // a short utterance may not have hit prebuffer
+  }
+
+  // ---- the client half of the cascade flush ----
   function interruptPlayback() {
-    // Barge-in / stop / reset: drop everything queued/buffered so the previous
-    // answer can't play into the next turn, then dissolve to idle THROUGH the hidden
-    // buffer. We never change the visible element's src (that caused a black flash);
-    // the current last frame is held until the idle clip is decoded, then swapped.
-    videoQueue.length = 0;
-    preloadItem = null;
-    preloadReady = false;
-    try { activeVideo.pause(); } catch (e) {}
-    try { preloadVideo.pause(); } catch (e) {}
-    if (current && current.idle) {
-      waitingForNext = false;
-      responseEnded = false;
-      // Nothing to dissolve to — but the pause() above stopped the idle loop, and
-      // no other path restarts it (onEnded never fires on a paused element), so the
-      // avatar would freeze on that frame until the next clip arrived. Resume it.
-      activeVideo.play().catch(() => {});
-      return;
-    }
-    waitingForNext = true;    // hold the current last frame until idle is ready
-    responseEnded = true;     // lets loadNextIntoPreload prepare the idle clip
-    loadNextIntoPreload();    // preload idle → onPreloadReady swaps (dissolve, no flash)
+    // Barge-in / stop / reset. Drop every buffered frame and every queued
+    // utterance (the jitter buffer, in effect), cut the audio, and fade back to
+    // the idle loop — which has been running underneath the whole time, so this
+    // is a dissolve onto a moving face, never a hard cut and never a freeze on
+    // an open-mouth frame.
+    for (const s of segQueue) dropSeg(s);
+    segQueue.length = 0;
+    if (playing) { dropSeg(playing); playing = null; }
+    drawn = null;
+    try {
+      speech.pause();
+      speech.removeAttribute('src');
+      speech.load();            // release the buffered audio, don't just stop it
+    } catch (e) {}
+    toIdle();
   }
 
   // Start with idle
@@ -333,14 +340,16 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   function connectStateWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     stateWs = new WebSocket(proto + '//' + location.host + '/ws/state' + SID_Q);
+    // The same socket carries JSON control messages and binary video frames.
+    stateWs.binaryType = 'arraybuffer';
     stateWs.onopen = () => console.log('[State] WS connected');
     stateWs.onclose = () => {
       console.log('[State] WS disconnected, reconnecting...');
       setTimeout(connectStateWS, 2000);
     };
     stateWs.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      handleStateMessage(msg);
+      if (typeof e.data === 'string') handleStateMessage(JSON.parse(e.data));
+      else handleFrame(e.data);
     };
   }
 
@@ -349,15 +358,22 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   function handleStateMessage(msg) {
     if (msg.type === 'chat') {
       applyChatDelta(msg);
-    } else if (msg.type === 'video') {
-      enqueueVideo(msg.video_url, msg.subtitle || '');
+    } else if (msg.type === 'segment') {
+      announceSegment(msg);
       statusBar.textContent = 'Speaking: ' + (msg.subtitle || '').slice(0, 60);
+    } else if (msg.type === 'segment_end') {
+      endSegment(msg.id);
+    } else if (msg.type === 'flush') {
+      // Instant barge-in. This arrives straight off the audio socket's detection
+      // path, not on the poll tick, so it lands ahead of the 'state' message
+      // below — drop everything now rather than a poll interval later.
+      interruptPlayback();
+      statusBar.textContent = 'Listening...';
     } else if (msg.type === 'video_end') {
-      // Response done. Once the remaining clips drain, dissolve cleanly back to
-      // idle (the idle clip is preloaded into the hidden buffer, never src-swapped
-      // onto the visible one). Kick off that preload now if we're already idling.
+      // Response complete. Whatever is still buffered plays out, then the player
+      // dissolves to idle on its own (finishSegment → toIdle).
       responseEnded = true;
-      loadNextIntoPreload();
+      if (!isPlayingSpeech()) toIdle();
     } else if (msg.type === 'state') {
       const s = msg.state || 'idle';
       if (s === 'listening') {
@@ -559,7 +575,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
           statusBar.textContent = 'Listening…';
           textInput.disabled = false;
           // Unmute video after user interaction
-          activeVideo.muted = false;
+          speech.muted = false;
           // Counselor leads: greet now that the mic is confirmed live. (Kept
           // separate from the toggle so a denied mic or a Clear never greets.)
           fetch('/api/greet' + SID_Q, { method: 'POST' });

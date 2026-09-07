@@ -7,6 +7,7 @@ import json
 import asyncio
 import logging
 import threading
+import queue
 from contextlib import asynccontextmanager
 import numpy as np
 
@@ -50,6 +51,13 @@ class Session:
         self.state_clients: set[WebSocket] = set()
         # state_poller bookkeeping (per session)
         self.last_state = None
+        # Frame-streaming cursor. The poller forwards ONE segment at a time and
+        # only moves on once that segment's terminating sentinel arrives, which
+        # is what keeps utterances in order on the wire even though several may
+        # be rendering at once on different GPUs.
+        self.active_seg = None
+        self.seg_id = 0
+        self.seg_frames = 0     # frames forwarded for active_seg (the wire index)
         # (role, content) snapshot of the chat last pushed to this session's
         # clients, so the poller sends only the CHANGED suffix each tick instead of
         # re-serializing the whole history.
@@ -135,7 +143,7 @@ async def serve_video(request: Request):
     roots = {
         "tmp": os.path.join(BASE_DIR, "tmp"),
         "clips": config.CLIPS_DIR,          # assets/clips
-        "assets": config.ASSETS_DIR,        # assets/ root (idle_loop.mp4)
+        "assets": config.ASSETS_DIR,        # assets/ root (loop.mp4)
     }
     root = roots.get(subdir)
     if root is None:
@@ -146,7 +154,7 @@ async def serve_video(request: Request):
         return JSONResponse({"error": "not found"}, status_code=404)
 
     # no-cache is REQUIRED, not an optimisation opt-out. Every one of these URLs
-    # is stable (/video/assets/idle_loop.mp4, /video/clips/greeting.mp4, ...) while
+    # is stable (/video/assets/loop.mp4, /video/clips/greeting.mp4, ...) while
     # its BYTES are mutable — re-rendering after a GREETING_TEXT edit or an
     # AVATAR_IMAGE swap rewrites the file behind an unchanged URL. Starlette's
     # FileResponse sets etag/last-modified but no Cache-Control, so the browser
@@ -276,6 +284,25 @@ def _looks_like_echo(text: str, pipeline) -> bool:
     return u in norm(resp)
 
 
+async def _barge_in(session: Session, reason: str):
+    """Interrupt the current response everywhere, in one step.
+
+    Server side, pipeline.on_speech_start() runs the cascade flush: it sets
+    cancel_event (which closes the LLM stream and makes TTS drop its partial
+    mp3), cancels every live Segment (which stops the MuseTalk render on its
+    next batch and empties the frame queues), and clears the delivery queue.
+
+    Client side, the flush message is sent from HERE rather than left to the
+    next poll tick — the poller runs on STATE_POLL_INTERVAL, and 100ms of the
+    avatar still talking is exactly what the instant barge-in is meant to
+    remove. The client drops its buffered frames and its audio on receipt.
+    """
+    logger.info("[barge-in] %s -> cascade flush", reason)
+    session.pipeline.on_speech_start()
+    session.active_seg = None
+    await broadcast(session.state_clients, {"type": "flush", "id": session.seg_id})
+
+
 async def ws_audio(websocket: WebSocket):
     await websocket.accept()
     if config.SHUTTING_DOWN.is_set():
@@ -325,10 +352,34 @@ async def ws_audio(websocket: WebSocket):
                 None, session.vad.process_chunk, audio_chunk
             )
 
+            speaking = session.pipeline.state in ("processing", "speaking")
+
+            # Instant (full-duplex) barge-in: SUSTAINED voice from the VAD cuts the
+            # response immediately, with no transcription in the loop. This is the
+            # fast path and it fires first; the ASR-confirmed check below only ever
+            # runs when this is disabled or has not reached its threshold yet.
+            #
+            # The tradeoff is deliberate and it is not free: the ASR path rejected
+            # the avatar's OWN leaked voice by checking the transcript against what
+            # the avatar is saying, and no such check is possible here. This relies
+            # entirely on the browser's echo canceller (getUserMedia is opened with
+            # echoCancellation:{exact:true}, so it is guaranteed present, not hoped
+            # for). If a deployment still hears the avatar interrupt itself, that is
+            # AEC failing — set BARGE_IN_VAD=0 to fall back to ASR confirmation.
+            if config.BARGE_IN_VAD and speaking and not session.barge_done:
+                pending = session.vad.pending_audio()
+                if pending is not None and \
+                        len(pending) >= int(config.BARGE_IN_VAD_SUSTAIN * 16000):
+                    session.barge_done = True
+                    session.speech_started_notified = True
+                    await _barge_in(session, "%.0fms sustained voice"
+                                    % (config.BARGE_IN_VAD_SUSTAIN * 1000))
+                    continue
+
             # ASR-confirmed (semantic) barge-in: while the avatar is speaking, the VAD
             # onset is unreliable, so transcribe the user's speech-so-far and interrupt
             # the MOMENT it becomes real words (rejecting the avatar's own echo).
-            if config.BARGE_IN_ASR and session.pipeline.state in ("processing", "speaking"):
+            if config.BARGE_IN_ASR and speaking:
                 pending = session.vad.pending_audio()
                 if pending is None:
                     session.barge_done = False
@@ -344,18 +395,17 @@ async def ws_audio(websocket: WebSocket):
                         text = await asyncio.get_running_loop().run_in_executor(
                             None, asr.transcribe_array, pending)
                         if text.strip() and not _looks_like_echo(text, session.pipeline):
-                            logger.info("[barge-in] user speech detected: %s -> interrupting",
-                                        privacy.phi(text))
                             session.barge_done = True
                             session.speech_started_notified = True
-                            session.pipeline.on_speech_start()
+                            await _barge_in(session, "ASR confirmed: %s"
+                                            % privacy.phi(text))
             else:
                 session.barge_done = False
                 session.barge_last_n = 0
 
             if event == "speech_start" and not session.speech_started_notified:
                 session.speech_started_notified = True
-                session.pipeline.on_speech_start()
+                await _barge_in(session, "VAD speech_start")
 
             elif event == "speech_end":
                 session.speech_started_notified = False
@@ -431,6 +481,101 @@ async def broadcast(clients: set, msg: dict):
     clients.difference_update(disconnected)
 
 
+async def broadcast_bytes(clients: set, payload: bytes):
+    """Send one binary frame to the given set of state clients."""
+    if not clients:
+        return
+    disconnected = set()
+    for ws in list(clients):
+        try:
+            await ws.send_bytes(payload)
+        except Exception:
+            disconnected.add(ws)
+    clients.difference_update(disconnected)
+
+
+def _media_url(path: str) -> str:
+    """Map a segment's audio file to the URL serve_video() will answer on."""
+    if path.startswith(os.path.join(BASE_DIR, "tmp")):
+        return "/video/tmp/" + os.path.basename(path)
+    return "/video/clips/" + os.path.basename(path)
+
+
+# Frames per session per poll tick. STATE_POLL_INTERVAL is 0.1s and playback
+# needs MUSETALK_FPS frames a second, so this is ~4x realtime: the pump is never
+# the bottleneck (the renderer is), while still bounding how long one session
+# can hold the event loop when many sessions stream at once.
+_MAX_FRAMES_PER_TICK = 24
+
+
+async def _pump_segments(session: Session):
+    """Forward ready audio+frames for one session, in strict utterance order.
+
+    The wire protocol is two channels on the ONE state socket:
+      - text  : {"type":"segment"} announces an utterance (audio URL + fps),
+                {"type":"segment_end"} closes it, {"type":"flush"} abandons it.
+      - binary: [uint32 segment id][uint32 frame index][JPEG bytes]
+
+    The segment id is on every frame so a client that is mid-flush can drop
+    late frames belonging to the utterance it just abandoned, instead of
+    painting them over the idle loop.
+    """
+    pipeline = session.pipeline
+    clients = session.state_clients
+
+    while True:
+        seg = session.active_seg
+        if seg is None:
+            item = pipeline.get_next_video()
+            if item is None:
+                return                       # nothing ready this tick
+            if item is False:
+                await broadcast(clients, {"type": "video_end", "state": pipeline.state})
+                return
+            seg = session.active_seg = item
+            session.seg_id += 1
+            session.seg_frames = 0
+            if seg._t_enqueue:
+                logger.info("[latency] segment %d announced after %.2fs in queue",
+                            session.seg_id, time.perf_counter() - seg._t_enqueue)
+            await broadcast(clients, {
+                "type": "segment",
+                "id": session.seg_id,
+                "audio_url": _media_url(seg.audio_path),
+                "fps": seg.fps,
+                "prebuffer": config.STREAM_PREBUFFER_FRAMES,
+                "subtitle": seg.sentence,
+                "state": "speaking",
+            })
+
+        for _ in range(_MAX_FRAMES_PER_TICK):
+            if seg.cancelled.is_set():
+                # Barge-in reached this segment. Say so explicitly rather than
+                # letting it end normally: the client must drop what it has
+                # buffered, not play it out.
+                await broadcast(clients, {"type": "flush", "id": session.seg_id})
+                session.active_seg = None
+                return
+            try:
+                frame = seg.frames.get_nowait()
+            except queue.Empty:
+                return                       # renderer still working; resume next tick
+            if frame is None:
+                await broadcast(clients, {"type": "segment_end", "id": session.seg_id,
+                                          "frames": session.seg_frames})
+                session.active_seg = None
+                break                        # fall through to the next segment
+            await broadcast_bytes(
+                clients,
+                session.seg_id.to_bytes(4, "big")
+                + session.seg_frames.to_bytes(4, "big")
+                + frame,
+            )
+            session.seg_frames += 1
+        else:
+            return                           # hit the per-tick cap
+
+
 # --------------- Background poller ---------------
 
 async def _poll_session(session: Session):
@@ -438,37 +583,7 @@ async def _poll_session(session: Session):
     pipeline = session.pipeline
     clients = session.state_clients
 
-    # Drain ALL segments ready this tick (not just one) so finished clips reach
-    # the browser promptly instead of one-per-poll-interval.
-    while True:
-        item = pipeline.get_next_video()
-        if item is None:
-            break  # queue empty for now
-        if item is False:
-            await broadcast(clients, {
-                "type": "video_end",
-                "state": pipeline.state,
-            })
-            break
-        # New video segment
-        video_path = item["video"]
-        if video_path.startswith(os.path.join(BASE_DIR, "tmp")):
-            video_url = "/video/tmp/"  + os.path.basename(video_path)
-        else:
-            video_url = "/video/clips/" + os.path.basename(video_path)
-
-        # Latency: how long the finished clip sat in the queue before delivery.
-        t_enq = item.get("_t_enqueue")
-        if t_enq is not None:
-            logger.info("[latency] deliver %s after %.2fs in queue",
-                        os.path.basename(video_path), time.perf_counter() - t_enq)
-
-        await broadcast(clients, {
-            "type": "video",
-            "video_url": video_url,
-            "subtitle": item["sentence"],
-            "state": "speaking",
-        })
+    await _pump_segments(session)
 
     # Broadcast state changes (chat is pushed separately as a delta below).
     current_state = pipeline.state
@@ -614,56 +729,32 @@ def _reap_idle_sessions():
 def _ensure_idle_media():
     """Make sure the ambient clip the frontend loops between answers exists.
 
-    Video mode: a seamless short section of the driving clip with natural head
-    and eye motion but a stabilized smiling mouth, regenerated if it is missing
-    OR was made from a different driving video. Same stamp discipline as the
-    fixed clips (see pipeline.clip_stamp): the loop is a function of
-    config.AVATAR_VIDEO, so an existence check alone would leave the ambient video
-    showing the OLD face after a driving-video swap.
+    Video mode: nothing to do — the idle loop IS config.AVATAR_VIDEO, which must
+    exist for the renderer to work at all.
 
     Voice-only mode: a couple of seconds of silence, encoded once by ffmpeg. The
     frontend's playback state machine pivots on having an idle item to loop, so
     giving it silence keeps the swap/drain/barge-in logic identical across modes
     instead of forking it.
     """
-    if not config.ENABLE_VIDEO_AVATAR:
-        if os.path.exists(config.IDLE_AUDIO_PATH):
-            return
-        logger.info("Generating idle silence clip...")
-        os.makedirs(os.path.dirname(config.IDLE_AUDIO_PATH), exist_ok=True)
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-f", "lavfi",
-                 "-i", "anullsrc=r=24000:cl=mono",
-                 "-t", str(config.IDLE_AUDIO_DURATION),
-                 "-c:a", "libmp3lame", "-b:a", "48k",
-                 config.IDLE_AUDIO_PATH],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            logger.info("Idle silence saved to %s", config.IDLE_AUDIO_PATH)
-        except (OSError, subprocess.CalledProcessError) as e:
-            logger.warning("Could not generate idle silence: %s", e)
+    if config.ENABLE_VIDEO_AVATAR:
         return
-
-    idle_sidecar = config.IDLE_VIDEO_PATH + ".txt"
-    idle_stamp = (f"motion-smile-v1:{config.IDLE_VIDEO_DURATION}:"
-                  f"{config.IDLE_SMILE_FRAME_SEC}:"
-                  f"{config.avatar_fingerprint()}")
+    if os.path.exists(config.IDLE_AUDIO_PATH):
+        return
+    logger.info("Generating idle silence clip...")
+    os.makedirs(os.path.dirname(config.IDLE_AUDIO_PATH), exist_ok=True)
     try:
-        with open(idle_sidecar, encoding="utf-8") as f:
-            idle_cached = f.read()
-    except OSError:
-        idle_cached = None
-    if not os.path.exists(config.IDLE_VIDEO_PATH) or idle_cached != idle_stamp:
-        logger.info("Generating idle loop video (missing or driving video changed)...")
-        from modules import avatar
-        try:
-            avatar.generate_idle_video(duration=config.IDLE_VIDEO_DURATION)
-            with open(idle_sidecar, "w", encoding="utf-8") as f:
-                f.write(idle_stamp)
-            logger.info(f"Idle video saved to {config.IDLE_VIDEO_PATH}")
-        except Exception as e:
-            logger.warning(f"Could not generate idle video: {e}")
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi",
+             "-i", "anullsrc=r=24000:cl=mono",
+             "-t", str(config.IDLE_AUDIO_DURATION),
+             "-c:a", "libmp3lame", "-b:a", "48k",
+             config.IDLE_AUDIO_PATH],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        logger.info("Idle silence saved to %s", config.IDLE_AUDIO_PATH)
+    except (OSError, subprocess.CalledProcessError) as e:
+        logger.warning("Could not generate idle silence: %s", e)
 
 
 def _temp_janitor():

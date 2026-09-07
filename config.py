@@ -137,8 +137,28 @@ ASR_GPU = 0          # GPU for ASR (currently shared with MuseTalk)
 
 # MuseTalk render knobs. There is no quality/speed dial like FLOAT's NFE — MuseTalk
 # is a single-step inpainting UNet, so a clip costs one pass per frame regardless.
-MUSETALK_FPS = 24            # MUST match AVATAR_VIDEO's real fps, or lips drift
-MUSETALK_BATCH_SIZE = 48     # frames per UNet batch; higher = faster, more VRAM
+# Playback frame rate, and the rate whisper features are sampled at. It does NOT
+# have to match AVATAR_VIDEO's own frame rate, and here it deliberately does not
+# (the clip is 24 fps): lip sync is preserved either way, because output frame i
+# is driven by the audio at i/MUSETALK_FPS and the browser draws frame
+# floor(currentTime * MUSETALK_FPS) — both sides use THIS number, not the clip's.
+#
+# What the mismatch does change is head motion. One driving frame is consumed
+# per output frame, so at 15 fps the clip's own motion plays back at 15/24 =
+# 0.63x. The idle loop is the same file played by a <video> element at its
+# native 24 fps, so the head visibly slows down when the avatar starts speaking.
+# Re-encoding assets/loop.mp4 to 15 fps removes that seam (and re-keys
+# avatar_fingerprint(), forcing a one-off material rebuild).
+#
+# 15 rather than 24 because the renderer is the bottleneck: measured throughput
+# on a V100 at MUSETALK_BATCH_SIZE=4 is ~17.5 frames/s, which is 0.73x a 24 fps
+# clock (the video falls behind the audio for as long as the utterance runs) but
+# ~1.17x a 15 fps one. Streaming playback only works while this is above 1.0x.
+MUSETALK_FPS = 15
+MUSETALK_BATCH_SIZE = 6      # frames per UNet batch AND the streaming flush unit.
+# Every batch is blended, JPEG-encoded and pushed to the browser the moment the
+# VAE decoder returns it, so this is the first-frame latency dial: 4 frames at
+# MUSETALK_FPS=24 is one sixth of a second of video per flush.
 MUSETALK_BBOX_SHIFT = 0      # v1 only; v15 ignores it (upstream forces 0)
 MUSETALK_EXTRA_MARGIN = 10   # v15: extra pixels below the face box, chin coverage
 MUSETALK_PARSING_MODE = "jaw"      # v15 blend mask mode ("jaw" or "raw")
@@ -146,6 +166,17 @@ MUSETALK_LEFT_CHEEK_WIDTH = 90     # face-parsing cheek protection, in px
 MUSETALK_RIGHT_CHEEK_WIDTH = 90
 MUSETALK_AUDIO_PAD_LEFT = 2        # whisper context frames before each video frame
 MUSETALK_AUDIO_PAD_RIGHT = 2       # ... and after
+
+# Frame streaming (the browser composites JPEG frames on a canvas against one
+# continuous <audio> element, instead of fetching a muxed mp4 per sentence).
+MUSETALK_JPEG_QUALITY = 82   # per-frame JPEG quality pushed over the WebSocket
+# Frames the client buffers before it starts the audio clock. The audio, once
+# started, cannot be paused without an audible gap, so playback must not begin
+# until the renderer is far enough ahead to stay ahead — and at MUSETALK_FPS=15
+# it does stay ahead (see the throughput note above), so a fixed lead is enough:
+# the gap grows in the renderer's favour, not the clock's.
+# 12 frames is 0.8s at 15 fps.
+STREAM_PREBUFFER_FRAMES = 12
 
 # VAD
 VAD_THRESHOLD = 0.5
@@ -168,6 +199,21 @@ MIC_WARMUP_DISCARD = float(os.getenv("MIC_WARMUP_DISCARD", "0.5"))
 BARGE_IN_ASR = os.getenv("BARGE_IN_ASR", "1").lower() not in ("0", "false", "no")
 BARGE_IN_MIN_SPEECH = 0.30   # seconds of user speech before the first ASR check
 BARGE_IN_RECHECK = 0.20      # re-run ASR every this many more seconds of speech until it fires
+
+# Instant (full-duplex) barge-in. The ASR-confirmed path above is accurate but
+# costs BARGE_IN_MIN_SPEECH + a transcription before it fires, which is audible
+# as the avatar talking over the user. This fires the cascade flush on SUSTAINED
+# VAD voice alone, with no transcription in the loop.
+#
+# It is safe here only because getUserMedia is opened with
+# echoCancellation:{exact:true} (static/index.html) — without AEC the avatar's
+# own leaked voice is "sustained voice" and it would interrupt itself in a loop.
+# Set BARGE_IN_VAD=0 to fall back to ASR-confirmed interruption only.
+BARGE_IN_VAD = os.getenv("BARGE_IN_VAD", "1").lower() not in ("0", "false", "no")
+# Seconds of CONTINUOUS detected voice before the flush fires. Below ~0.12s the
+# trigger starts catching lip smacks and chair creaks that survive AEC; above
+# ~0.25s the user hears themselves talking over the avatar.
+BARGE_IN_VAD_SUSTAIN = 0.18
 
 # --- Performance / latency tuning ---
 # How often the server polls the pipeline for finished video segments and pushes
@@ -221,13 +267,10 @@ EOU_ONNX_THREADS = 2         # CPU threads for the ONNX session
 # Reap a per-user session this long after its last client disconnects (idle only).
 SESSION_IDLE_TTL_SEC = 600
 
-# Idle video (ambient loop; lives at the assets root, not a spoken clip)
-IDLE_VIDEO_PATH = os.path.join(ASSETS_DIR, "idle_loop.mp4")
-IDLE_VIDEO_DURATION = 4.0
-# A natural smile in the current driving clip. Idle keeps this mouth expression
-# while retaining the surrounding clip's subtle head/eye motion. Retune when
-# replacing AVATAR_VIDEO with a clip whose smile occurs at another timestamp.
-IDLE_SMILE_FRAME_SEC = 6.625
+# Idle video (ambient loop). It IS the driving clip: loop.mp4 is authored to
+# loop seamlessly, so the frontend can play it directly between answers and
+# nothing has to be generated, cached or invalidated.
+IDLE_VIDEO_PATH = AVATAR_VIDEO
 
 # Voice-only counterpart of the idle loop. The frontend's playback state machine
 # pivots on an "idle" item it can loop between answers; with no video there is

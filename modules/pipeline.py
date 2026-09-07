@@ -4,7 +4,9 @@ import os
 import threading
 import logging
 import queue
+import shutil
 import time
+import glob
 from concurrent.futures import ThreadPoolExecutor, Future
 
 import re
@@ -12,7 +14,8 @@ import numpy as np
 
 import config
 from modules import asr, llm, tts, privacy
-# modules.avatar is imported lazily inside render_clip, never at module scope:
+# modules.avatar is imported lazily inside render_into/_cache_fixed, never at
+# module scope:
 # importing it pulls in torch plus the whole sibling float/ repo (face_alignment,
 # torchvision, librosa, the MuseTalk model classes). Voice-only mode must not fail to
 # start, or pay that import, because of a repo it will never call.
@@ -28,115 +31,220 @@ logger = logging.getLogger(__name__)
 _CLIPS_DIR = config.CLIPS_DIR
 
 
-def clip_ext() -> str:
-    """File extension of a cached clip in the CURRENT mode.
+class Segment:
+    """One utterance on its way to the browser.
 
-    Voice-only clips are the raw TTS mp3, so the two modes must not share a
-    filename: a greeting.mp4 holding mp3 bytes would be served as video/mp4 and
-    fail to decode, and flipping the flag back would find a stale file of the
-    wrong type sitting on a valid-looking sidecar. Separate extensions keep both
-    caches on disk simultaneously, so toggling the flag costs nothing.
+    A segment is NOT a video file. It is a whole audio file plus a live stream
+    of JPEG frames, because that is the only shape that gets the first frame out
+    fast. MuseTalk needs the ENTIRE utterance's audio up front (whisper features
+    are trimmed and padded against the full length, so audio cannot be fed in
+    pieces), but it produces frames a batch at a time — so the audio is handed
+    over as one URL and the frames arrive progressively.
+
+    The browser plays `audio_path` on one continuous <audio> element and uses its
+    currentTime as THE clock, drawing frame floor(t * fps) on a canvas. That is
+    what removes the per-chunk seams: nothing is re-encoded, no container is
+    restarted, and the audio never stops for the video to catch up.
+
+    Ownership: `frames` is filled by the render thread and drained by the state
+    poller. The terminating None is mandatory — it is how the poller learns the
+    utterance is complete rather than merely slow.
     """
-    return ".mp4" if config.ENABLE_VIDEO_AVATAR else ".mp3"
+
+    __slots__ = ("sentence", "audio_path", "fps", "frames", "started",
+                 "cancelled", "_t_enqueue")
+
+    def __init__(self, sentence: str = ""):
+        self.sentence = sentence
+        self.audio_path = None          # set before `started` fires
+        self.fps = config.MUSETALK_FPS
+        self.frames = queue.Queue()     # jpeg bytes ..., then None
+        self.started = threading.Event()  # audio_path is valid; safe to announce
+        self.cancelled = threading.Event()
+        self._t_enqueue = 0.0
+
+    def open(self, audio_path: str):
+        self.audio_path = audio_path
+        self.started.set()
+
+    def close(self):
+        self.frames.put(None)
+
+    def cancel(self):
+        """Barge-in: stop the render and stop forwarding whatever is buffered."""
+        self.cancelled.set()
+        self.frames.put(None)
 
 
-def clip_path(base: str) -> str:
-    """Re-point a configured clip path (always written as .mp4) at the current
-    mode's file. config.GREETING_VIDEO_PATH and friends stay single-valued."""
-    return os.path.splitext(base)[0] + clip_ext()
+def clip_base(path: str) -> str:
+    """The cache key on disk for a fixed clip, as a path with NO extension.
+
+    A cached fixed clip is no longer a single file — it is `<base>.mp3` (the
+    audio) plus `<base>.frames/` (the pre-rendered JPEGs), so callers hold the
+    stem and the two artifacts hang off it. config.GREETING_VIDEO_PATH and
+    friends are still written as .mp4 names; this strips that.
+    """
+    return os.path.splitext(path)[0]
 
 
 def crisis_clip_path(category: str) -> str:
-    """Cached clip location for one crisis category's fixed response."""
-    return os.path.join(_CLIPS_DIR, f"crisis_{category}" + clip_ext())
+    """Cached clip base for one crisis category's fixed response."""
+    return os.path.join(_CLIPS_DIR, f"crisis_{category}")
 
 
 _KEY_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def protocol_clip_path(key: str) -> str:
-    """Cached clip location for a fixed protocol utterance (runtime.Say key).
+    """Cached clip base for a fixed protocol utterance (runtime.Say key).
     Content-addressed by the stable key, shared across ALL sessions."""
-    return os.path.join(_CLIPS_DIR, _KEY_SAFE.sub("_", key) + clip_ext())
+    return os.path.join(_CLIPS_DIR, _KEY_SAFE.sub("_", key))
 
 _fixed_clip_lock = threading.Lock()
 
 
 def clip_stamp(text: str) -> str:
-    """The full cache key for a rendered clip: the spoken text AND the reference
-    portrait it was rendered from. A clip is a function of both, so keying on
-    text alone was a face-swap trap — repointing config.AVATAR_IMAGE left every
+    """The full cache key for a rendered clip: the spoken text AND everything
+    about how it was rendered. A clip is a function of all of them, so keying on
+    text alone was a face-swap trap — repointing config.AVATAR_VIDEO left every
     cached clip replaying the OLD face forever, because no text had changed.
     Stored verbatim in the clip's sidecar .txt.
 
+    MUSETALK_FPS is in the key because the cached frames ARE a fixed-rate
+    sequence: the browser indexes them as floor(currentTime * fps), so replaying
+    24fps frames under a 25fps clock desynchronises the whole clip.
+
     A voice-only clip has no portrait in it, so it is deliberately NOT keyed on
-    the fingerprint — swapping the avatar image must not invalidate audio that
+    the fingerprint — swapping the avatar video must not invalidate audio that
     cannot possibly show a face."""
     if not config.ENABLE_VIDEO_AVATAR:
         return f"audio-only\n{text}"
-    return f"avatar:{config.avatar_fingerprint()}\n{text}"
+    return (f"avatar:{config.avatar_fingerprint()}\n"
+            f"fps:{config.MUSETALK_FPS}\n{text}")
 
 
-def render_clip(tts_path: str, output_path: str | None = None) -> str | None:
-    """Turn a finished TTS file into the clip the browser will play, and take
-    ownership of `tts_path` either way.
+def render_into(seg: Segment, tts_path: str, abort=None) -> int:
+    """Drive `seg` from a finished TTS file, taking ownership of `tts_path`.
 
-    Video mode: MuseTalk renders a talking head and the mp3 is consumed (deleted).
-    Voice-only mode: the mp3 IS the clip — moved to `output_path` for a cached
-    fixed clip, or handed back as-is for a per-sentence render, where the temp
-    janitor reclaims it after config.TEMP_FILE_TTL_SEC. It must NOT be deleted
-    here: unlike video mode, this file is the deliverable.
+    The mp3 is the DELIVERABLE now, not an intermediate: it is what the browser
+    plays, so unlike the old mp4 path it is never deleted here. The temp janitor
+    reclaims it after config.TEMP_FILE_TTL_SEC, by which time it has been served.
+
+    Voice-only mode emits zero frames and the segment is just the audio — the
+    page shows the still portrait, exactly as before.
     """
-    if config.ENABLE_VIDEO_AVATAR:
-        from modules import avatar
+    seg.open(tts_path)
+    if not config.ENABLE_VIDEO_AVATAR:
+        seg.close()
+        return 0
+    from modules import avatar
+    try:
+        return avatar.stream_video(
+            tts_path,
+            lambda idx, jpeg: seg.frames.put(jpeg),
+            abort=abort or seg.cancelled.is_set,
+        )
+    finally:
+        seg.close()
+
+
+def _cache_fixed(text: str, base: str) -> bool:
+    """Render one fixed utterance into the on-disk cache at `base`. True on success.
+
+    Written to scratch names and moved into place only once BOTH artifacts exist,
+    so an interrupted prewarm can never leave an audio file with a half-written
+    frame directory that a later run would happily serve.
+    """
+    frames_dir = base + ".frames"
+    build_dir = frames_dir + ".building"
+    tts_path = tts.synthesize(text, None, None)
+    if not tts_path:
+        return False
+    try:
+        os.makedirs(os.path.dirname(base), exist_ok=True)
+        if config.ENABLE_VIDEO_AVATAR:
+            shutil.rmtree(build_dir, ignore_errors=True)
+            os.makedirs(build_dir)
+            from modules import avatar
+
+            def _write(idx, jpeg):
+                with open(os.path.join(build_dir, f"{idx:08d}.jpg"), "wb") as f:
+                    f.write(jpeg)
+
+            n = avatar.stream_video(tts_path, _write,
+                                    abort=config.SHUTTING_DOWN.is_set)
+            if n == 0:
+                shutil.rmtree(build_dir, ignore_errors=True)
+                return False
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            os.replace(build_dir, frames_dir)
+        else:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+        os.replace(tts_path, base + ".mp3")
+        return True
+    finally:
+        # os.replace consumed it on success; a failure must not leak it.
         try:
-            return avatar.generate_video(tts_path, output_path=output_path)
-        finally:
-            try:
-                os.remove(tts_path)
-            except OSError:
-                pass
-    if output_path is None:
-        return tts_path
-    os.replace(tts_path, output_path)
-    return output_path
+            os.remove(tts_path)
+        except OSError:
+            pass
 
 
-def ensure_fixed_clip(text, path):
-    """Render a FIXED line (`text`) to a cached clip at `path` ONCE and reuse it —
-    no per-session LLM/TTS/MuseTalk, plays instantly. Regenerates if the text OR the
-    reference portrait changed (both tracked via the sidecar .txt, see clip_stamp).
-    Returns the cached path, or None on failure. Used for the always-identical
-    greeting and consent-decline clips.
+def ensure_fixed_clip(text: str, path: str) -> str | None:
+    """Render a FIXED line (`text`) into the shared cache ONCE and reuse it — no
+    per-session LLM/TTS/MuseTalk, plays instantly. Regenerates if the text OR the
+    driving video OR the frame rate changed (all tracked via the sidecar .txt,
+    see clip_stamp). Returns the cache BASE (see clip_base), or None on failure.
 
-    `path` is passed in as the configured .mp4 name; clip_path() re-points it at
-    the current mode's file so both caches can coexist on disk."""
-    path = clip_path(path)
-    sidecar = path + ".txt"
+    `path` is passed in as the configured .mp4 name; clip_base() reduces it to
+    the stem the two cached artifacts hang off.
+    """
+    base = clip_base(path)
+    sidecar = base + ".txt"
     stamp = clip_stamp(text)
     with _fixed_clip_lock:
         try:
-            if os.path.exists(path) and os.path.exists(sidecar):
+            if os.path.exists(base + ".mp3") and os.path.exists(sidecar):
                 with open(sidecar, encoding="utf-8") as f:
-                    if f.read() == stamp:
-                        return path  # cached and up to date
+                    fresh = f.read() == stamp
+                if fresh and (not config.ENABLE_VIDEO_AVATAR
+                              or os.path.isdir(base + ".frames")):
+                    return base  # cached and up to date
         except OSError:
             pass
         try:
-            tts_path = tts.synthesize(text, None, None)
-            if not tts_path:
-                return None
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            result = render_clip(tts_path, output_path=path)
-            if result is None:
+            if not _cache_fixed(text, base):
                 return None
             with open(sidecar, "w", encoding="utf-8") as f:
                 f.write(stamp)
-            logger.info("Fixed clip cached at %s", path)
-            return path
+            logger.info("Fixed clip cached at %s", base)
+            return base
         except Exception as e:
-            logger.warning("Fixed clip generation failed for %s: %s", path, e)
+            logger.warning("Fixed clip generation failed for %s: %s", base, e)
             return None
+
+
+def fixed_segment(text: str, path: str) -> Segment | None:
+    """A ready-to-play Segment for a fixed line, served from the cache.
+
+    Frames are read off disk up front rather than streamed: a cached clip has no
+    render to wait for, so there is nothing to gain by dribbling them out, and a
+    complete segment lets the client start on its first frame.
+    """
+    base = ensure_fixed_clip(text, path)
+    if base is None:
+        return None
+    seg = Segment(text)
+    try:
+        for fp in sorted(glob.glob(os.path.join(base + ".frames", "*.jpg"))):
+            with open(fp, "rb") as f:
+                seg.frames.put(f.read())
+    except OSError as e:
+        logger.warning("Cached frames unreadable for %s: %s", base, e)
+        return None
+    seg.open(base + ".mp3")
+    seg.close()
+    return seg
 
 
 def prewarm_fixed_clips():
@@ -211,6 +319,49 @@ class Pipeline:
         self._carry_lock = threading.Lock()
         self._pending_voice = None   # (turn id, audio) — unconsumed voice turn
         self._carry_audio = None     # carried first half awaiting the merge
+        # Every Segment created for the CURRENT turn, so a barge-in can reach
+        # into the ones already handed to the poller and cancel them too —
+        # emptying video_queue alone would leave the segment being played right
+        # now streaming happily into a browser that has moved on.
+        self._live_lock = threading.Lock()
+        self._live: list[Segment] = []
+
+    def _new_segment(self, sentence: str) -> Segment:
+        seg = Segment(sentence)
+        with self._live_lock:
+            self._live.append(seg)
+        return seg
+
+    def _enqueue(self, seg: Segment):
+        """Hand a segment to the poller. Called BEFORE its render finishes: the
+        poller forwards frames as they land, so delivery overlaps generation."""
+        seg._t_enqueue = time.perf_counter()
+        self.video_queue.put(seg)
+        self.state = "speaking"
+
+    def _flush(self):
+        """Cascade flush — the whole response is abandoned, at every stage at once.
+
+        Ordering matters. Cancelling the live segments FIRST makes every
+        in-flight MuseTalk render see its abort flag on the next batch (and the
+        next frame), and makes TTS drop its partial mp3, so the GPU and the
+        network stop producing before the queue is emptied. Draining first would
+        leave the renderer busily filling queues nobody reads.
+
+        cancel_event (set by the caller) is what stops the LLM stream; this stops
+        everything downstream of it.
+        """
+        with self._live_lock:
+            live, self._live = self._live, []
+        for seg in live:
+            seg.cancel()
+        while True:
+            try:
+                item = self.video_queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, Segment):
+                item.cancel()
 
     def _aborted(self, turn):
         """True if this response was cancelled or superseded by a newer turn."""
@@ -246,12 +397,7 @@ class Pipeline:
                                 "unconsumed first half into the next utterance")
             self.cancel_event.set()
             self._turn += 1  # invalidate the in-flight response immediately
-            # Clear video queue
-            while not self.video_queue.empty():
-                try:
-                    self.video_queue.get_nowait()
-                except queue.Empty:
-                    break
+            self._flush()    # LLM stream, TTS, MuseTalk, frame queues — all of it
             # History is pipeline-owned; the in-flight producer's finally commits
             # whatever was generated so far, so no truncation is needed here.
 
@@ -263,11 +409,7 @@ class Pipeline:
         if self.state in ("processing", "speaking"):
             self.cancel_event.set()
             self._turn += 1
-            while not self.video_queue.empty():
-                try:
-                    self.video_queue.get_nowait()
-                except queue.Empty:
-                    break
+            self._flush()
         # An explicit Stop abandons any pause-split fragment too.
         self._clear_carry()
         self.state = "idle"
@@ -339,19 +481,14 @@ class Pipeline:
                 self.state = "idle"
                 return
             text = config.GREETING_TEXT
-            video = ensure_fixed_clip(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
+            seg = fixed_segment(config.GREETING_TEXT, config.GREETING_VIDEO_PATH)
             # Record the fixed opening as the assistant's first turn in both histories.
             self._history_set_assistant(text)
             # Fresh protocol run: the machine starts at the consent expectation.
             self.clinical = runtime.ClinicalSession()
             runtime.start(self.clinical)
-            if video and not self._aborted(turn):
-                self.video_queue.put({
-                    "video": video,
-                    "sentence": text,
-                    "_t_enqueue": time.perf_counter(),
-                })
-                self.state = "speaking"
+            if seg and not self._aborted(turn):
+                self._enqueue(seg)
                 self.video_queue.put(None)
             else:
                 # No clip (generation failed / not ready) — the text greeting still shows.
@@ -365,15 +502,10 @@ class Pipeline:
         the cached decline clip, and end the turn. No screening, no dynamic LLM."""
         self._history_begin(user_text)          # record the user's "no"
         text = config.DECLINE_TEXT
-        video = ensure_fixed_clip(text, config.DECLINE_VIDEO_PATH)
+        seg = fixed_segment(text, config.DECLINE_VIDEO_PATH)
         self._history_set_assistant(text)
-        if video and not self._aborted(turn):
-            self.video_queue.put({
-                "video": video,
-                "sentence": text,
-                "_t_enqueue": time.perf_counter(),
-            })
-            self.state = "speaking"
+        if seg and not self._aborted(turn):
+            self._enqueue(seg)
             self.video_queue.put(None)
         else:
             self.state = "idle"
@@ -396,21 +528,17 @@ class Pipeline:
         # turns run the full counselor with the crisis protocol.
         runtime.enter_crisis(self.clinical)
         text = crisis.RESPONSES[hit.category]
-        video = ensure_fixed_clip(text, crisis_clip_path(hit.category))
+        seg = fixed_segment(text, crisis_clip_path(hit.category))
         self._history_set_assistant(text)
-        if video is None and not self._aborted(turn):
-            # Cache miss (e.g. pre-warm failed): render it now rather than stay silent.
-            tts_path = tts.synthesize(text, None, self.cancel_event)
-            if tts_path is not None:
-                video = render_clip(tts_path)
-        if video and not self._aborted(turn):
-            self.video_queue.put({
-                "video": video,
-                "sentence": text,
-                "_t_enqueue": time.perf_counter(),
-            })
-            self.state = "speaking"
+        if seg and not self._aborted(turn):
+            self._enqueue(seg)
             self.video_queue.put(None)
+        elif not self._aborted(turn):
+            # Cache miss (e.g. pre-warm failed): render it now rather than stay silent.
+            if self._speak_dynamic(text, turn) is not None:
+                self.video_queue.put(None)
+            else:
+                self.state = "idle"
         else:
             self.state = "idle"
 
@@ -817,17 +945,28 @@ class Pipeline:
             runtime.Step(self.clinical.node, (utterance,), exp),
             turn)
 
-    def _render_dynamic(self, text):
-        """TTS + MuseTalk for a non-cached utterance; None on failure/cancel.
+    def _speak_dynamic(self, text, turn):
+        """TTS + streamed MuseTalk for a non-cached utterance; the Segment, or
+        None on failure/cancel.
+
+        The segment is enqueued BEFORE the render runs, which is the whole
+        latency win: the poller starts forwarding frames after the first UNet
+        batch while this thread is still generating the rest. It then blocks
+        until the render finishes, so utterances stay strictly in order.
+
         Counts every dynamic render (T18): fixed content must stay at zero
         runtime renders, so this counter IS the session's generation budget."""
         self.dynamic_renders += 1
         logger.info("[latency] dynamic render #%d this session",
                     self.dynamic_renders)
+        seg = self._new_segment(text)
         tts_path = tts.synthesize(text, None, self.cancel_event)
-        if tts_path is None:
+        if tts_path is None or self._aborted(turn):
+            seg.cancel()
             return None
-        return render_clip(tts_path)
+        self._enqueue(seg)
+        render_into(seg, tts_path, abort=seg.cancelled.is_set)
+        return seg
 
     def _deliver_step(self, user_text, step, turn, ack=""):
         """Speak one machine step: fixed utterances come from the shared clip
@@ -846,16 +985,20 @@ class Pipeline:
         for utt in utterances:
             if self._aborted(turn):
                 return
+            # `seg` is None for a cached line whose text still has to be spoken
+            # by the dynamic path below; `pending` marks that case. Fixed lines
+            # are already complete when fixed_segment() returns, dynamic ones
+            # stream while _speak_dynamic blocks.
+            seg, pending = None, False
             if isinstance(utt, runtime.Say):
                 text = utt.text
-                video = ensure_fixed_clip(text, protocol_clip_path(utt.key))
-                if video is None and not self._aborted(turn):
-                    video = self._render_dynamic(text)   # cache miss fallback
+                seg = fixed_segment(text, protocol_clip_path(utt.key))
+                pending = seg is None       # cache miss -> render it below
             elif isinstance(utt, runtime.Speak):
                 text = utt.text
                 if not text.strip():
                     continue
-                video = None if self._aborted(turn) else self._render_dynamic(text)
+                pending = True
             else:
                 with self._lock:
                     history = self._api_window()
@@ -863,19 +1006,16 @@ class Pipeline:
                 text = llm.phrase_utterance(utt.instruction, history, patient)
                 if not text.strip():
                     continue          # bounded utterance failed -> skip, protocol continues
-                video = None if self._aborted(turn) else self._render_dynamic(text)
+                pending = True
             if self._aborted(turn):
                 return
             spoken.append(text)
             # Text lands in the chat even if this clip failed to render.
             self._history_set_assistant(" ".join(spoken))
-            if video:
-                self.video_queue.put({
-                    "video": video,
-                    "sentence": text,
-                    "_t_enqueue": time.perf_counter(),
-                })
-                self.state = "speaking"
+            if seg is not None:
+                self._enqueue(seg)
+            elif pending:
+                self._speak_dynamic(text, turn)
         if not self._aborted(turn):
             self.video_queue.put(None)
             self.state = "speaking"
@@ -906,21 +1046,25 @@ class Pipeline:
         SENTINEL = object()
         n_gpus = max(1, len(config.MUSETALK_GPUS))
 
-        def _render(sentence, idx):
+        def _render(seg, idx):
+            """Fill one segment on a pool thread. The consumer announces it the
+            moment `seg.started` fires (audio ready), so frames stream out of
+            here while this is still running."""
             if self._aborted(turn) or config.SHUTTING_DOWN.is_set():
-                return None
+                seg.cancel()
+                return
             t_tts0 = time.perf_counter()
-            tts_path = tts.synthesize(sentence, None, self.cancel_event)
+            tts_path = tts.synthesize(seg.sentence, None, self.cancel_event)
             if tts_path is None or self._aborted(turn):
-                return None
+                seg.cancel()
+                return
             t_render0 = time.perf_counter()
-            # render_clip takes ownership of tts_path: MuseTalk consumes and
-            # deletes it in video mode, and in voice-only mode the mp3 IS the clip
-            # and the janitor reclaims it, so tmp/ does not fill up either way.
-            video_path = render_clip(tts_path)
+            # render_into takes ownership of tts_path. The mp3 is the segment's
+            # AUDIO now, not an intermediate, so it is not deleted — the temp
+            # janitor reclaims it once it has been served.
+            render_into(seg, tts_path, abort=seg.cancelled.is_set)
             logger.info("[latency] seg %d rendered: tts=%.2fs render=%.2fs",
                         idx, t_render0 - t_tts0, time.perf_counter() - t_render0)
-            return video_path
 
         def _producer(executor):
             """Pull sentences off the LLM stream, submit renders, update chat live."""
@@ -940,7 +1084,10 @@ class Pipeline:
                     # Live update BOTH histories so display and API memory agree.
                     self._history_set_assistant(full_response)
 
-                    futures_q.put((executor.submit(_render, sentence, idx), sentence))
+                    # The Segment is created HERE, on the ordering thread, so
+                    # the consumer can hold it before the render has begun.
+                    seg = self._new_segment(sentence)
+                    futures_q.put((executor.submit(_render, seg, idx), seg))
             except Exception:
                 logger.exception("streaming producer failed")
             finally:
@@ -966,26 +1113,25 @@ class Pipeline:
                 item = futures_q.get()
                 if item is SENTINEL:
                     break
-                fut, sentence = item
+                fut, seg = item
                 if self._aborted(turn):
                     fut.cancel()
+                    seg.cancel()
                     continue  # keep draining to SENTINEL so the producer finishes
-                try:
-                    video_path = fut.result()
-                except Exception:
-                    # A single sentence's TTS/MuseTalk failing must NOT abort the whole
-                    # turn (which would skip the video_end sentinel below and freeze
-                    # the avatar on its last frame). Skip this clip and continue.
-                    logger.exception("segment render failed; skipping this clip")
+                # Announce as soon as the AUDIO exists, not when the render is
+                # done — that is what lets sentence i stream while i+1 renders on
+                # another GPU. Waiting on `started` OR the future completing
+                # covers the TTS-failed case, where `started` never fires.
+                while not seg.started.wait(0.02):
+                    if fut.done() or self._aborted(turn) or config.SHUTTING_DOWN.is_set():
+                        break
+                if not seg.started.is_set() or self._aborted(turn):
+                    seg.cancel()
+                    # A single sentence's TTS/MuseTalk failing must NOT abort the
+                    # whole turn (which would skip the video_end sentinel below and
+                    # freeze the avatar on its last frame). Skip it and continue.
                     continue
-                if video_path is None or self._aborted(turn):
-                    continue
-                self.video_queue.put({
-                    "video": video_path,
-                    "sentence": sentence,
-                    "_t_enqueue": time.perf_counter(),
-                })
-                self.state = "speaking"
+                self._enqueue(seg)
                 if first_seg:
                     first_seg = False
                     logger.info("[latency] FIRST segment enqueued at +%.2fs",
@@ -1001,8 +1147,8 @@ class Pipeline:
         """Non-blocking: get next video from queue.
 
         Returns:
-            dict with "video" and "sentence" keys, or None if queue empty,
-            or False if response is complete.
+            a Segment, or None if the queue is empty, or False if the response
+            is complete.
         """
         try:
             item = self.video_queue.get_nowait()
@@ -1034,9 +1180,5 @@ class Pipeline:
         self.ended = False
         self.clinical = runtime.ClinicalSession()
         runtime.start(self.clinical)
-        while not self.video_queue.empty():
-            try:
-                self.video_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._flush()
         self.state = "idle"

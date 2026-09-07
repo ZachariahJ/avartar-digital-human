@@ -113,7 +113,15 @@ def chat_stream(messages: list[dict],
 
     for chunk in stream:
         if cancel_event and cancel_event.is_set():
-            break
+            # Close the response, don't just stop reading it. Breaking out alone
+            # leaves the SSE connection open and the model still generating (and
+            # still billing) into a socket nobody drains — the barge-in flush is
+            # supposed to STOP the work, not abandon it.
+            try:
+                stream.close()
+            except Exception:
+                pass
+            return
 
         if not chunk.choices:
             continue

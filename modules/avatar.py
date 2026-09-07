@@ -1,8 +1,11 @@
 """MuseTalk talking-head renderer.
 
-Replaces FLOAT. The public API is deliberately unchanged — get_pool(),
-generate_video(), generate_idle_video() — so modules/pipeline.py and main.py
-call this exactly as before.
+The public API is get_pool() and stream_video(). Nothing here writes a video
+file: stream_video hands each blended frame to a callback as JPEG bytes the
+moment the VAE decoder returns it, and modules/pipeline.py forwards those to the
+browser, which composites them on a canvas against the TTS audio. The first
+frames are therefore available after ONE UNet batch instead of after the whole
+utterance -- that is the entire point of the arrangement.
 
 The model swap changes what the avatar IS driven by. FLOAT animated a single
 still portrait and invented head motion from the audio. MuseTalk is an
@@ -19,9 +22,7 @@ import logging
 import os
 import pickle
 import shutil
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -143,12 +144,19 @@ def _video_to_frames(video_path: str) -> list:
     cap.release()
     if not frames:
         raise RuntimeError(f"driving video {video_path} has no decodable frames")
-    # The whisper->frame alignment assumes the material runs at MUSETALK_FPS. A
-    # mismatch does not fail, it just drifts the lips, so say so loudly.
+    # A mismatch here does NOT drift the lips: whisper features are sampled at
+    # MUSETALK_FPS and the browser draws frame floor(currentTime * MUSETALK_FPS),
+    # so both ends agree regardless of what the source clip was shot at. What it
+    # changes is the playback speed of the clip's own head motion (one driving
+    # frame per output frame), which then differs from the idle loop the browser
+    # plays at native rate. Worth knowing about, not worth failing over.
     if abs(src_fps - config.MUSETALK_FPS) > 0.5:
-        logger.warning("driving video is %.2f fps but MUSETALK_FPS is %d — lip sync "
-                       "will drift; re-encode the clip to %d fps",
-                       src_fps, config.MUSETALK_FPS, config.MUSETALK_FPS)
+        logger.info("driving video is %.2f fps, rendering at %d fps — head motion "
+                    "will play at %.2fx during speech; re-encode the clip to %d fps "
+                    "to match the idle loop",
+                    src_fps, config.MUSETALK_FPS,
+                    config.MUSETALK_FPS / src_fps if src_fps else 0,
+                    config.MUSETALK_FPS)
     return frames
 
 
@@ -285,102 +293,6 @@ def _get_material(vae) -> _Material:
 
 # --------------- Rendering ---------------
 
-def _run_h264_encode(base_cmd: list[str], output_path: str,
-                     audio_path: str | None = None) -> str:
-    """Finish an FFmpeg command using the available browser-safe H.264 encoder."""
-    # Some server FFmpeg builds omit GPL libx264 but include OpenH264. Both
-    # produce browser-compatible H.264, so use OpenH264 as a portable fallback.
-    encoders = [
-        ("libx264", ["-crf", "18"]),
-        ("libopenh264", ["-b:v", "4M"]),
-    ]
-    errors = []
-    for encoder, quality_args in encoders:
-        cmd = base_cmd + ["-c:v", encoder, "-pix_fmt", "yuv420p"] + quality_args
-        cmd += (["-c:a", "aac", "-b:a", "128k", "-shortest"]
-                if audio_path else ["-an"])
-        cmd += [output_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            if encoder != "libx264":
-                logger.info("FFmpeg libx264 unavailable; encoded with %s", encoder)
-            return output_path
-        errors.append(f"{encoder}: {result.stderr.strip()}")
-    raise RuntimeError("FFmpeg could not encode H.264: " + " | ".join(errors))
-
-
-def _encode(frames_dir: str, output_path: str, audio_path: str | None) -> str:
-    """Mux the rendered png sequence (and the spoken audio) into one mp4."""
-    base_cmd = ["ffmpeg", "-y", "-v", "error",
-                "-framerate", str(config.MUSETALK_FPS),
-                "-i", os.path.join(frames_dir, "%08d.png")]
-    if audio_path:
-        base_cmd += ["-i", audio_path]
-    return _run_h264_encode(base_cmd, output_path, audio_path)
-
-
-def _generate_motion_idle(duration: float, output_path: str) -> str:
-    """Keep natural head/eye motion while replacing speech with one smiling mouth.
-
-    A short section around IDLE_SMILE_FRAME_SEC is played forward then backward,
-    which makes the boundary seamless. MuseTalk's cached per-frame face boxes and
-    soft jaw masks track one reference smile onto that motion without inference.
-    """
-    mat_dir = _material_dir()
-    with open(os.path.join(mat_dir, "info.json"), encoding="utf-8") as f:
-        info = json.load(f)
-    with open(os.path.join(mat_dir, "coords.pkl"), "rb") as f:
-        coords = pickle.load(f)
-    with open(os.path.join(mat_dir, "mask_coords.pkl"), "rb") as f:
-        mask_coords = pickle.load(f)
-
-    # The cache is source frames followed by their reverse. Work only in its
-    # first half, then construct our own ping-pong cycle without duplicate ends.
-    source_count = int(info["frames"]) // 2
-    fps = config.MUSETALK_FPS
-    reference = min(source_count - 1, max(0, round(config.IDLE_SMILE_FRAME_SEC * fps)))
-    radius = max(1, round(duration * fps / 4))
-    start = max(0, reference - radius)
-    end = min(source_count - 1, reference + radius)
-    indices = list(range(start, end + 1)) + list(range(end - 1, start, -1))
-
-    reference_frame = cv2.imread(
-        os.path.join(mat_dir, "full_imgs", f"{reference:08d}.png"))
-    if reference_frame is None:
-        raise RuntimeError(f"missing cached idle reference frame {reference}")
-    rx1, ry1, rx2, ry2 = coords[reference]
-    reference_face = reference_frame[ry1:ry2, rx1:rx2]
-    if reference_face.size == 0:
-        raise RuntimeError(f"invalid cached idle reference face {coords[reference]}")
-
-    frames_dir = tempfile.mkdtemp(prefix="idleframes_", dir=config.TEMP_DIR)
-    try:
-        for output_index, frame_index in enumerate(indices):
-            frame = cv2.imread(os.path.join(
-                mat_dir, "full_imgs", f"{frame_index:08d}.png"))
-            mask = cv2.imread(os.path.join(
-                mat_dir, "mask", f"{frame_index:08d}.png"), cv2.IMREAD_GRAYSCALE)
-            if frame is None or mask is None:
-                raise RuntimeError(f"missing cached idle material frame {frame_index}")
-
-            x1, y1, x2, y2 = coords[frame_index]
-            xs, ys, xe, ye = mask_coords[frame_index]
-            smile = cv2.resize(reference_face, (x2 - x1, y2 - y1),
-                               interpolation=cv2.INTER_LANCZOS4)
-            replacement = frame[ys:ye, xs:xe].copy()
-            replacement[y1 - ys:y2 - ys, x1 - xs:x2 - xs] = smile
-            alpha = (mask.astype(np.float32) / 255.0)[..., None]
-            target = frame[ys:ye, xs:xe]
-            frame[ys:ye, xs:xe] = (
-                replacement * alpha + target * (1.0 - alpha)
-            ).astype(np.uint8)
-            cv2.imwrite(os.path.join(frames_dir, f"{output_index:08d}.png"), frame)
-
-        return _encode(frames_dir, output_path, audio_path=None)
-    finally:
-        shutil.rmtree(frames_dir, ignore_errors=True)
-
-
 class _Worker:
     """One MuseTalk stack pinned to one GPU."""
 
@@ -413,20 +325,36 @@ class _Worker:
         self.whisper.requires_grad_(False)
 
     @torch.no_grad()
-    def render(self, audio_path: str, output_path: str,
-               with_audio: bool = True, frame_limit: int | None = None) -> str | None:
-        """Render one clip. Returns None if the render was cut short by shutdown.
+    def stream(self, audio_path: str, on_frame, abort=None) -> int:
+        """Render one utterance, handing every frame out as it is finished.
 
-        Unlike FLOAT's ODE sampler (which ran to completion inside the external
-        repo and could not be interrupted), the batch loop is here, so shutdown
-        is checked every batch.
+        `on_frame(idx, jpeg_bytes)` is called once per frame, in order, the
+        moment that frame is blended — NOT after the utterance is complete.
+        Returns the number of frames emitted.
+
+        This is the whole point of the streaming rewrite. The UNet+VAE produce
+        MUSETALK_BATCH_SIZE frames per pass, so the first frames are ready after
+        a single batch (~1/3 s of video at the default settings) instead of
+        after the last one. Nothing is written to disk and nothing is muxed: the
+        browser draws these frames on a canvas against the TTS audio, which it
+        fetches separately and plays as one continuous element.
+
+        `abort()` is polled every batch AND every frame, so a barge-in stops the
+        GPU work instead of rendering a reply nobody will hear.
         """
         mt = _musetalk()
         m = self.material
         fps = config.MUSETALK_FPS
+        jpeg_opts = [int(cv2.IMWRITE_JPEG_QUALITY), config.MUSETALK_JPEG_QUALITY]
+
+        def _stop():
+            return config.SHUTTING_DOWN.is_set() or (abort is not None and abort())
 
         features, librosa_length = self.audio_processor.get_audio_feature(
             audio_path, weight_dtype=self.weight_dtype)
+        # Whisper still needs the WHOLE utterance: get_whisper_chunk trims and
+        # pads against librosa_length, so the audio cannot be fed in pieces. Only
+        # the OUTPUT is streamed.
         chunks = self.audio_processor.get_whisper_chunk(
             features, self.device, self.weight_dtype, self.whisper, librosa_length,
             fps=fps,
@@ -434,47 +362,43 @@ class _Worker:
             audio_padding_length_right=config.MUSETALK_AUDIO_PAD_RIGHT,
         )
 
-        frames_dir = tempfile.mkdtemp(prefix="mtframes_", dir=config.TEMP_DIR)
         idx = 0
-        try:
-            # device=: datagen's tail batch does a .to() with a cuda:0 default,
-            # which would touch GPU 0 from every worker in a multi-GPU pool.
-            for whisper_batch, latent_batch in mt.datagen(
-                    chunks, m.latents, config.MUSETALK_BATCH_SIZE,
-                    device=str(self.device)):
-                if config.SHUTTING_DOWN.is_set():
-                    return None
-                audio_feature_batch = self.pe(whisper_batch.to(self.device))
-                latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
-                pred_latents = self.unet.model(
-                    latent_batch, self.timesteps,
-                    encoder_hidden_states=audio_feature_batch).sample
-                pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
-                for res_frame in self.vae.decode_latents(pred_latents):
-                    if frame_limit is not None and idx >= frame_limit:
-                        break
-                    i = idx % len(m)
-                    x1, y1, x2, y2 = m.coords[i]
-                    try:
-                        face = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-                    except cv2.error:
-                        continue
-                    # .copy(): the cached frame is reused by every later render,
-                    # so blending must never write through to it.
-                    combined = mt.get_image_blending(
-                        m.frames[i].copy(), face, [x1, y1, x2, y2],
-                        m.masks[i], m.mask_coords[i])
-                    cv2.imwrite(os.path.join(frames_dir, f"{idx:08d}.png"), combined)
-                    idx += 1
-                if frame_limit is not None and idx >= frame_limit:
-                    break
+        # device=: datagen's tail batch does a .to() with a cuda:0 default,
+        # which would touch GPU 0 from every worker in a multi-GPU pool.
+        for whisper_batch, latent_batch in mt.datagen(
+                chunks, m.latents, config.MUSETALK_BATCH_SIZE,
+                device=str(self.device)):
+            if _stop():
+                break
+            audio_feature_batch = self.pe(whisper_batch.to(self.device))
+            latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
+            pred_latents = self.unet.model(
+                latent_batch, self.timesteps,
+                encoder_hidden_states=audio_feature_batch).sample
+            pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
+            for res_frame in self.vae.decode_latents(pred_latents):
+                if _stop():
+                    return idx
+                i = idx % len(m)
+                x1, y1, x2, y2 = m.coords[i]
+                try:
+                    face = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                except cv2.error:
+                    continue
+                # .copy(): the cached frame is reused by every later render,
+                # so blending must never write through to it.
+                combined = mt.get_image_blending(
+                    m.frames[i].copy(), face, [x1, y1, x2, y2],
+                    m.masks[i], m.mask_coords[i])
+                ok, buf = cv2.imencode(".jpg", combined, jpeg_opts)
+                if not ok:
+                    continue
+                on_frame(idx, buf.tobytes())
+                idx += 1
 
-            if idx == 0:
-                logger.warning("MuseTalk produced no frames for %s", audio_path)
-                return None
-            return _encode(frames_dir, output_path, audio_path if with_audio else None)
-        finally:
-            shutil.rmtree(frames_dir, ignore_errors=True)
+        if idx == 0:
+            logger.warning("MuseTalk produced no frames for %s", audio_path)
+        return idx
 
 
 class MuseTalkGPUPool:
@@ -504,17 +428,19 @@ class MuseTalkGPUPool:
             self.semaphores[gpu_id] = threading.Semaphore(1)
         logger.info(f"MuseTalk GPU pool ready: {list(self.workers.keys())}")
 
-    def generate_video(self, audio_path: str, output_path: str | None = None) -> str | None:
-        """Generate video using any available GPU from the pool."""
-        if output_path is None:
-            output_path = tempfile.mktemp(suffix=".mp4", dir=config.TEMP_DIR)
+    def stream_video(self, audio_path: str, on_frame, abort=None) -> int:
+        """Stream one utterance's frames using any free GPU from the pool.
 
-        # Try to acquire any GPU
+        Blocks the CALLING thread for the whole render, calling `on_frame` from
+        it as each frame lands. Callers therefore run this off the event loop
+        (pipeline renders in a ThreadPoolExecutor) and `on_frame` must not
+        block — it hands the frame to a queue and returns.
+        """
         while True:
             # Bail out promptly on server shutdown so Ctrl+C isn't blocked waiting
-            # here for a free GPU (the caller treats None as a failed render).
+            # here for a free GPU (the caller treats 0 frames as a failed render).
             if config.SHUTTING_DOWN.is_set():
-                return None
+                return 0
             for gpu_id in self.gpu_ids:
                 if self.semaphores[gpu_id].acquire(blocking=False):
                     try:
@@ -524,18 +450,11 @@ class MuseTalkGPUPool:
                         # segments dispatched to GPU 1/2 crash with "tensors on
                         # cuda:1 and cuda:0".
                         with torch.cuda.device(gpu_id):
-                            return self.workers[gpu_id].render(audio_path, output_path)
+                            return self.workers[gpu_id].stream(audio_path, on_frame, abort)
                     finally:
                         self.semaphores[gpu_id].release()
             # All GPUs busy, wait briefly
             time.sleep(0.1)
-
-    def generate_idle_video(self, duration: float = 5.0, output_path: str | None = None) -> str:
-        """Generate a seamless moving idle clip with a stable smiling mouth."""
-        if output_path is None:
-            output_path = config.IDLE_VIDEO_PATH
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        return _generate_motion_idle(duration, output_path)
 
 
 def get_pool() -> MuseTalkGPUPool:
@@ -552,17 +471,9 @@ def get_pool() -> MuseTalkGPUPool:
     return _pool
 
 
-def generate_video(audio_path: str, output_path: str | None = None) -> str | None:
-    """Public API - uses the GPU pool."""
-    return get_pool().generate_video(audio_path, output_path)
-
-
-def generate_idle_video(duration: float = 3.0) -> str:
-    """Generate a moving idle loop, preparing MuseTalk material if necessary."""
-    os.makedirs(os.path.dirname(config.IDLE_VIDEO_PATH), exist_ok=True)
-    if not os.path.exists(os.path.join(_material_dir(), "info.json")):
-        return get_pool().generate_idle_video(duration)
-    return _generate_motion_idle(duration, config.IDLE_VIDEO_PATH)
+def stream_video(audio_path: str, on_frame, abort=None) -> int:
+    """Public API - uses the GPU pool. See MuseTalkGPUPool.stream_video."""
+    return get_pool().stream_video(audio_path, on_frame, abort)
 
 
 if __name__ == "__main__":
