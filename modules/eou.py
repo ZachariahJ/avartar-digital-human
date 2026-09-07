@@ -1,18 +1,17 @@
-"""Semantic End-Of-Utterance (EOU) detection via smart-turn v3.
+"""Decides whether a pause means the speaker is finished.
 
-Predicts P(the user has finished their turn) from the raw waveform — it reads
-intonation and filler words ("um...", "so...") that a fixed-silence VAD misreads
-as a turn end. We use it to gate VAD's speech_end: a pause is only treated as the
-end of a turn if the model agrees the utterance is semantically complete.
+A silence-duration VAD cannot tell a finished sentence from someone thinking
+mid-sentence, so it cuts people off. This model reads intonation and filler
+words straight from the waveform and predicts whether the turn is semantically
+complete; modules/vad.py uses it to gate speech_end.
 
-Runs as a tiny (~9MB) ONNX model on CPU (~28ms/consult), fully isolated from the
-MuseTalk GPUs. If the model or onnxruntime is unavailable, predict_complete() returns
-None and the VAD transparently falls back to its silence-duration behavior — EOU
-is a strict add-on that can never brick the pipeline.
+It is a strict add-on and can never break the pipeline: predict_complete()
+returns None whenever the model or onnxruntime is unavailable, and the VAD then
+falls back to plain silence timing.
 
-GPU note: to run on GPU instead, install onnxruntime-gpu and pass
-providers=["CUDAExecutionProvider"] in _load(). CPU is the default because it
-needs no CUDA-version matching against the pinned torch build and is fast enough.
+Runs on CPU (~9MB model, ~28ms per consult), deliberately away from the MuseTalk
+GPUs. Running it on GPU would need onnxruntime-gpu and a CUDA build matching the
+pinned torch, which buys nothing at this size.
 """
 
 import logging
@@ -25,7 +24,7 @@ import config
 logger = logging.getLogger(__name__)
 
 SR = 16000
-WINDOW_SEC = 8  # smart-turn v3 analyzes the last 8s of audio
+WINDOW_SEC = 8  # fixed by the model: it consumes exactly this much audio
 
 _session = None
 _feature_extractor = None
@@ -35,14 +34,14 @@ _lock = threading.Lock()
 
 
 def _load():
-    """Build the ONNX session + Whisper feature extractor. Raises on failure."""
+    """Build the ONNX session and its feature extractor. Raises on failure."""
     global _session, _feature_extractor, _input_name
     import onnxruntime as ort
     from transformers import WhisperFeatureExtractor
 
     so = ort.SessionOptions()
     so.inter_op_num_threads = 1
-    so.intra_op_num_threads = getattr(config, "EOU_ONNX_THREADS", 2)
+    so.intra_op_num_threads = config.EOU_ONNX_THREADS
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
     sess = ort.InferenceSession(
@@ -54,11 +53,13 @@ def _load():
 
 
 def get_model():
-    """Lazily load the EOU model once. Returns the session, or None if loading
-    failed (in which case callers should fall back to silence-only VAD)."""
+    """The ONNX session, loaded on first use, or None if it cannot be loaded.
+
+    A failed load is remembered, so a missing model costs one warning rather
+    than a failed load attempt on every pause. Double-checked locking, because
+    the startup pre-warm and a first user request race here.
+    """
     global _load_failed
-    # Double-checked locking: a startup pre-warm and a concurrent first request
-    # must not both build the session.
     if _session is None and not _load_failed:
         with _lock:
             if _session is None and not _load_failed:
@@ -74,18 +75,24 @@ def get_model():
 
 
 def predict_complete(audio: np.ndarray) -> float | None:
-    """P(turn complete) in [0,1] for the given utterance audio.
+    """Probability in [0,1] that the speaker has finished their turn.
 
-    audio: float32 mono numpy array at 16kHz (speech so far, including the
-    trailing pause). Returns None if EOU is unavailable — callers must treat
-    None as "no signal" and fall back to silence-duration logic.
+    Args:
+        audio: float32 mono at 16kHz — the speech so far, including the
+            trailing pause being judged.
+
+    Returns:
+        The probability, or None when the model is unavailable or inference
+        failed. Callers must read None as "no opinion" and fall back to silence
+        timing rather than treating it as a low score.
     """
     sess = get_model()
     if sess is None:
         return None
     try:
         a = np.asarray(audio, dtype=np.float32)
-        # Keep the END of the utterance (that's where turn-final cues live).
+        # Trim from the front: the cues that mark a turn ending are all at the
+        # end of the utterance.
         if a.size > WINDOW_SEC * SR:
             a = a[-WINDOW_SEC * SR:]
         inputs = _feature_extractor(
@@ -99,7 +106,7 @@ def predict_complete(audio: np.ndarray) -> float | None:
         )
         feats = inputs.input_features.squeeze(0).astype(np.float32)[None, ...]
         out = sess.run(None, {_input_name: feats})
-        # Model output (named "logits") already has sigmoid applied -> a probability.
+        # Despite being named "logits", this output already has sigmoid applied.
         return float(np.ravel(out[0])[0])
     except Exception as e:
         logger.warning("EOU predict failed (%s); treating as no-signal", e)
@@ -107,6 +114,8 @@ def predict_complete(audio: np.ndarray) -> float | None:
 
 
 if __name__ == "__main__":
+    # Smoke test: confirms the model loads and produces a number. Noise in gives
+    # a meaningless score out, which is fine — only the plumbing is under test.
     logging.basicConfig(level=logging.INFO)
     dummy = (np.random.randn(SR * 3).astype(np.float32) * 0.02)
     print("EOU P(complete) on dummy audio:", predict_complete(dummy))

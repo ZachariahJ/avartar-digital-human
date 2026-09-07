@@ -1,4 +1,20 @@
-"""Core orchestrator: streaming sentence-by-sentence processing with barge-in support."""
+"""Turns what the user said into what the avatar says back.
+
+One turn runs: transcribe, classify and code the utterance, let the clinical
+state machine in modules/sbirt/ decide what comes next, then speak it. Each
+sentence becomes a Segment — audio plus a live stream of frames — and segments
+are delivered strictly in order even though several may be rendering at once.
+
+Two properties shape most of the design here:
+
+  * Nothing survives a barge-in. When the user starts talking, the LLM stream,
+    the pending synthesis, every in-flight render and every queued segment are
+    all abandoned together, and a turn id makes the abandoned work unable to
+    write into the turn that replaced it.
+  * The state machine decides, not the model. The LLM classifies an utterance
+    and words individual lines; it never chooses the next question, a score, or
+    where the session goes.
+"""
 
 import os
 import threading
@@ -13,11 +29,9 @@ import numpy as np
 
 import config
 from modules import asr, clipcache, llm, tts, privacy
-# modules.avatar is imported lazily inside render_into/_render_frames, never at
-# module scope:
-# importing it pulls in torch plus the whole sibling float/ repo (face_alignment,
-# torchvision, librosa, the MuseTalk model classes). Voice-only mode must not fail to
-# start, or pay that import, because of a repo it will never call.
+# modules.avatar is imported inside the render functions, never here. Importing
+# it pulls in torch and the entire sibling MuseTalk checkout, which voice-only
+# mode must neither pay for nor be able to fail on.
 from modules.privacy import phi, phi_keys
 from modules.sbirt import crisis, runtime, state_view, templates
 from modules.sbirt.instruments import BY_KEY, InvalidResponse, PRE_SCREEN
@@ -26,25 +40,21 @@ logger = logging.getLogger(__name__)
 
 
 class Segment:
-    """One utterance on its way to the browser.
+    """One utterance travelling to the browser: complete audio, streaming frames.
 
-    A segment is NOT a video file. It is a whole audio file plus a live stream
-    of JPEG frames, because that is the only shape that gets the first frame out
-    fast. MuseTalk needs the ENTIRE utterance's audio up front (whisper features
-    are trimmed and padded against the full length, so audio cannot be fed in
-    pieces), but it produces frames a batch at a time — so the audio is handed
-    over as one URL and the frames arrive progressively.
+    The asymmetry is forced by the renderer. It needs the whole utterance's
+    audio before it can start, because features are padded against the total
+    length, but it produces frames a batch at a time. So audio is handed over
+    once as a URL while frames arrive progressively.
 
-    The browser plays `audio_url` on one continuous <audio> element and uses its
-    currentTime as THE clock, drawing frame floor(t * fps) on a canvas. That is
-    what removes the per-chunk seams: nothing is re-encoded, no container is
-    restarted, and the audio never stops for the video to catch up. The URL
-    points at bytes in clipcache, not a file — no part of an utterance is
-    written to disk.
+    The browser treats the audio element's currentTime as the clock and draws
+    frame floor(t * fps) on a canvas. Nothing is re-encoded and no container is
+    restarted between sentences, which is what removes the seams a per-sentence
+    video file would have; the audio never pauses for the video to catch up.
 
-    Ownership: `frames` is filled by the render thread and drained by the state
-    poller. The terminating None is mandatory — it is how the poller learns the
-    utterance is complete rather than merely slow.
+    The render thread fills `frames` and the state poller drains it. The
+    terminating None is mandatory: without it the poller cannot distinguish a
+    finished utterance from a slow one.
     """
 
     __slots__ = ("sentence", "audio_url", "fps", "frames", "started",
@@ -52,12 +62,12 @@ class Segment:
 
     def __init__(self, sentence: str = ""):
         self.sentence = sentence
-        self.audio_url = None           # set before `started` fires
+        self.audio_url = None           # valid once `started` is set
         self.fps = config.MUSETALK_FPS
-        self.frames = queue.Queue()     # jpeg bytes ..., then None
-        self.started = threading.Event()  # audio_url is valid; safe to announce
+        self.frames = queue.Queue()     # JPEG bytes, terminated by None
+        self.started = threading.Event()  # audio exists; safe to announce
         self.cancelled = threading.Event()
-        self._t_enqueue = 0.0
+        self._t_enqueue = 0.0           # for the latency log only
 
     def open(self, audio_url: str):
         self.audio_url = audio_url
@@ -67,15 +77,18 @@ class Segment:
         self.frames.put(None)
 
     def cancel(self):
-        """Barge-in: stop the render and stop forwarding whatever is buffered."""
+        """Abandon this utterance: stop its render and discard what is buffered.
+
+        The sentinel is queued as well, so a poller already blocked on this
+        segment wakes rather than waiting for a render that will never finish.
+        """
         self.cancelled.set()
         self.frames.put(None)
 
 
-# --------------- Fixed-clip keys ---------------
-# A fixed utterance is identified by a stable KEY, not by a file path: the clip
-# it names lives in RAM (modules/clipcache.py), never on disk. Keys are
-# namespaced so a protocol key can never collide with the greeting's.
+# Fixed utterances are addressed by a stable key rather than a path, since the
+# clip they name lives in memory. The prefixes keep the three namespaces from
+# colliding.
 
 def crisis_clip_key(category: str) -> str:
     """Cache key for one crisis category's fixed response."""
@@ -83,39 +96,37 @@ def crisis_clip_key(category: str) -> str:
 
 
 def protocol_clip_key(key: str) -> str:
-    """Cache key for a fixed protocol utterance (runtime.Say key)."""
+    """Cache key for a fixed protocol utterance."""
     return f"protocol.{key}"
 
 
 def clip_stamp(text: str) -> str:
-    """The full cache key for a rendered clip: the spoken text AND everything
-    about how it was rendered. A clip is a function of all of them, so keying on
-    text alone was a face-swap trap — repointing config.AVATAR_VIDEO left every
-    cached clip replaying the OLD face forever, because no text had changed.
+    """Everything a rendered clip depends on, as one cache-validity string.
 
-    MUSETALK_FPS is in the stamp because the cached frames ARE a fixed-rate
-    sequence: the browser indexes them as floor(currentTime * fps), so replaying
-    24fps frames under a 25fps clock desynchronises the whole clip.
+    Keying on the text alone is a trap: repointing the driving video changes no
+    text, so every cached clip would go on replaying the previous face
+    indefinitely.
 
-    A voice-only clip has no portrait in it, so it is deliberately NOT stamped
-    with the fingerprint — swapping the avatar video must not invalidate audio
-    that cannot possibly show a face."""
+    The frame rate belongs here too, because cached frames are a fixed-rate
+    sequence that the browser indexes by wall-clock time — replaying them under
+    a different clock desynchronises the whole clip.
+
+    Voice-only clips deliberately omit the avatar entirely: audio that can never
+    show a face must not be invalidated by swapping the video.
+    """
     if not config.ENABLE_VIDEO_AVATAR:
         return f"audio-only\n{text}"
     return (f"avatar:{config.avatar_fingerprint()}\n"
             f"fps:{config.MUSETALK_FPS}\n{text}")
 
 
-# --------------- Rendering ---------------
-
 def _scratch_audio(audio: bytes) -> str:
-    """Spill an utterance's wav to a scratch file, because MuseTalk needs a PATH.
+    """Write an utterance's audio to a temporary file and return its path.
 
-    This is the only disk write left in the speaking path, and it is not a cache:
-    whisper's feature extraction is get_audio_feature(audio_path), so the bytes
-    have to exist as a file for exactly the length of one render. It goes to
-    config.RENDER_SCRATCH_DIR — /dev/shm, i.e. RAM — and every caller deletes it
-    in a finally. The janitor sweeps anything a crash leaks.
+    The only disk write left in the speaking path, and not a cache: the whisper
+    feature extractor takes a filename, so the bytes must exist as a file for
+    the duration of one render. The destination is normally RAM-backed, and
+    every caller deletes the file in a finally.
     """
     os.makedirs(config.RENDER_SCRATCH_DIR, exist_ok=True)
     fd, path = tempfile.mkstemp(suffix=".wav", dir=config.RENDER_SCRATCH_DIR)
@@ -125,15 +136,23 @@ def _scratch_audio(audio: bytes) -> str:
 
 
 def render_into(seg: Segment, audio: bytes, abort=None, collect=None) -> int:
-    """Drive `seg` from finished TTS audio. Returns the frame count.
+    """Fill `seg` from finished audio, streaming frames as they render.
 
-    The audio is published to clipcache first and the segment opened on its URL,
-    so the browser can start fetching and playing while MuseTalk is still on its
-    first batch. Voice-only mode emits zero frames and the segment IS just the
-    audio — the page shows the still portrait, exactly as before.
+    Args:
+        seg: the segment to open and fill.
+        audio: the complete utterance.
+        abort: polled by the renderer; defaults to the segment's own cancelled
+            flag.
+        collect: if given, receives every JPEG as it is produced, so the caller
+            can cache a fixed utterance it had to render itself.
 
-    `collect`, when given, accumulates the JPEGs as they stream so the caller can
-    cache a fixed utterance it just had to render (see Pipeline._speak_dynamic).
+    Returns:
+        The number of frames rendered; zero in voice-only mode, where the audio
+        alone is the whole segment.
+
+    The audio is published and the segment opened before rendering starts, so
+    the browser can fetch and begin playing while the first batch is still on
+    the GPU.
     """
     seg.open(clipcache.publish_url(audio))
     if not config.ENABLE_VIDEO_AVATAR:
@@ -159,9 +178,12 @@ def render_into(seg: Segment, audio: bytes, abort=None, collect=None) -> int:
 
 
 def _render_frames(audio: bytes, abort=None) -> list:
-    """Render an utterance to JPEG frames with no Segment and nobody listening —
-    the pre-warm path. Returns the frames rendered so far, which is a PARTIAL
-    list if `abort` fired; the caller checks that before caching."""
+    """Render an utterance to frames with no segment and no listener.
+
+    Used by the pre-warm, which has nowhere to stream to. Returns whatever was
+    rendered, which is a partial list if `abort` fired — the caller must check
+    that before caching, or half an utterance gets cached permanently.
+    """
     from modules import avatar
     frames = []
     path = _scratch_audio(audio)
@@ -176,16 +198,13 @@ def _render_frames(audio: bytes, abort=None) -> list:
 
 
 def fixed_segment(text: str, key: str) -> Segment | None:
-    """A ready-to-play Segment for a fixed line, straight out of RAM.
+    """A ready-to-play segment for a fixed line, or None if it is not cached.
 
-    Returns None on a cache miss. Callers MUST fall back to rendering the line
-    (Pipeline._speak_dynamic with cache_key=key), which streams it and fills the
-    cache: the cache does not survive a restart, so a miss is an ordinary event
-    on the first session after boot, not a failure.
+    A miss is ordinary, not an error: the cache is memory and is empty after
+    every restart, so callers must fall back to rendering the line themselves.
 
-    Frames are loaded into the segment up front rather than streamed: a cached
-    clip has no render to wait for, so there is nothing to gain by dribbling
-    them out, and a complete segment lets the client start on its first frame.
+    The frames are loaded up front rather than streamed. There is no render to
+    wait for, so withholding them would only delay playback.
     """
     clip = clipcache.get_clip(key, clip_stamp(text))
     if clip is None:
@@ -198,12 +217,11 @@ def fixed_segment(text: str, key: str) -> Segment | None:
     return seg
 
 
-# --------------- Conversation activity (the pre-warm's GPU yield) ---------------
-# The pre-warm renders fixed clips on the SAME GPUs that answer people. These
-# three functions are the whole arbitration: a turn marks the conversation live,
-# and the pre-warm both waits on this before starting a clip and passes it as the
-# render's abort hook — MuseTalk polls abort every batch, so a person who starts
-# talking gets the GPU back within one batch instead of after the whole clip.
+# The pre-warm renders on the same GPUs that answer people, so it needs to know
+# when a conversation is live. These few functions are the whole arbitration:
+# the pre-warm waits on conversation_busy() before starting a clip and also
+# passes it as the render's abort condition, so somebody who starts talking gets
+# the GPU back within one batch rather than after the whole clip.
 
 _activity_lock = threading.Lock()
 _active_turns = 0
@@ -224,18 +242,22 @@ def _turn_end():
 
 
 def note_activity():
-    """Mark the conversation live without owning a turn — used the moment the
-    VAD hears speech, so the pre-warm lets go of the GPU before the turn that
-    needs it has even been created."""
+    """Mark the conversation live without claiming a turn.
+
+    Called the instant the VAD hears speech, so the pre-warm releases its GPU
+    before the turn that will need it has even been created.
+    """
     global _last_active
     with _activity_lock:
         _last_active = time.monotonic()
 
 
 def conversation_busy() -> bool:
-    """True while any turn is in flight, or one ended within the idle grace
-    period (so the pre-warm doesn't grab a GPU in the gap between two turns of
-    the same exchange)."""
+    """True while a turn is in flight, or one ended within the grace period.
+
+    The grace period stops the pre-warm from seizing a GPU in the pause between
+    two turns of the same exchange.
+    """
     with _activity_lock:
         if _active_turns > 0:
             return True
@@ -244,14 +266,12 @@ def conversation_busy() -> bool:
 
 
 def _prewarm_abort() -> bool:
+    """The pre-warm's abort condition: anyone talking, or the server stopping."""
     return conversation_busy() or config.SHUTTING_DOWN.is_set()
 
 
-# --------------- Fixed-clip pre-warm ---------------
-
 def fixed_catalogue() -> list:
-    """(clip key, text) for every fixed utterance the protocol can ever speak."""
-    from modules.sbirt import templates
+    """(key, text) for every fixed utterance the protocol can ever speak."""
     items = [(config.GREETING_CLIP_KEY, config.GREETING_TEXT),
              (config.DECLINE_CLIP_KEY, config.DECLINE_TEXT)]
     items += [(crisis_clip_key(c), t) for c, t in crisis.RESPONSES.items()]
@@ -261,8 +281,12 @@ def fixed_catalogue() -> list:
 
 
 def _prewarm_one(key: str, text: str, stamp: str) -> str:
-    """Render one fixed utterance into the cache. "cached", "preempted" (someone
-    started talking — the GPU was handed back, try again later) or "failed"."""
+    """Render one fixed utterance into the cache.
+
+    Returns "cached", "preempted" when somebody started talking and the GPU was
+    handed back, or "failed". A preempted render leaves truncated frames, which
+    are discarded rather than cached.
+    """
     audio = tts.synthesize(text, config.SHUTTING_DOWN)
     if audio is None:
         return "failed"
@@ -270,7 +294,7 @@ def _prewarm_one(key: str, text: str, stamp: str) -> str:
     if config.ENABLE_VIDEO_AVATAR:
         frames = _render_frames(audio, abort=_prewarm_abort)
         if _prewarm_abort():
-            return "preempted"      # frames are truncated; never cache those
+            return "preempted"
         if not frames:
             return "failed"
     clipcache.put_clip(key, stamp, audio, frames)
@@ -278,7 +302,7 @@ def _prewarm_one(key: str, text: str, stamp: str) -> str:
 
 
 def _wait_until_idle() -> bool:
-    """Block until no conversation is in flight. False if we're shutting down."""
+    """Block until no conversation is in flight. False if the server is stopping."""
     while not config.SHUTTING_DOWN.is_set():
         if not conversation_busy():
             return True
@@ -287,16 +311,15 @@ def _wait_until_idle() -> bool:
 
 
 def prewarm_fixed_clips():
-    """Render every fixed utterance into the in-RAM clip cache, at idle.
+    """Fill the clip cache with every fixed utterance, whenever nobody is talking.
 
-    Runs in a background thread for the life of the process. Unlike the old
-    on-disk cache this has to happen on EVERY boot, so it is explicitly the
-    lowest-priority user of the GPUs: it renders one clip at a time, only while
-    conversation_busy() is false, and abandons a clip mid-render the moment
-    someone speaks (re-queueing it for a later idle window). A clip that is
-    needed before the pre-warm reaches it is simply rendered on demand by the
-    turn that needs it, which caches it too — so this loop is an optimisation,
-    never a correctness requirement.
+    Runs in a background thread for the life of the process. Because the cache
+    is memory, this happens on every boot, which makes it the lowest-priority
+    user of the GPUs: one clip at a time, only while idle, and abandoned
+    mid-render as soon as somebody speaks. An abandoned clip is re-queued.
+
+    Purely an optimisation. Any clip needed before this reaches it is rendered
+    on demand by the turn that needs it, and cached the same way.
     """
     if not config.CLIP_PREWARM:
         logger.info("[prewarm] disabled (CLIP_PREWARM=0)")
@@ -324,11 +347,11 @@ def prewarm_fixed_clips():
         elif result == "preempted":
             logger.info("[prewarm] yielded the GPU mid-render of %s; "
                         "re-queued for the next idle window", key)
-            pending.appendleft((key, text))   # front: it was next in line
+            pending.appendleft((key, text))   # retry first; it was next anyway
         else:
             attempts[key] = attempts.get(key, 0) + 1
             if attempts[key] < config.CLIP_PREWARM_MAX_ATTEMPTS:
-                pending.append((key, text))   # back: let the others through
+                pending.append((key, text))   # retry last; do not block the rest
             else:
                 skipped += 1
                 logger.warning("[prewarm] giving up on %s after %d attempts "
@@ -340,69 +363,68 @@ def prewarm_fixed_clips():
 
 
 class Pipeline:
-    """State machine: idle → listening → processing → speaking → idle"""
+    """One conversation: its history, its clinical state, and its turn machinery.
+
+    Cycles through idle, listening, processing and speaking. One instance per
+    session; nothing is shared between instances.
+    """
 
     def __init__(self, audit_key: str = "default"):
-        self.audit_key = audit_key  # pseudonymous session id for audit records
-        self.state = "idle"  # idle, listening, processing, speaking
+        self.audit_key = audit_key  # pseudonymous session id, for audit records
+        self.state = "idle"
         self.cancel_event = threading.Event()
         self.video_queue = queue.Queue()
-        # THE conversation record: {"role", "content"} dicts. The frontend
-        # shows all of it; the LLM API gets a derived sliding-window suffix
-        # (_api_window). Deterministic scores live in self.clinical, so window
-        # trimming can never corrupt triage.
+        # The conversation, as {"role", "content"} dicts. The page shows all of
+        # it; the model sees a trimmed window derived from it. Screening results
+        # live in self.clinical instead, so trimming can never lose a score.
         self.chat_history = []
-        # Structured patient profile (age, sex, substances, screening scores, ...),
-        # injected into the prompt every turn so it survives history-window trimming
-        # and the model never loses key clinical facts.
+        # Patient facts extracted in the background and re-injected every turn,
+        # so they outlive the history window.
         self.patient = {}
-        # Set when the user declines consent: the server then turns the mic off and
-        # tells the client to stop, ending the session until Start is pressed again.
+        # Set when the session is over — consent refused, aborted, or the
+        # protocol finished. The server reads it, drops the mic and tells the
+        # client to stop.
         self.ended = False
-        # Dynamic (non-cached) TTS+MuseTalk renders this session — the generation
-        # budget observable (T18). Fixed content contributes zero to THIS counter
-        # however it was produced.
+        # Renders of generated content this session, which is the observable the
+        # study caps. Fixed protocol lines never count toward it, however they
+        # were produced.
         self.dynamic_renders = 0
-        # Fixed utterances this session had to render because the clip cache was
-        # cold (the cache is RAM, so the first session after a restart pays for
-        # whatever the pre-warm hasn't reached yet). Counted separately: these
-        # are verbatim protocol lines, not generated content, and folding them
-        # into dynamic_renders would make T18 unreadable.
+        # Fixed lines this session had to render because the cache was still
+        # cold. Counted apart from dynamic_renders precisely so that they do not
+        # inflate the number above: these are verbatim protocol, not generation.
         self.fixed_renders = 0
-        # THE clinical state: protocol node, coded answers, deterministic
-        # scores/zones, readiness. The machine (modules/sbirt/runtime.py)
-        # decides every transition; the LLM never does.
+        # The clinical state: where the protocol is, what has been coded, the
+        # derived scores and zones. modules/sbirt/runtime.py owns every
+        # transition; the model never makes one.
         self.clinical = runtime.ClinicalSession()
         runtime.start(self.clinical)
         self._lock = threading.Lock()
-        # Serializes protocol turns: coding -> machine advance -> delivery.
-        # Two concurrent turns (voice + typed, or a barge-in racing a slow
-        # coder) must never both advance the clinical machine; the stale turn
-        # re-checks _aborted() under this lock and drops out.
+        # Serializes a whole protocol turn, from coding through delivery. A
+        # typed message racing a spoken one, or a barge-in racing a slow coder,
+        # must not both advance the machine; the loser re-checks _aborted()
+        # under this lock and withdraws.
         self._protocol_lock = threading.Lock()
         self._processing_thread = None
-        # Monotonic turn id: each new utterance bumps it. A response only touches
-        # shared state (enqueue video) while it still owns the current turn, so a
-        # barged-in response can't leak stale segments into the next turn even
-        # after cancel_event is cleared for the new turn.
+        # Incremented by every new utterance. A response may only touch shared
+        # state while it still owns the current turn, which is what stops an
+        # abandoned response from leaking segments into its replacement after
+        # cancel_event has been cleared for the new turn.
         self._turn = 0
-        # perf_counter() at the moment the user stopped speaking — the T0 for the
-        # latency waterfall logged through the rest of the turn.
-        self._t0 = 0.0
-        # Pause-split continuation merge (voice): remember the in-flight
-        # utterance's audio until the machine ACTS on its words; if new
-        # speech supersedes the turn first, that audio is prepended to the
-        # next speech_end so the whole sentence reaches ASR as one piece —
-        # instead of the first half silently vanishing. Guarded by its own
-        # lock: these ops run on the WS thread and must never block on
-        # _protocol_lock (held for seconds during LLM calls).
+        self._t0 = 0.0               # start of the turn, for the latency log
+        # Someone pausing mid-sentence trips the turn detector, and their second
+        # half then arrives as a separate utterance while the first is still in
+        # flight. Holding the first half here lets the two be merged so ASR sees
+        # one sentence, instead of the first half vanishing.
+        #
+        # Its own lock, because these run on the websocket thread and must never
+        # wait on _protocol_lock, which is held across LLM calls.
         self._carry_lock = threading.Lock()
-        self._pending_voice = None   # (turn id, audio) — unconsumed voice turn
-        self._carry_audio = None     # carried first half awaiting the merge
-        # Every Segment created for the CURRENT turn, so a barge-in can reach
-        # into the ones already handed to the poller and cancel them too —
-        # emptying video_queue alone would leave the segment being played right
-        # now streaming happily into a browser that has moved on.
+        self._pending_voice = None   # (turn id, audio) not yet acted on
+        self._carry_audio = None     # first half awaiting its continuation
+        # Segments belonging to the current turn, including ones already handed
+        # to the poller. Emptying video_queue alone would leave whichever
+        # segment is playing right now streaming into a browser that has already
+        # moved on.
         self._live_lock = threading.Lock()
         self._live: list[Segment] = []
 
@@ -413,23 +435,28 @@ class Pipeline:
         return seg
 
     def _enqueue(self, seg: Segment):
-        """Hand a segment to the poller. Called BEFORE its render finishes: the
-        poller forwards frames as they land, so delivery overlaps generation."""
+        """Hand a segment to the poller, normally before its render has finished.
+
+        The poller forwards frames as they land, so delivery overlaps
+        generation rather than waiting for it.
+        """
         seg._t_enqueue = time.perf_counter()
         self.video_queue.put(seg)
         self.state = "speaking"
 
     def _flush(self):
-        """Cascade flush — the whole response is abandoned, at every stage at once.
+        """Abandon the whole response at every stage at once.
 
-        Ordering matters. Cancelling the live segments FIRST makes every
-        in-flight MuseTalk render see its abort flag on the next batch (and the
-        next frame), and makes TTS drop its partial audio, so the GPU and the
-        network stop producing before the queue is emptied. Draining first would
-        leave the renderer busily filling queues nobody reads.
-
-        cancel_event (set by the caller) is what stops the LLM stream; this stops
+        The caller sets cancel_event, which stops the LLM stream; this stops
         everything downstream of it.
+
+        Order matters. Cancelling the live segments first makes every in-flight
+        render see its abort flag on the next batch, so the GPUs stop producing
+        before the queue is drained. Draining first would leave the renderers
+        busily filling queues nobody will ever read.
+
+        One synthesis already in flight cannot be stopped; its audio is
+        discarded when it arrives.
         """
         with self._live_lock:
             live, self._live = self._live, []
@@ -444,34 +471,43 @@ class Pipeline:
                 item.cancel()
 
     def _aborted(self, turn):
-        """True if this response was cancelled or superseded by a newer turn."""
+        """True if `turn` was cancelled or has been superseded by a newer one.
+
+        Checked at every point where a response would touch shared state, so
+        work from an abandoned turn cannot write into its replacement.
+        """
         return self.cancel_event.is_set() or turn != self._turn
 
     def _consume_utterance(self, turn):
-        """The machine is acting on this voice turn's words — no longer
-        carryable (a later barge-in must never double-process them)."""
+        """Mark this turn's audio as acted upon, so it can no longer be carried.
+
+        Past this point a later interruption must start a fresh turn rather than
+        merging these words into it a second time.
+        """
         with self._carry_lock:
             if self._pending_voice is not None and self._pending_voice[0] == turn:
                 self._pending_voice = None
 
     def _clear_carry(self):
-        """Abandon any pause-split fragment (Stop / typed input / fresh
-        session): a stale first half must never prepend to a later utterance."""
+        """Throw away any held sentence fragment.
+
+        Used on Stop, typed input and a new session: a stale first half must
+        never be prepended to an unrelated later utterance.
+        """
         with self._carry_lock:
             self._pending_voice = self._carry_audio = None
 
     def on_speech_start(self):
-        """Called by main.ws_audio when user starts speaking (barge-in)."""
-        # Someone is talking: the clip pre-warm must let go of its GPU now, not
-        # when the resulting turn is created a second or two from now.
+        """The user has begun speaking: abandon whatever the avatar was saying."""
+        # Release the pre-warm's GPU now, not when the resulting turn is created
+        # a second or two from here.
         note_activity()
         if self.state in ("processing", "speaking"):
             logger.info("Barge-in detected! Cancelling current response.")
-            # Continuation, not interruption: if the turn being cancelled is a
-            # voice utterance whose words were never consumed (still in
-            # ASR/NLU flight — the avatar hasn't acted on them), the person is
-            # finishing their own sentence after a pause the VAD read as a
-            # turn end. Carry that audio for the next speech_end.
+            # If the turn being cancelled was speech whose words have not been
+            # acted on yet, this is most likely the same person finishing a
+            # sentence after a pause the turn detector misread as an ending.
+            # Keep that audio so the two halves can be rejoined.
             with self._carry_lock:
                 pv = self._pending_voice
                 if pv is not None and pv[0] == self._turn:
@@ -479,31 +515,37 @@ class Pipeline:
                     logger.info("[continuation] pause-split: carrying the "
                                 "unconsumed first half into the next utterance")
             self.cancel_event.set()
-            self._turn += 1  # invalidate the in-flight response immediately
-            self._flush()    # LLM stream, TTS, MuseTalk, frame queues — all of it
-            # History is pipeline-owned; the in-flight producer's finally commits
-            # whatever was generated so far, so no truncation is needed here.
+            self._turn += 1  # invalidates the in-flight response at once
+            self._flush()
+            # No history repair is needed: the abandoned producer's finally
+            # commits whatever it generated before it stopped.
 
         self.state = "listening"
 
     def cancel_response(self):
-        """Stop any in-flight response immediately and end at idle (used by Stop and
-        by text-send interruption). Drops queued clips; leaves histories intact."""
+        """Stop any response in flight and settle at idle.
+
+        Used by Stop and by typed input. Queued clips are dropped; the
+        conversation history is left intact.
+        """
         if self.state in ("processing", "speaking"):
             self.cancel_event.set()
             self._turn += 1
             self._flush()
-        # An explicit Stop abandons any pause-split fragment too.
+        # An explicit stop discards a held fragment as well: it is not going to
+        # be continued.
         self._clear_carry()
         self.state = "idle"
 
     def on_speech_end(self, audio_array):
-        """Called by main.ws_audio when user finishes speaking.
-        audio_array: float32 numpy array at 16kHz.
+        """Start a turn from a finished utterance.
+
+        Args:
+            audio_array: float32 at 16kHz, the whole utterance.
         """
         self._t0 = time.perf_counter()
-        # Pause-split continuation: prepend the carried first half (if any)
-        # so ASR transcribes the whole utterance in one piece.
+        # Rejoin a held first half, so ASR transcribes one continuous sentence
+        # rather than two fragments that each read as nonsense.
         with self._carry_lock:
             if self._carry_audio is not None:
                 audio_array = np.concatenate([self._carry_audio, audio_array])
@@ -517,10 +559,9 @@ class Pipeline:
         with self._carry_lock:
             self._pending_voice = (turn, audio_array)
 
-        # Run processing in background thread. The turn is marked live HERE,
-        # not inside the thread, so the pre-warm stops taking new GPU work from
-        # this instant rather than one scheduling delay later; the thread's
-        # finally closes it.
+        # The turn is marked live here rather than inside the thread, so the
+        # pre-warm stops taking GPU work immediately instead of after a
+        # scheduling delay. The thread's finally closes it.
         _turn_begin()
         self._processing_thread = threading.Thread(
             target=self._process_speech, args=(audio_array, turn), daemon=True
@@ -528,10 +569,10 @@ class Pipeline:
         self._processing_thread.start()
 
     def on_speech_end_text(self, text):
-        """Text input: skip ASR and feed text directly into pipeline."""
+        """Start a turn from typed text, skipping ASR."""
         self._t0 = time.perf_counter()
-        # Typing supersedes any pause-split voice fragment: never prepend a
-        # stale first half to a LATER voice utterance.
+        # Typing supersedes a held spoken fragment; merging the two would
+        # produce an utterance the person never made.
         self._clear_carry()
         self.state = "processing"
         self.cancel_event.clear()
@@ -544,13 +585,13 @@ class Pipeline:
         )
         self._processing_thread.start()
 
-    # ---------- Proactive greeting (counselor leads the conversation) ----------
     def start_greeting(self):
-        """Kick off the counselor's opening turn with NO user input, so the avatar
-        greets and asks the first SBIRT question instead of waiting to be spoken
-        to. Runs the same synthesis path as a normal turn."""
+        """Open the conversation with no user input, so the counselor leads.
+
+        Runs the same delivery path as any other turn.
+        """
         self._t0 = time.perf_counter()
-        self._clear_carry()   # a fresh session never inherits a voice fragment
+        self._clear_carry()   # a new session inherits nothing from the last
         self.state = "processing"
         self.cancel_event.clear()
         self._turn += 1
@@ -562,9 +603,12 @@ class Pipeline:
         self._processing_thread.start()
 
     def _process_greeting(self, turn):
-        """Deliver the fixed opening from the cached clip — no LLM/TTS/MuseTalk. Records
-        it as the assistant's first turn so the conversation flows straight into the
-        user's yes/no consent reply."""
+        """Speak the opening line and start the protocol at the consent question.
+
+        Normally costs nothing: the line is fixed, so it comes from the cache
+        rather than the LLM, TTS and renderer. Recording it as the assistant's
+        first turn is what makes the user's reply read as an answer to it.
+        """
         try:
             if self._aborted(turn):
                 self.state = "idle"
@@ -572,22 +616,21 @@ class Pipeline:
             text = config.GREETING_TEXT
             key = config.GREETING_CLIP_KEY
             seg = fixed_segment(text, key)
-            # Record the fixed opening as the assistant's first turn in both histories.
             self._history_set_assistant(text)
-            # Fresh protocol run: the machine starts at the consent expectation.
+            # Greeting means a new run, so the machine restarts at consent.
             self.clinical = runtime.ClinicalSession()
             runtime.start(self.clinical)
             if seg and not self._aborted(turn):
                 self._enqueue(seg)
                 self.video_queue.put(None)
             elif not self._aborted(turn):
-                # Cache miss — the pre-warm hasn't reached the greeting yet (or
-                # the cache was cleared). Render it now, which caches it for
-                # every later session; the first frame still streams out fast.
+                # The pre-warm has not reached the greeting yet. Rendering it
+                # here also caches it for every later session, and frames still
+                # stream out as they are produced.
                 if self._speak_dynamic(text, turn, cache_key=key) is not None:
                     self.video_queue.put(None)
                 else:
-                    # Render failed too — the text greeting still shows.
+                    # Even the render failed; the greeting is still on screen.
                     self.state = "idle"
             else:
                 self.state = "idle"
@@ -598,8 +641,11 @@ class Pipeline:
             _turn_end()
 
     def _deliver_decline(self, user_text, turn):
-        """User declined consent: record their reply + the FIXED thank-you line, play
-        the cached decline clip, and end the turn. No screening, no dynamic LLM."""
+        """Consent was refused: speak the fixed closing line and end the session.
+
+        No screening and no generated content on this path — the wording is
+        fixed so that a refusal is always answered identically.
+        """
         self._history_begin(user_text)          # record the user's "no"
         text = config.DECLINE_TEXT
         key = config.DECLINE_CLIP_KEY
@@ -609,31 +655,34 @@ class Pipeline:
             self._enqueue(seg)
             self.video_queue.put(None)
         elif not self._aborted(turn):
-            # Cache miss: render the fixed line now (and cache it) rather than
-            # end the session on silence.
+            # Render it now rather than end the session on silence.
             if self._speak_dynamic(text, turn, cache_key=key) is not None:
                 self.video_queue.put(None)
             else:
                 self.state = "idle"
         else:
             self.state = "idle"
-        # Consent declined: end the session (the server turns the mic off + tells the
-        # client to stop) now that the goodbye clip is queued for delivery.
+        # Safe to end now that the closing line is queued: the client plays it
+        # out before it resets.
         self.ended = True
 
     def _deliver_crisis(self, user_text, hit, turn):
-        """Deterministic crisis net fired: speak the FIXED response for the
-        category from its cached clip — no LLM anywhere on this path — and stay
-        in the conversation (the counselor's crisis protocol owns later turns).
-        Falls back to the normal TTS+MuseTalk render if the cached clip is missing,
-        and to on-screen text if even that fails; the fixed TEXT always lands in
-        both histories either way."""
+        """Speak the fixed response for a detected crisis and stay engaged.
+
+        No model is involved anywhere on this path: the wording for each
+        category is fixed, so what a person in crisis hears cannot vary. If the
+        clip is uncached it is rendered; if even that fails the text is still on
+        screen, because it reaches the history before any of this can fail.
+
+        The session continues afterwards under the crisis protocol rather than
+        the screening one.
+        """
         logger.warning("[crisis] deterministic net fired: category=%s pattern=%s",
-                       hit.category, hit.pattern)  # no user text in the log
-        self._consume_utterance(turn)   # acting on these words: no longer carryable
+                       hit.category, hit.pattern)  # deliberately no user text
+        self._consume_utterance(turn)
         self._history_begin(user_text)
-        # Pause the clinical protocol permanently for this session; later
-        # turns run the full counselor with the crisis protocol.
+        # Suspends the screening for the rest of the session; there is no path
+        # back into it.
         runtime.enter_crisis(self.clinical)
         text = crisis.RESPONSES[hit.category]
         key = crisis_clip_key(hit.category)
@@ -643,8 +692,7 @@ class Pipeline:
             self._enqueue(seg)
             self.video_queue.put(None)
         elif not self._aborted(turn):
-            # Cache miss (e.g. pre-warm hasn't reached it): render it now rather
-            # than stay silent — and cache it for the rest of the process.
+            # Render it rather than stay silent, and cache it while we are here.
             if self._speak_dynamic(text, turn, cache_key=key) is not None:
                 self.video_queue.put(None)
             else:
@@ -652,27 +700,28 @@ class Pipeline:
         else:
             self.state = "idle"
 
-    # ---------- History management (ONE history; API view derived) ----------
-    # chat_history is the single conversation record. What the LLM API sees is
-    # derived from it on demand (_api_window): the most recent
-    # LLM_HISTORY_MAX_MESSAGES entries, never starting on an assistant turn.
-    # One list, no lockstep invariant to break on barge-in or LLM errors.
+    # There is one conversation record, and what the model sees is derived from
+    # it on demand. Keeping a second, parallel list for the API would introduce
+    # an invariant that a barge-in or a failed call could break.
     def _api_window(self):
-        """The sliding-window suffix of chat_history sent to the LLM API.
-        Caller must hold self._lock."""
+        """The trailing slice of the history to send to the model.
+
+        Caller must hold self._lock.
+        """
         win = [dict(m) for m in
                self.chat_history[-config.LLM_HISTORY_MAX_MESSAGES:]]
         if win and win[0]["role"] == "assistant":
-            del win[0]   # never orphan a reply from its user prompt
+            del win[0]   # a reply whose prompt was trimmed away misleads
         return win
 
     def _history_begin(self, user_text):
-        """Append the user turn and return the API message list. If the
-        previous turn's user message is still unanswered (e.g. speech split by
-        a pause into two segments, so the first half hasn't been replied to
-        yet), MERGE the new text into it — never drop it. This preserves
-        everything the user said, reassembles the paused sentence into one
-        turn, and still avoids sending two user messages in a row to the API."""
+        """Record the user's turn and return the messages to send the model.
+
+        When the previous user message is still unanswered — speech split by a
+        pause, so the first half never got a reply — the new text is merged into
+        it. That preserves everything the person said, reassembles the sentence,
+        and avoids sending two consecutive user messages to the API.
+        """
         with self._lock:
             hist = self.chat_history
             if hist and hist[-1]["role"] == "user":
@@ -683,15 +732,14 @@ class Pipeline:
                 hist.append({"role": "user", "content": user_text})
             window = self._api_window()
             messages = llm.build_messages(window, dict(self.patient))
-        # Fire-and-forget structured extraction to keep the patient profile current.
-        # Runs off the hot path (never blocks TTS/display) and applies to the NEXT
-        # turn's prompt, so age/sex/screening facts survive history-window trimming.
+        # Deliberately not awaited: extraction costs an API call and only
+        # affects the next turn's prompt, so it must never delay this one.
         threading.Thread(target=self._extract_patient, args=(window,),
                          name="patient-extract", daemon=True).start()
         return messages
 
     def _extract_patient(self, history_snapshot):
-        """Merge any newly-extracted patient facts into the profile (background)."""
+        """Merge newly extracted patient facts into the profile. Runs in the background."""
         facts = llm.extract_patient_facts(history_snapshot)
         if not facts:
             return
@@ -703,8 +751,11 @@ class Pipeline:
         logger.info("[patient] profile now: %s", phi_keys(self.patient))
 
     def _history_set_assistant(self, text):
-        """Create or update the current assistant turn (display and API memory
-        are the same list, so they can never disagree)."""
+        """Start or overwrite the assistant's current turn.
+
+        Overwriting rather than appending is what lets a sentence-by-sentence
+        reply grow in place as it streams, instead of arriving as fragments.
+        """
         with self._lock:
             hist = self.chat_history
             if hist and hist[-1]["role"] == "assistant":
@@ -713,9 +764,8 @@ class Pipeline:
                 hist.append({"role": "assistant", "content": text})
 
     def _process_speech(self, audio_array, turn):
-        """Full pipeline: ASR → LLM stream → TTS+MuseTalk (pipelined) → video queue."""
+        """Run one spoken turn end to end, in a background thread."""
         try:
-            # Step 1: ASR
             if self._aborted(turn):
                 self.state = "idle"
                 return
@@ -732,16 +782,15 @@ class Pipeline:
                 self.state = "idle"
                 return
 
-            # Crisis safety net FIRST (overrides everything, incl. the consent
-            # gate): deterministic patterns, unioned with the LLM's own protocol.
+            # Runs before everything, including the consent gate: a disclosure
+            # of self-harm must not wait on a screening question. The model has
+            # its own crisis check, and the two are used together rather than
+            # either being trusted alone.
             hit = crisis.detect(user_text)
             if hit:
                 self._deliver_crisis(user_text, hit, turn)
                 return
 
-            # Every other turn goes through the clinical state machine: the
-            # coder maps the words onto the expected input, the machine decides
-            # the transition, the LLM at most phrases bounded utterances.
             self._protocol_turn(user_text, turn)
 
         except Exception as e:
@@ -751,19 +800,17 @@ class Pipeline:
             _turn_end()
 
     def _process_text(self, user_text, turn):
-        """Text-only pipeline: skip ASR, go straight to LLM → TTS+MuseTalk (pipelined)."""
+        """Run one typed turn. Identical to _process_speech without the ASR step."""
         try:
             if self._aborted(turn):
                 self.state = "idle"
                 return
 
-            # Crisis safety net FIRST (same as the voice path).
             hit = crisis.detect(user_text)
             if hit:
                 self._deliver_crisis(user_text, hit, turn)
                 return
 
-            # Same protocol path as the voice turns.
             self._protocol_turn(user_text, turn)
 
         except Exception as e:
@@ -772,11 +819,12 @@ class Pipeline:
         finally:
             _turn_end()
 
-    # ---------- Protocol turns: coder -> state machine -> bounded rendering ----------
-
     def _current_question(self):
-        """(question_text, options) for the machine's current option
-        expectation, from the structured instrument data."""
+        """(text, options) for the item currently being asked, or (None, None).
+
+        Read from the instrument data rather than from anything spoken, so it is
+        the question as authored.
+        """
         exp = self.clinical.expect
         if exp.kind != "option":
             return None, None
@@ -787,9 +835,12 @@ class Pipeline:
         return item.text, item.options
 
     def _last_question_text(self):
-        """The most recent question the avatar asked (context for the NLU
-        turn call): last fixed Say of the current pause, else the assistant's
-        last spoken text (compose asks), else the greeting's consent ask."""
+        """What the avatar most recently asked, as context for classifying a reply.
+
+        Prefers the protocol's own fixed wording, falls back to whatever the
+        assistant last said, and finally to the consent question — which is the
+        only thing that can have been asked before any step exists.
+        """
         step = self.clinical.last_step
         if step:
             for utt in reversed(step.utterances):
@@ -802,10 +853,12 @@ class Pipeline:
         return "May I ask you some questions about your health?"
 
     def _turn_facts(self):
-        """Grounding for the NLU turn's replies: ONLY what the machine knows
-        deterministically. This is what lets a user's question ('have we
-        discussed the standard drink?') be answered honestly from state
-        instead of re-asking the machine's own question."""
+        """The only factual source the model may draw on when replying.
+
+        Everything here is deterministic state, never model output. That is what
+        lets a question like "have we covered what a standard drink is?" be
+        answered honestly rather than guessed at or deflected.
+        """
         c = self.clinical
         facts = {
             "current_phase": c.node,
@@ -815,18 +868,15 @@ class Pipeline:
             "permissions_declined_so_far": list(c.declined),
             "active_topic": c.arm,
         }
-        # Content of the education actually delivered, so a "you spoke too
-        # fast / say that again" turn can honestly re-give the key facts
-        # instead of ignoring the request (the facts block is the reply's
-        # ONLY permitted factual source).
+        # The actual wording of any education already delivered, so that "say
+        # that again" can repeat the real content instead of deflecting.
         for unit_key, fact_key in (
                 ("alcohol.edu.standard_drink", "standard_drink_definition"),
                 ("alcohol.edu.limits", "recommended_drinking_limits")):
             if unit_key in c.covered:
                 facts[fact_key] = templates.FIXED[unit_key]
-        # Mid-instrument: what they already answered, so a correction turn
-        # ("actually it's more like three times a week") can name its target
-        # item (T21). Deterministic state only — item text + coded label.
+        # What has already been answered on the current instrument, so that a
+        # correction can identify which item it refers to.
         exp = c.expect
         if (exp.kind == "option" and exp.instrument
                 and exp.instrument != "prescreen"):
@@ -839,20 +889,24 @@ class Pipeline:
         return facts
 
     def _protocol_turn(self, user_text, turn):
-        """ONE NLU+voice call classifies the utterance relative to the current
-        ask (answer / continuation / question / tangent / crisis / unclear),
-        codes it if it is an answer, and produces this turn's bounded reply.
-        Only a VALIDATED answer advances the deterministic machine; every
-        other action holds position (T12). The whole turn is serialized under
-        _protocol_lock so a superseded turn can never advance the machine
-        after a newer one already has."""
+        """Classify one utterance, act on it, and speak the result.
+
+        A single model call decides what the utterance is relative to the
+        question on the table — an answer, a continuation, a question, an aside,
+        a correction, a refusal, a crisis, or unclear — and codes it if it is an
+        answer. Only a validated answer moves the machine; every other outcome
+        holds position and re-poses the ask.
+
+        Serialized, so that a superseded turn cannot advance the machine after
+        its replacement already has.
+        """
         with self._protocol_lock:
             if self._aborted(turn):
                 return
             clinical = self.clinical
 
-            # In-crisis sessions: the protocol stays paused; every turn runs the
-            # full counselor (its prompt carries the complete crisis protocol).
+            # Once in crisis the screening never resumes; every remaining turn
+            # is handled by the full counselor.
             if clinical.crisis:
                 self._consume_utterance(turn)
                 messages = self._history_begin(user_text)
@@ -863,7 +917,8 @@ class Pipeline:
             exp = clinical.expect
             if exp.kind == "end":
                 self._consume_utterance(turn)
-                # Session already closed/declined; stay warm, done.
+                # The session is over but the person is still talking; answer
+                # warmly rather than ignoring them.
                 return self._deliver_step(user_text, runtime.Step(
                     clinical.node, (runtime.LLMSay(
                         "The screening session is already complete. In one warm "
@@ -881,21 +936,18 @@ class Pipeline:
                            interview_state=state_view.render_interview_state(
                                clinical))
 
-            # The NLU may have taken a slow LLM round-trip; if a newer turn
-            # started meanwhile (barge-in, typed message), don't touch the
-            # machine — an unconsumed voice utterance stays carryable so a
-            # pause-split continuation can merge it (modules/carry.py).
+            # That call may have taken seconds, so a newer turn may have started
+            # in the meantime. Returning here leaves the utterance unconsumed
+            # and therefore still available to be merged with a continuation.
             if self._aborted(turn):
                 return
-            # Committing to act on these words: from here on, new speech is a
-            # fresh turn (or a real barge-in), never a continuation-merge.
+            # Past this point the words have been acted on, so anything new is a
+            # separate turn rather than the rest of this sentence.
             self._consume_utterance(turn)
 
             if out.action == "crisis":
-                # NLU-flagged crisis (union with the deterministic net, which
-                # already ran in _process_speech/_process_text): pause the
-                # protocol permanently; this and every later turn follow the
-                # crisis protocol.
+                # The model's own crisis judgement, used alongside the pattern
+                # check that already ran; either one firing is enough.
                 logger.warning("[crisis] NLU flagged crisis at node %s",
                                clinical.node)
                 runtime.enter_crisis(clinical)
@@ -903,20 +955,18 @@ class Pipeline:
                     user_text, runtime.crisis_step(clinical), turn)
 
             if out.action == "abort":
-                # T22: the user wants to stop the whole session. Close
-                # gracefully with the fixed goodbye (no retention attempt),
-                # keep everything coded so far, and end the session like a
-                # consent decline (mic off via `ended`).
+                # The person wants to stop entirely. Close with the fixed
+                # goodbye and make no attempt to keep them; what was coded so
+                # far is retained.
                 step = runtime.enter_abort(clinical)
                 self._deliver_step(user_text, step, turn)
                 self.ended = True
                 return
 
             if out.action == "correction":
-                # T21: overwrite the earlier item, let skips/score re-derive,
-                # re-pose the (possibly changed) current item. An inapplicable
-                # target (not an answered item of the active instrument)
-                # holds and clarifies instead of moving anything.
+                # Overwrite the earlier answer and let skips and scores
+                # re-derive. A correction that does not name an answered item of
+                # the current instrument moves nothing and asks which was meant.
                 try:
                     step = runtime.correct(clinical, out)
                 except InvalidResponse:
@@ -929,79 +979,84 @@ class Pipeline:
 
             if out.action == "answer":
                 if exp.ask_key == "consent.opening":
-                    # THE study consent (the greeting's ask) -> audit trail.
+                    # The study consent decision itself, which is the one thing
+                    # that has to be recorded outside the session.
                     privacy.record_consent(
                         self.audit_key, "yes" if out.code == 1 else "no")
                 if exp.kind == "confirm":
-                    # T20: verdict on the read-back — yes commits the held
-                    # code, no re-collects the same item.
+                    # Their verdict on a read-back: yes commits the held code,
+                    # no re-asks the same item.
                     step = runtime.resolve_confirm(clinical,
                                                    yes=(out.code == 1))
                     return self._deliver_step(user_text, step, turn,
                                               ack=out.reply)
                 reason = runtime.confirm_reason(clinical, out)
                 if reason is not None:
-                    # T20/F5: the read-back is the exception — it fires only
-                    # when a conversion assumption entered the coding, the
-                    # value sat near a bucket edge, the answer contradicts an
-                    # earlier one, or nothing deterministic vouches for a
-                    # semantic code on a score-critical item.
+                    # Reading an answer back is the exception, not the rule: it
+                    # happens only where a mistake would change a score — a unit
+                    # conversion was assumed, the value sits on a bucket edge,
+                    # it contradicts an earlier answer, or nothing deterministic
+                    # vouches for the code.
                     step = runtime.request_confirm(clinical, out, reason)
                     return self._deliver_step(user_text, step, turn,
                                               ack=out.reply)
                 try:
                     step = runtime.advance(clinical, out)
                 except (runtime.ProtocolError, InvalidResponse):
-                    # A wiring bug must not strand the user: log loudly, then
-                    # re-ask instead of guessing or going silent.
+                    # A bug in the protocol wiring must not strand the person
+                    # mid-screening: log it loudly and re-ask.
                     logger.exception("protocol advance failed; re-asking")
                     return self._hold(user_text, "", turn)
                 if clinical.node == "declined":
-                    # Machine recorded the decline; the fixed decline path
-                    # speaks it and ends the session (mic off via `ended`).
                     return self._deliver_decline(user_text, turn)
                 return self._deliver_step(user_text, step, turn,
                                           ack=out.reply)
 
             if out.action == "continuation":
-                # The two-breath answer: fold it into the previous capture,
-                # keep the machine exactly where it is, and let the reply
-                # re-pose the pending ask (never a duplicate re-question).
+                # An answer delivered in two breaths. Fold it into the previous
+                # capture and hold position, so the person is not asked the same
+                # thing twice.
                 runtime.absorb(clinical, out)
                 return self._hold(user_text, out.reply, turn)
 
             if out.action == "dont_know":
-                # T25/F1: probe ONCE with the manual's recall anchor, then
-                # take the missing-data exit (F2) — never a re-ask loop.
+                # One assisted-recall attempt, then record the item as missing.
+                # Bounded on purpose: repeating the question is worse than
+                # having no answer for it.
                 if runtime.note_stall(clinical) >= runtime.DONT_KNOW_LIMIT:
                     return self._deliver_missing(user_text, "dont_know", turn)
                 return self._hold_probe(user_text, turn)
 
             if out.action == "unclear":
-                # F2: clarifications are finite — at the limit the item is
-                # recorded as unanswered and the protocol moves on.
+                # Clarification attempts are finite for the same reason: at the
+                # limit the item is recorded unanswered and the protocol moves on.
                 if runtime.note_stall(clinical) >= runtime.UNCLEAR_LIMIT:
                     return self._deliver_missing(user_text, "no_answer", turn)
                 return self._hold(user_text, out.reply, turn)
 
-            # question / tangent: machine holds position; the reply
-            # answers/acknowledges and re-poses the current ask.
+            # Questions and asides: answer or acknowledge, then re-pose the
+            # current ask without moving.
             return self._hold(user_text, out.reply, turn)
 
     def _deliver_missing(self, user_text, reason, turn):
-        """F2's guaranteed terminus: mark the current pause missing and let
-        the protocol continue (an unanswerable consent gate degrades to its
-        decline path, which may end the session)."""
+        """Record the current item as unanswered and carry on.
+
+        This is what guarantees no question can loop forever. A consent gate
+        that cannot be answered degrades to its refusal path, which may end the
+        session.
+        """
         step = runtime.mark_missing(self.clinical, reason)
         if self.clinical.node == "declined":
             return self._deliver_decline(user_text, turn)
         return self._deliver_step(user_text, step, turn)
 
     def _hold_probe(self, user_text, turn):
-        """First dont_know at a pause: ONE assisted-recall attempt per the
-        WHO manual (p.18 — help the person estimate, anchored to their
-        heaviest period in the past year), always with the skip offer so
-        declining again is easy. The machine does not move."""
+        """Help the person estimate an answer they say they do not know.
+
+        One attempt only, following the WHO manual (p.18): anchor them to their
+        heaviest period in the past year, and always offer to skip so that
+        declining a second time is easy. The machine does not move.
+        """
         exp = self.clinical.expect
         if exp.kind == "option":
             q, _ = self._current_question()
@@ -1018,7 +1073,7 @@ class Pipeline:
                 "say it doesn't have to be exact and ask for whatever "
                 "number from 0 to 10 feels closest — or offer to skip it.")
         else:
-            # Gates and read-backs: re-pose the pending ask as-is.
+            # A gate or a read-back has nothing to estimate; just ask again.
             return self._deliver_step(
                 user_text, runtime.repeat_step(self.clinical), turn)
         return self._deliver_step(
@@ -1028,9 +1083,12 @@ class Pipeline:
             turn)
 
     def _hold(self, user_text, reply, turn):
-        """Speak a bounded hold-turn WITHOUT touching the machine: the NLU's
-        reply if it produced one, else a deterministic re-ask built from the
-        current expectation (the guess-free fallback when the model failed)."""
+        """Reply without moving the protocol.
+
+        Uses the model's reply when it produced one, and otherwise builds a
+        re-ask from the current expectation — so a failed model call still gets
+        a sensible question rather than silence.
+        """
         exp = self.clinical.expect
         if reply:
             utterance = runtime.Speak(reply)
@@ -1060,23 +1118,27 @@ class Pipeline:
             turn)
 
     def _speak_dynamic(self, text, turn, cache_key=None):
-        """TTS + streamed MuseTalk for an utterance the clip cache didn't have;
-        the Segment, or None on failure/cancel.
+        """Synthesize and render one utterance that was not already cached.
 
-        The segment is enqueued BEFORE the render runs, which is the whole
-        latency win: the poller starts forwarding frames after the first UNet
-        batch while this thread is still generating the rest. It then blocks
-        until the render finishes, so utterances stay strictly in order.
+        Args:
+            text: the sentence to speak.
+            turn: the turn that owns this work.
+            cache_key: set when the text is a fixed line the caller found
+                missing from the cache. Its frames are then collected and
+                stored, so a fixed line costs at most one render per process.
 
-        `cache_key` marks the text as FIXED — the caller found it missing from
-        the cache. The frames are then collected as they stream and the finished
-        clip is stored, so a fixed line costs at most ONE render per process even
-        if the pre-warm never got to it. Only a render that ran to completion is
-        cached: a barge-in leaves a truncated frame list, and replaying half an
-        utterance forever is far worse than re-rendering it.
+        Returns:
+            The Segment, or None if synthesis failed or the turn was abandoned.
 
-        Counts dynamic renders (T18): generated content increments
-        dynamic_renders, a cold fixed line increments fixed_renders."""
+        Enqueued before rendering rather than after, which is where the latency
+        win comes from: the poller starts forwarding frames after the first
+        batch while this thread is still producing the rest. It then blocks
+        until the render ends, which is what keeps utterances in order.
+
+        Only a completed render is cached. An interrupted one leaves truncated
+        frames, and half an utterance replaying forever is far worse than
+        rendering it again.
+        """
         if cache_key is None:
             self.dynamic_renders += 1
             logger.info("[latency] dynamic render #%d this session",
@@ -1096,20 +1158,26 @@ class Pipeline:
         render_into(seg, audio, abort=seg.cancelled.is_set, collect=frames)
         if (cache_key and not seg.cancelled.is_set() and not self._aborted(turn)
                 and (frames or not config.ENABLE_VIDEO_AVATAR)):
-            # Adopt the blob this segment is already playing from rather than
-            # storing the same mp3 a second time.
+            # Reuse the audio this segment is already playing from, instead of
+            # storing a second copy of identical bytes.
             clipcache.put_clip(cache_key, clip_stamp(text), audio, frames,
                                token=clipcache.token_from_url(seg.audio_url))
         return seg
 
     def _deliver_step(self, user_text, step, turn, ack=""):
-        """Speak one machine step: fixed utterances come from the shared clip
-        cache (rendered once, reused across sessions); Speak utterances are
-        pre-resolved dynamic text (the NLU turn's acknowledgment); LLMSay
-        utterances are phrased by the bounded LLM then rendered. Enqueued
-        strictly in order. `ack` (when the turn was an answer) is prepended
-        as its own short Speak so the person hears they were heard BEFORE the
-        next protocol content."""
+        """Speak everything one machine step calls for, in order.
+
+        A step is a sequence of utterances of three kinds: fixed protocol lines,
+        which come from the shared cache; text the turn already produced; and
+        instructions the model must word before they can be spoken.
+
+        Args:
+            user_text: what the person said, recorded before anything is spoken.
+            step: the step to deliver.
+            turn: the turn that owns this work.
+            ack: a brief acknowledgment, spoken first so the person hears they
+                were heard before the next question arrives.
+        """
         self._history_begin(user_text)
         self.state = "processing"
         utterances = step.utterances
@@ -1119,16 +1187,14 @@ class Pipeline:
         for utt in utterances:
             if self._aborted(turn):
                 return
-            # `seg` is None for a cached line whose text still has to be spoken
-            # by the dynamic path below; `pending` marks that case. Fixed lines
-            # are already complete when fixed_segment() returns, dynamic ones
-            # stream while _speak_dynamic blocks.
+            # A fixed line arrives complete from the cache; everything else has
+            # to be synthesized below, which `pending` marks.
             seg, pending, clip_key = None, False, None
             if isinstance(utt, runtime.Say):
                 text = utt.text
                 clip_key = protocol_clip_key(utt.key)
                 seg = fixed_segment(text, clip_key)
-                pending = seg is None       # cache miss -> render it below
+                pending = seg is None
             elif isinstance(utt, runtime.Speak):
                 text = utt.text
                 if not text.strip():
@@ -1140,12 +1206,13 @@ class Pipeline:
                     patient = dict(self.patient)
                 text = llm.phrase_utterance(utt.instruction, history, patient)
                 if not text.strip():
-                    continue          # bounded utterance failed -> skip, protocol continues
+                    continue          # skip it; the protocol still advances
                 pending = True
             if self._aborted(turn):
                 return
             spoken.append(text)
-            # Text lands in the chat even if this clip failed to render.
+            # Written before it is spoken, so a failed render still leaves the
+            # words on screen.
             self._history_set_assistant(" ".join(spoken))
             if seg is not None:
                 self._enqueue(seg)
@@ -1155,36 +1222,35 @@ class Pipeline:
             self.video_queue.put(None)
             self.state = "speaking"
             if step.expect.kind == "end":
-                # Terminal node (flow.End): the close was just queued, so the
-                # session is OVER — end it the same way a consent decline does
-                # (server drops the mic, client stops capturing and resets to
-                # Start once the goodbye finishes playing). Without this the
-                # counselor said its goodbye and then kept listening forever,
-                # and every further utterance burnt an LLM+TTS turn on the
-                # "session is already complete" reply below.
+                # The closing line is queued, so the session is finished. Without
+                # this the counselor says goodbye and then keeps listening, and
+                # every further remark costs a full turn to answer with "the
+                # session is already complete".
                 self.ended = True
 
     def _run_crisis_synthesis(self, messages, turn):
-        """CRISIS turns only — the sole remaining full-LLM synthesis path (every
-        normal turn goes through the clinical protocol instead). Streams
-        sentences from the LLM (chat text appears live in
-        <1s) AND render each sentence's TTS+MuseTalk concurrently across the whole
-        GPU pool, while enqueuing strictly in sentence order.
+        """Speak a free-form counselor reply, used only on the crisis path.
 
-        A producer thread pulls sentences off the LLM stream and submits each as a
-        TTS->MuseTalk job to a pool sized to len(MUSETALK_GPUS); this consumer reads the
-        resulting futures IN ORDER and enqueues the finished clips. So sentence 1
-        starts playing after just 1 TTS + 1 MuseTalk render, while sentences 2..N are already
-        rendering on the other GPUs -> no stall between segments.
+        Every other turn goes through the clinical protocol; this is the one
+        place the model still writes a whole answer.
+
+        Sentences are produced, synthesized and rendered concurrently but
+        enqueued strictly in order. A producer thread pulls sentences off the
+        stream and submits each as a job to a pool sized to the GPU count, while
+        this thread consumes the results in sequence. So the first sentence
+        starts playing after one synthesis and one render, with the rest already
+        under way on the other GPUs.
         """
         futures_q = queue.Queue()
         SENTINEL = object()
         n_gpus = max(1, len(config.MUSETALK_GPUS))
 
         def _render(seg, idx):
-            """Fill one segment on a pool thread. The consumer announces it the
-            moment `seg.started` fires (audio ready), so frames stream out of
-            here while this is still running."""
+            """Fill one segment on a pool thread.
+
+            The consumer announces the segment as soon as its audio exists, so
+            frames stream to the browser while this is still running.
+            """
             if self._aborted(turn) or config.SHUTTING_DOWN.is_set():
                 seg.cancel()
                 return
@@ -1194,14 +1260,12 @@ class Pipeline:
                 seg.cancel()
                 return
             t_render0 = time.perf_counter()
-            # The mp3 IS the segment's audio, not an intermediate: render_into
-            # publishes it to clipcache and the browser fetches it from there.
             render_into(seg, audio, abort=seg.cancelled.is_set)
             logger.info("[latency] seg %d rendered: tts=%.2fs render=%.2fs",
                         idx, t_render0 - t_tts0, time.perf_counter() - t_render0)
 
         def _producer(executor):
-            """Pull sentences off the LLM stream, submit renders, update chat live."""
+            """Read sentences as they stream, submit each to render, update the chat."""
             full_response = ""
             try:
                 for idx, sentence in enumerate(
@@ -1215,21 +1279,19 @@ class Pipeline:
                     full_response += sentence
                     logger.info("LLM sentence: %s", phi(sentence))
 
-                    # Live update BOTH histories so display and API memory agree.
                     self._history_set_assistant(full_response)
 
-                    # The Segment is created HERE, on the ordering thread, so
-                    # the consumer can hold it before the render has begun.
+                    # Created on this thread, in sentence order, so the consumer
+                    # holds it before its render has even started.
                     seg = self._new_segment(sentence)
                     futures_q.put((executor.submit(_render, seg, idx), seg))
             except Exception:
                 logger.exception("streaming producer failed")
             finally:
-                # Finalize history only if we still own the turn. If superseded
-                # (barge-in, or a follow-on utterance after a pause), the newer turn
-                # now owns the histories — don't touch them here, and NEVER delete
-                # the user's message. A produced-nothing turn just leaves its user
-                # message, which the next turn merges into (see _history_begin).
+                # Only finalize if this turn still owns the history; a newer one
+                # has taken it over otherwise. The user's message is never
+                # removed — a turn that produced nothing leaves it for the next
+                # turn to merge into.
                 if full_response.strip() and not self._aborted(turn):
                     self._history_set_assistant(full_response)
                 futures_q.put(SENTINEL)
@@ -1241,8 +1303,8 @@ class Pipeline:
             )
             producer.start()
 
-            # Consume render futures strictly in order (sentences i+1.. render in
-            # parallel while we wait on sentence i).
+            # Strictly in order: later sentences keep rendering in parallel
+            # while this waits on the current one.
             while True:
                 item = futures_q.get()
                 if item is SENTINEL:
@@ -1251,19 +1313,19 @@ class Pipeline:
                 if self._aborted(turn):
                     fut.cancel()
                     seg.cancel()
-                    continue  # keep draining to SENTINEL so the producer finishes
-                # Announce as soon as the AUDIO exists, not when the render is
-                # done — that is what lets sentence i stream while i+1 renders on
-                # another GPU. Waiting on `started` OR the future completing
-                # covers the TTS-failed case, where `started` never fires.
+                    continue  # keep draining, or the producer blocks forever
+                # Waiting for audio rather than for the whole render is what
+                # lets one sentence play while the next is still on the GPU.
+                # Also watching the future covers a failed synthesis, where the
+                # audio never arrives at all.
                 while not seg.started.wait(0.02):
                     if fut.done() or self._aborted(turn) or config.SHUTTING_DOWN.is_set():
                         break
                 if not seg.started.is_set() or self._aborted(turn):
                     seg.cancel()
-                    # A single sentence's TTS/MuseTalk failing must NOT abort the
-                    # whole turn (which would skip the video_end sentinel below and
-                    # freeze the avatar on its last frame). Skip it and continue.
+                    # One failed sentence must not abandon the turn: that would
+                    # skip the end-of-response sentinel below and leave the
+                    # avatar frozen on its last frame.
                     continue
                 self._enqueue(seg)
                 if first_seg:
@@ -1278,35 +1340,32 @@ class Pipeline:
             self.state = "speaking"
 
     def get_next_video(self):
-        """Non-blocking: get next video from queue.
+        """Take the next segment for delivery, without blocking.
 
         Returns:
-            a Segment, or None if the queue is empty, or False if the response
-            is complete.
+            A Segment; None if nothing is ready yet; False once the whole
+            response has been delivered. The three are distinct because "not
+            yet" and "finished" mean opposite things to the poller.
         """
         try:
             item = self.video_queue.get_nowait()
             if item is None:
-                # End of response
                 self.state = "idle"
                 return False
             return item
         except queue.Empty:
             return None
 
-    def mark_playback_done(self):
-        """Called when frontend finishes playing all videos."""
-        if self.video_queue.empty() and self.state == "speaking":
-            self.state = "idle"
-
     def get_chat_history(self):
-        """Return current chat history for display."""
+        """A snapshot of the conversation, safe to serialize while it mutates."""
         return list(self.chat_history)
 
     def reset(self):
-        """Reset everything."""
+        """Clear the conversation and the clinical state, back to a new session."""
         self.cancel_event.set()
-        self._turn += 1  # invalidate any in-flight response
+        self._turn += 1
+        # Give in-flight threads a moment to notice the cancellation before the
+        # state they are reading is torn out from under them.
         time.sleep(0.1)
         self.cancel_event.clear()
         self.chat_history.clear()

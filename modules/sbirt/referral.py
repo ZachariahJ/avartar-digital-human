@@ -1,8 +1,11 @@
-"""Referral to Treatment content (the "RT" in SBIRT) + safety net.
+"""Where to send someone, and what to do when screening must stop.
 
-For moderate-to-high risk: the ASAM levels of care, medication-assisted
-treatment (MAT) options, concrete national resources, the warm-handoff steps,
-and the crisis protocol that overrides everything else.
+Reference content for the referral end of SBIRT: levels of care, medications,
+national resources and how to hand somebody over, plus the crisis situations
+that take priority over any of it.
+
+Rendered into the system prompt. The executable crisis detection lives in
+crisis.py; this is the guidance the model works from once that has fired.
 """
 
 from __future__ import annotations
@@ -17,10 +20,12 @@ class LevelOfCare:
     fits: str
 
     def render(self) -> str:
+        """This level as prompt text."""
         return f"  • ASAM {self.code} — {self.name}: {self.fits}"
 
 
-# ASAM continuum — match intensity to severity, don't over- or under-refer.
+# Matching intensity to severity matters in both directions: over-referring is
+# a failure as much as under-referring.
 ASAM_LEVELS = (
     LevelOfCare("0.5", "Early intervention", "At-risk use, no diagnosis yet; education + brief intervention."),
     LevelOfCare("1.0", "Outpatient", "Mild severity; <9 hrs/week counseling."),
@@ -30,7 +35,8 @@ ASAM_LEVELS = (
     LevelOfCare("4.0", "Medically managed intensive inpatient", "Acute withdrawal or medical instability."),
 )
 
-# Medication-assisted treatment — normalize it; it is first-line, not a last resort.
+# First-line treatment, not a last resort, and widely believed otherwise — hence
+# the final entry, which exists to pre-empt that objection.
 MAT_OPTIONS = (
     "Opioid use: buprenorphine, methadone, or extended-release naltrexone.",
     "Alcohol use: naltrexone, acamprosate, or disulfiram.",
@@ -38,7 +44,8 @@ MAT_OPTIONS = (
     "Frame MAT as evidence-based medicine, not 'trading one addiction for another'.",
 )
 
-# National, always-available resources to hand off to.
+# National and always available, so a handoff never depends on knowing where the
+# person is.
 RESOURCES = (
     "SAMHSA National Helpline: 1-800-662-HELP (4357) — free, confidential, 24/7.",
     "FindTreatment.gov — searchable treatment locator.",
@@ -47,7 +54,8 @@ RESOURCES = (
     "988 Suicide & Crisis Lifeline (call or text 988).",
 )
 
-# Warm handoff beats a phone number on a napkin — connection while motivation is live.
+# Motivation is perishable: a connection made now beats a phone number to call
+# later.
 WARM_HANDOFF = (
     "Ask permission before referring.",
     "Offer a specific, named next step (not just 'see a counselor').",
@@ -63,7 +71,9 @@ class CrisisFlag:
     response: str
 
 
-# Safety FIRST: any of these OVERRIDES the SBIRT workflow — stop screening.
+# Any of these stops the screening outright. Note that withdrawal is on the list
+# because abrupt cessation can kill, which makes "just quit" actively dangerous
+# advice rather than merely unhelpful.
 CRISIS_PROTOCOL = (
     CrisisFlag("Suicidal ideation / self-harm / intent",
                "Empathy + urgency; give 988 and 911; do not leave it as a casual topic."),

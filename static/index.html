@@ -4,14 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SBIRT Counselor</title>
-<!-- Server-injected settings (main._app_config); must precede the app script. -->
+<!-- Filled in by the server before the page is sent; the app script reads it. -->
 <!--APP_CONFIG-->
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html { background: #1a1a2e; height: 100%; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; height: 100vh; }
 
-/* Split view: the counselor column, and an optional side panel holding the
+/* Two columns: the conversation, and an optional panel holding the
    tester's case card in an iframe. The panel is a SEPARATE document — see
    the sandbox note on the <iframe> below. */
 .split { display: flex; height: 100vh; justify-content: center; }
@@ -20,7 +20,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 body.with-card .card-panel { display: block; }
 .card-panel iframe { width: 100%; height: 100%; border: 0; display: block; }
 
-/* Under ~1080px the two columns (560 + 460) stop fitting: fall back to
+/* Below the width the two columns need, fall back to
    opening the card in its own window instead of splitting the screen. */
 @media (max-width: 1080px) { body.with-card .card-panel { display: none; } }
 
@@ -29,18 +29,18 @@ body.with-card .card-panel { display: block; }
 
 .main { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
 
-/* Avatar panel — top, centered */
+/* The avatar, above the transcript. */
 .avatar-panel { display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; flex: 0 0 auto; padding: 16px 0 10px; }
 .video-container { position: relative; width: 280px; height: 280px; }
 .video-container video, .video-container canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 12px; background: #111; }
-/* The idle loop sits UNDER the canvas and never stops running, so "returning to
+/* The idle loop sits under the canvas and never stops, so returning to
    idle" is a fade of the canvas rather than a swap of a source. That is what
    makes a barge-in land on a moving, listening face instead of freezing on
    whatever half-open mouth the last decoded frame happened to be. */
 #idleVideo { z-index: 0; opacity: 1; }
 #stage { z-index: 1; opacity: 0; transition: opacity 0.14s ease-out; }
 #stage.speaking { opacity: 1; }
-/* Voice-only mode: the <video> elements still drive playback (an audio-only
+/* Voice-only still uses the video elements to drive playback (an audio-only
    source fires canplay/ended exactly like an mp4), they just have nothing to
    show, so the still portrait sits on top of them. */
 #portrait { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
@@ -48,7 +48,7 @@ body.with-card .card-panel { display: block; }
 body.audio-only #portrait { display: block; }
 .subtitle-bar { width: 100%; max-width: 500px; text-align: center; padding: 8px 16px; font-size: 0.95em; min-height: 32px; color: #ccc; }
 
-/* Chat panel — bottom, scrollable */
+/* The transcript, below the avatar. */
 .chat-panel { flex: 1; display: flex; flex-direction: column; border-top: 1px solid #0f3460; min-height: 0; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 10px 16px; }
 .msg { margin-bottom: 8px; padding: 8px 12px; border-radius: 8px; max-width: 80%; word-wrap: break-word; font-size: 0.9em; }
@@ -56,7 +56,7 @@ body.audio-only #portrait { display: block; }
 .msg.assistant { background: #16213e; border: 1px solid #0f3460; }
 .msg .role { font-size: 0.7em; color: #888; margin-bottom: 2px; }
 
-/* Controls */
+/* Start, stop and the typed-input toggle. */
 .controls { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid #0f3460; }
 .controls button { padding: 6px 14px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.8em; font-weight: 600; }
 .btn-start { background: #e94560; color: white; }
@@ -64,7 +64,7 @@ body.audio-only #portrait { display: block; }
 .btn-clear { background: #333; color: #ccc; }
 .controls button:hover { opacity: 0.85; }
 .controls button:active { transform: translateY(1px); }
-/* Typed input — alternates with the mic (see the `typing` flag in the script). */
+/* Typed input, which replaces the mic controls while it is open. */
 .text-input { flex: 1; min-width: 0; padding: 7px 10px; border-radius: 6px; border: 1px solid #0f3460; background: #16213e; color: #e0e0e0; font-family: inherit; font-size: 0.85em; }
 .text-input::placeholder { color: #667; }
 .text-input:focus { outline: none; border-color: #4ecca3; }
@@ -111,7 +111,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
 
 </div><!-- /.app-col -->
 
-<!-- The tester's case card, in its own document. `sandbox` WITHOUT
+<!-- The tester's case card, in its own document. Sandboxed WITHOUT
      allow-same-origin puts the frame on an opaque origin, so this page cannot
      read its DOM even by accident: card text is unreachable from the code that
      talks to the server. allow-scripts is the only capability the card needs. -->
@@ -123,7 +123,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
 
 <script>
 (function() {
-  // ============ Elements ============
+  // Elements
   const idleVideo = document.getElementById('idleVideo');
   const stage = document.getElementById('stage');
   const speech = document.getElementById('speech');
@@ -138,8 +138,8 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   const cardFrame = document.getElementById('cardFrame');
   const portrait = document.getElementById('portrait');
 
-  // Injected by the server (see main._app_config). The fallback keeps the file
-  // usable if it is ever served without the substitution.
+  // Injected by the server. The fallback keeps this file usable if it is ever
+  // opened without that substitution having happened.
   const APP_CONFIG = window.APP_CONFIG || {};
   const VIDEO_AVATAR = APP_CONFIG.videoAvatar !== false;
   const IDLE_VIDEO_URL = APP_CONFIG.idleUrl || '/video/assets/loop.mp4';
@@ -172,16 +172,17 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   }
   const SID_Q = '?sid=' + encodeURIComponent(SESSION_ID);
 
-  // ============ Streaming canvas player ============
-  // An utterance ("segment") arrives as ONE audio file plus a live stream of
-  // JPEG frames. The <audio> element is THE clock: every animation frame we draw
-  // frame floor(currentTime * fps). Nothing is muxed, no container is ever
-  // restarted mid-utterance, and the audio never pauses for the video to catch
-  // up — so the sub-second chunks MuseTalk emits produce no seams and no clicks.
+  // Playback.
   //
-  // The idle loop is a plain looping <video> UNDERNEATH the canvas, always
-  // running. Showing speech fades the canvas in; a barge-in fades it out onto a
-  // face that is already moving.
+  // An utterance arrives as one audio file plus a stream of JPEG frames. The
+  // audio element is the clock: each animation frame draws whichever frame the
+  // current playback time calls for. Nothing is muxed and no container is
+  // restarted mid-utterance, so the sub-second batches the renderer emits
+  // produce no seams and no clicks.
+  //
+  // Underneath the canvas an idle video loops continuously and is never
+  // stopped. Speaking fades the canvas in over it; an interruption fades it
+  // out — onto a face that is already moving, rather than a frozen frame.
   const SEG_FPS_FALLBACK = 24;
   const segQueue = [];       // announced, still filling / waiting their turn
   let playing = null;        // the segment currently on the canvas
@@ -218,13 +219,13 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     return !!playing || segQueue.length > 0;
   }
 
-  // ---- frame intake (binary WS messages) ----
+  // Frame intake.
   function handleFrame(buf) {
     const dv = new DataView(buf);
     const seg = segById(dv.getUint32(0));
-    // A frame for an utterance we already abandoned. This is the client half of
-    // the cascade flush: the server stops sending, but whatever was already on
-    // the wire still arrives, and it must not be painted over the idle loop.
+    // A frame for an utterance already abandoned. The server stops sending on
+    // an interruption, but whatever was in flight still arrives, and painting
+    // it would put a stale face over the idle loop.
     if (!seg || seg.dropped) return;
     const idx = dv.getUint32(4);
     createImageBitmap(new Blob([new Uint8Array(buf, 8)], { type: 'image/jpeg' }))
@@ -237,11 +238,11 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       .catch(() => {});
   }
 
-  // ---- playback ----
+  // Playback control.
   function maybeStart() {
-    // Start only the head of the queue, and only once enough frames are buffered
-    // that the render is comfortably ahead of the clock. Starting the audio early
-    // cannot be undone: it would run past the frames and desync the lips.
+    // Wait for a buffer before starting. Starting the audio cannot be undone —
+    // it would run ahead of the frames and the lips would fall out of sync for
+    // the rest of the utterance.
     if (playing || !segQueue.length) return;
     const seg = segQueue[0];
     if (!seg.done && seg.have < seg.prebuffer) return;
@@ -261,19 +262,19 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     drawn = null;
     if (segQueue.length) { maybeStart(); return; }
     if (responseEnded) toIdle();
-    // Otherwise hold the last frame: more of this response is still rendering.
+    // Hold the last frame; more of this response is still coming.
   }
 
   speech.addEventListener('ended', finishSegment);
-  // A missing/expired audio file must never freeze the avatar mid-response.
+  // Audio that fails to load must not leave the avatar frozen mid-response.
   speech.addEventListener('error', () => { if (playing) finishSegment(); });
 
   function drawTick() {
     requestAnimationFrame(drawTick);
     if (!playing || !playing.frames.length) return;
     const i = Math.floor(speech.currentTime * playing.fps);
-    // Hold the previous frame when the renderer is momentarily behind, rather
-    // than blanking: audio keeps running and the next frame catches up.
+    // Hold the previous frame rather than blanking when the renderer falls
+    // momentarily behind: the audio keeps running and it catches up.
     const bmp = playing.frames[i];
     if (!bmp || bmp === drawn) return;
     if (stage.width !== bmp.width || stage.height !== bmp.height) {
@@ -312,13 +313,12 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     maybeStart();               // a short utterance may not have hit prebuffer
   }
 
-  // ---- the client half of the cascade flush ----
+  // Interruption.
   function interruptPlayback() {
-    // Barge-in / stop / reset. Drop every buffered frame and every queued
-    // utterance (the jitter buffer, in effect), cut the audio, and fade back to
-    // the idle loop — which has been running underneath the whole time, so this
-    // is a dissolve onto a moving face, never a hard cut and never a freeze on
-    // an open-mouth frame.
+    // Drop every buffered frame and queued utterance, cut the audio, and fade
+    // back to the idle loop. Because that loop has been running underneath the
+    // whole time, this dissolves onto a moving face instead of cutting to a
+    // still one caught mid-word.
     for (const s of segQueue) dropSeg(s);
     segQueue.length = 0;
     if (playing) { dropSeg(playing); playing = null; }
@@ -331,16 +331,16 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     toIdle();
   }
 
-  // Start with idle
+
   startIdle();
 
-  // ============ State WebSocket ============
+  // Server messages.
   let stateWs = null;
 
   function connectStateWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     stateWs = new WebSocket(proto + '//' + location.host + '/ws/state' + SID_Q);
-    // The same socket carries JSON control messages and binary video frames.
+    // One socket carries both control messages and video frames.
     stateWs.binaryType = 'arraybuffer';
     stateWs.onopen = () => console.log('[State] WS connected');
     stateWs.onclose = () => {
@@ -364,29 +364,29 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     } else if (msg.type === 'segment_end') {
       endSegment(msg.id);
     } else if (msg.type === 'flush') {
-      // Instant barge-in. This arrives straight off the audio socket's detection
-      // path, not on the poll tick, so it lands ahead of the 'state' message
-      // below — drop everything now rather than a poll interval later.
+      // Sent the moment speech is detected rather than on the next poll, so it
+      // arrives ahead of the state change below. Acting on it here is what
+      // makes the interruption feel immediate.
       interruptPlayback();
       statusBar.textContent = 'Listening...';
     } else if (msg.type === 'video_end') {
-      // Response complete. Whatever is still buffered plays out, then the player
-      // dissolves to idle on its own (finishSegment → toIdle).
+      // The response is complete. What is buffered still plays out, and the
+      // player returns to idle by itself once it drains.
       responseEnded = true;
       if (!isPlayingSpeech()) toIdle();
     } else if (msg.type === 'state') {
       const s = msg.state || 'idle';
       if (s === 'listening') {
-        // User started speaking (barge-in): stop the current answer at once.
+        // They have started speaking; stop the current answer.
         interruptPlayback();
         statusBar.textContent = 'Listening...';
       }
       else if (s === 'processing') statusBar.textContent = 'Processing...';
       else if (s === 'speaking') { /* keep current subtitle status */ }
       else {
-        // The server goes idle BEFORE the browser finishes playing buffered clips.
-        // Only announce "ready" once playback has actually drained; otherwise the
-        // swap-to-idle in swapToPreload will set it at the right moment.
+        // The server finishes before the browser does, so announcing readiness
+        // here would be premature while audio is still playing. If it is,
+        // playback sets it once it drains.
         if (!isPlayingSpeech()) {
           statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
         }
@@ -397,10 +397,9 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       interruptPlayback();
       statusBar.textContent = 'Click Start to begin';
     } else if (msg.type === 'stop') {
-      // The server ended the session — consent declined, the user asked to stop,
-      // or the protocol ran to its close. Stop capturing and reset to Start, but
-      // do NOT interrupt playback — let the goodbye clip finish, then it
-      // dissolves to idle on its own. The next Start begins a fresh session.
+      // The session is over. Stop capturing and reset the controls, but leave
+      // playback alone so the closing line finishes; cutting somebody off on
+      // the goodbye is worse than a moment of dead air.
       sessionEnded = true;
       if (micActive) {
         stopMic();
@@ -408,9 +407,8 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
         btnStart.textContent = 'Start';
         btnStart.classList.remove('active');
       }
-      // The text box closes even if the mic was never on: the session is over
-      // server-side, so anything typed now only draws the "already complete"
-      // reply — an LLM turn spent telling the person there is nothing left to do.
+      // Closed even if the mic was never on. The session is over server-side,
+      // so anything typed now earns only the "already complete" reply.
       disableTextInput();
     }
   }
@@ -427,12 +425,11 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     return div;
   }
 
-  // Apply an incremental chat update. The server sends only the changed suffix
-  // (msg.from = first changed index, msg.msgs = messages from there on). We
-  // reconcile in place: the streaming assistant bubble's TEXT is updated on its
-  // existing node (so text selection isn't wiped and there's no flicker); nodes are
-  // only created/replaced when the role differs. Scrollback is preserved unless the
-  // user is already at the bottom.
+  // Apply an incremental transcript update. The server sends only the changed
+  // tail, and it is reconciled in place: a message still streaming has its text
+  // updated on the existing node rather than being replaced, which avoids
+  // flicker and does not wipe a selection the reader has made. Scroll position
+  // is left alone unless they were already at the bottom.
   function applyChatDelta(msg) {
     const from = msg.from | 0;
     const atBottom = chatMessages.scrollTop + chatMessages.clientHeight
@@ -458,7 +455,7 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
 
   connectStateWS();
 
-  // ============ Audio Capture ============
+  // Microphone capture.
   let audioWs = null;
   let audioCtx = null;
   let mediaStream = null;
@@ -482,19 +479,18 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
-          // `exact`, not `ideal`. Echo cancellation is load-bearing here: the mic
-          // stays open while the avatar speaks, and barge-in works by running ASR
-          // on what it hears (BARGE_IN_ASR in config.py). As an `ideal` hint a
-          // browser could silently hand back an uncancelled stream and nothing on
-          // this side could tell — `exact` makes getUserMedia reject instead, so
-          // the failure is loud and lands before the session starts.
+          // exact rather than ideal, because echo cancellation is load-bearing:
+          // the mic stays open while the avatar talks, and without cancellation
+          // the avatar interrupts itself. As a hint, a browser could hand back
+          // an uncancelled stream and nothing here could detect it; as a
+          // requirement, the failure is loud and arrives before the session.
           echoCancellation: { exact: true },
           noiseSuppression: { ideal: true },
         }
       });
 
-      // `exact` covers the constraint being unsatisfiable; this covers the rest.
-      // What actually got applied is now visible instead of assumed.
+      // The constraint above catches a browser that cannot comply. Logging what
+      // was actually applied catches everything else.
       const settings = mediaStream.getAudioTracks()[0].getSettings();
       console.log('[Audio] echoCancellation:', settings.echoCancellation,
                   ' noiseSuppression:', settings.noiseSuppression);
@@ -522,10 +518,9 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
 
       micSource = audioCtx.createMediaStreamSource(mediaStream);
       micSource.connect(micNode);
-      // A worklet only runs while something downstream pulls it, so the node has
-      // to reach the destination — through a silent gain, or the mic would go
-      // straight back out of the speakers. (Same trick, and the same reason, as
-      // the ScriptProcessor this replaces.)
+      // A worklet only runs while something downstream pulls from it, so it has
+      // to reach the destination — but through a silenced gain node, or the
+      // microphone would come straight back out of the speakers.
       micSink = audioCtx.createGain();
       micSink.gain.value = 0;
       micNode.connect(micSink);
@@ -554,16 +549,16 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     if (audioWs) { audioWs.close(); audioWs = null; }
   }
 
-  // ============ Button handlers ============
+  // Controls.
   btnStart.addEventListener('click', async () => {
     if (!micActive) {
-      // If the previous session ended by a consent decline, Start begins fresh:
-      // clear the server conversation so the greeting fires again.
+      // The previous session ended, so clear the server's conversation before
+      // starting; otherwise the greeting does not fire again.
       if (sessionEnded) {
         sessionEnded = false;
         await fetch('/api/reset' + SID_Q, { method: 'POST' });
       }
-      // Toggle mic on server
+
       const resp = await fetch('/api/toggle' + SID_Q, { method: 'POST' });
       const data = await resp.json();
       if (data.mic === 'on') {
@@ -574,13 +569,14 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
           btnStart.classList.add('active');
           statusBar.textContent = 'Listening…';
           textInput.disabled = false;
-          // Unmute video after user interaction
+          // Autoplay policy: unmuting is only permitted after an interaction.
           speech.muted = false;
-          // Counselor leads: greet now that the mic is confirmed live. (Kept
-          // separate from the toggle so a denied mic or a Clear never greets.)
+          // Greet only now that the mic is confirmed live. Tying this to the
+          // toggle instead would also greet on a denied mic.
           fetch('/api/greet' + SID_Q, { method: 'POST' });
         } else {
-          // Mic denied — revert the server toggle so no phantom greeting fires.
+          // Permission refused, so undo the server-side toggle; leaving it on
+          // would let a later request greet into a session with no microphone.
           await fetch('/api/toggle' + SID_Q, { method: 'POST' });
         }
       }
@@ -596,10 +592,10 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
     }
   });
 
-  // ============ Text input ============
-  // Enabled only while the mic session is live, so a typed turn always lands in a
-  // session that has already greeted. The user's message is NOT rendered locally:
-  // it comes back through the state WS chat delta, same as a spoken turn.
+  // Typed input, available only while a session is live so that a typed turn
+  // always lands in one that has already greeted. The message is not drawn
+  // locally: it comes back through the transcript update like a spoken one, so
+  // there is only ever one source for what is on screen.
   function disableTextInput() {
     typing = false;
     textInput.value = '';
@@ -622,21 +618,20 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   textInput.addEventListener('focus', () => { typing = true; });
   textInput.addEventListener('blur', () => { typing = false; });
   textInput.addEventListener('keydown', (e) => {
-    // isComposing/229 guard: Enter that commits an IME candidate must not send.
+    // Enter that commits an input-method candidate must not send the message.
     if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
     e.preventDefault();
     sendText();
   });
 
-  // ============ Case card side panel ============
-  // Opens the tester's card beside the conversation so nobody has to switch
-  // tabs mid-interview. Collapsing only hides the panel — the frame is never
-  // torn down and its src is never reset, so a card already drawn survives.
+  // The case card panel, beside the conversation so nobody has to switch tabs
+  // mid-interview. Collapsing hides it without tearing down the frame or
+  // clearing its source, so a card already filled in survives being closed.
   const SPLIT_MIN_WIDTH = 1081;   // 560 (app) + 460 (panel) + margin
 
   btnCard.addEventListener('click', () => {
     if (window.innerWidth < SPLIT_MIN_WIDTH) {
-      // Too narrow to split: give it its own window instead.
+      // Too narrow to split; give it its own window.
       window.open('/static/case_card.html', 'casecard',
                   'width=560,height=900,noopener');
       return;
@@ -646,10 +641,9 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
   });
 
   btnClear.addEventListener('click', async () => {
-    // api_reset already disables the mic server-side and returns the mic state, so
-    // we must NOT issue a second /api/toggle here (that flipped the server back ON,
-    // desyncing the toggle so the next Start was a silent no-op, and — with greeting
-    // tied to the toggle — fired a phantom greeting). Just tear down locally.
+    // The reset endpoint already turns the mic off server-side and reports the
+    // resulting state. Toggling as well would turn it back on, leaving the two
+    // sides disagreeing and the next Start doing nothing.
     await fetch('/api/reset' + SID_Q, { method: 'POST' });
     chatState = [];
     chatMessages.innerHTML = '';

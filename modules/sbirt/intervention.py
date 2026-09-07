@@ -1,11 +1,11 @@
-"""Brief Intervention content (the "BI" in SBIRT).
+"""How to talk to someone at moderate risk: the motivational interviewing toolkit.
 
-Motivational Interviewing (MI) scaffolding the counselor must use for moderate
-risk: the MI spirit (PACE), micro-skills (OARS), the FRAMES brief-intervention
-model, Prochaska/DiClemente stages of change with a matched strategy for each,
-the 0–10 readiness rulers, and change-talk cues (DARN-CAT).
+The stance, the micro-skills, the brief-intervention model, the stages of change
+with a strategy matched to each, the readiness rulers and the change-talk cues
+that predict someone actually changing.
 
-All plain data so the clinical technique set can be maintained in one place.
+Plain data, rendered into the system prompt. This is what the counselor knows
+about conducting a conversation, not what it is required to do.
 """
 
 from __future__ import annotations
@@ -20,13 +20,15 @@ class Technique:
     example: str = ""
 
     def render(self) -> str:
+        """This technique as prompt text, with its example when it has one."""
         line = f"  • {self.name}: {self.detail}"
         if self.example:
             line += f'  e.g. "{self.example}"'
         return line
 
 
-# MI spirit — the stance underneath every reflection.
+# The underlying stance. Everything below is technique; this is what stops the
+# technique reading as manipulation.
 MI_SPIRIT = (
     Technique("Partnership", "Collaborate; the user is the expert on their own life, not a passive patient."),
     Technique("Acceptance", "Absolute worth, accurate empathy, autonomy support, affirmation."),
@@ -34,7 +36,8 @@ MI_SPIRIT = (
     Technique("Evocation", "Draw motivation OUT of the user rather than installing it from outside."),
 )
 
-# OARS — the core micro-skills. Exactly one per turn keeps it conversational.
+# The core micro-skills. One per turn: stacking them turns a conversation into
+# an interrogation.
 OARS = (
     Technique("Open questions", "Invite elaboration, not yes/no.",
               "What worries you most about your drinking?"),
@@ -46,7 +49,7 @@ OARS = (
               "Let me pull that together — you've noticed X, you're worried about Y..."),
 )
 
-# FRAMES — the evidence-based brief-intervention checklist.
+# The evidence-based checklist for a brief intervention.
 FRAMES = (
     Technique("Feedback", "Give personal, non-judgmental feedback tied to the screen result."),
     Technique("Responsibility", "Emphasize the choice to change is theirs alone."),
@@ -67,7 +70,8 @@ class Stage:
         return f"  • {self.name} — sounds like: {self.marker}\n      do: {self.strategy}"
 
 
-# Transtheoretical stages of change + the matched MI strategy for each.
+# Where somebody is determines what helps: advice aimed at the wrong stage
+# reliably produces resistance rather than progress.
 STAGES_OF_CHANGE = (
     Stage("Pre-contemplation", "No problem; not considering change.",
           "Raise awareness gently, offer info with permission, avoid pushing. Plant a seed."),
@@ -81,7 +85,8 @@ STAGES_OF_CHANGE = (
           "Support relapse prevention, celebrate wins, plan for high-risk situations."),
 )
 
-# The three MI rulers. Asking the follow-up ("why not lower?") pulls change talk.
+# The follow-up is the point of the ruler, not the number: asking why they are
+# not lower makes the person argue for their own change.
 READINESS_RULERS = (
     Technique("Importance ruler", "On 0–10, how important is changing this?",
               "You said 6 — why a 6 and not a 3?"),
@@ -91,7 +96,8 @@ READINESS_RULERS = (
               "What would need to be true for that number to climb?"),
 )
 
-# DARN-CAT — listen for and reinforce these; they predict actual change.
+# These predict actual change, so they are worth reinforcing wherever they
+# appear.
 CHANGE_TALK = (
     Technique("Desire", "Wanting change.", "I wish I didn't need it to sleep."),
     Technique("Ability", "Confidence in changing.", "I quit once before, so I could again."),
@@ -102,14 +108,15 @@ CHANGE_TALK = (
     Technique("Taking steps", "Already acting.", "I poured them out this morning."),
 )
 
-# The safe way to give information inside MI without lecturing.
+# How to give information without it landing as a lecture.
 ELICIT_PROVIDE_ELICIT = (
     "ASK permission and what they already know",
     "PROVIDE one small piece of neutral information",
     "ASK what they make of it",
 )
 
-# Respond to 'sustain talk'/pushback by rolling with it — never argue.
+# Arguing back entrenches the position being argued for, so pushback is met
+# rather than contradicted.
 ROLL_WITH_RESISTANCE = (
     "Do NOT argue for change — arguing hardens the other side.",
     "Reflect the resistance (simple, amplified, or double-sided reflection).",

@@ -1,3 +1,20 @@
+"""Every call this project makes to a language model.
+
+Three distinct jobs, deliberately kept apart because they fail differently:
+
+  * turn() — the one constrained call per user utterance. It classifies what
+    the person said relative to the question on the table and codes it. Its
+    output is always gated by turn.validate, so a bad model response holds the
+    protocol in place rather than corrupting a screening.
+  * phrase_utterance() — wording for a single utterance the protocol has
+    already decided to deliver.
+  * chat_stream() / chat() / extract_patient_facts() — open-ended generation,
+    now reached only on the crisis path and by background profile extraction.
+
+The clinical protocol lives in modules/sbirt/ and is decided by code. Nothing
+here chooses what to ask, what a score is, or where a session goes next.
+"""
+
 import json
 import logging
 import re
@@ -9,13 +26,15 @@ from modules.sbirt.turn import validate as validate_turn
 
 logger = logging.getLogger(__name__)
 
-# Lazily built so an empty/misconfigured OPENROUTER_API_KEY doesn't crash the
-# whole server at import time (OpenAI('') raises on construction).
+# Built on first use, not at import: OpenAI("") raises, so a missing or
+# misconfigured API key would otherwise take the whole server down at startup
+# instead of failing the first request that needs a model.
 _client_obj = None
 _client_lock = threading.Lock()
 
 
 def _client() -> OpenAI:
+    """The shared API client, constructed on first use."""
     global _client_obj
     if _client_obj is None:
         with _client_lock:
@@ -28,12 +47,13 @@ def _client() -> OpenAI:
 
 
 def build_messages(history: list[dict], patient: dict | None = None) -> list[dict]:
-    """Build the API message list: system prompt (plus any known patient facts) on
-    top, then a snapshot of the caller-owned conversation history.
+    """Assemble a message list: system prompt, known patient facts, then history.
 
-    The patient profile is injected fresh EVERY turn, independent of the history
-    window, so key facts (age, sex, screening answers) survive the sliding-window
-    trim and the model never loses them even after old turns scroll out."""
+    The patient profile is re-injected on every turn rather than left in the
+    conversation, because the history is a sliding window: facts established
+    early would otherwise scroll out and the model would start re-asking for
+    things it had already been told.
+    """
     system = config.SYSTEM_PROMPT
     if patient:
         system += ("\n\n=== KNOWN PATIENT (persists for the whole session) ===\n"
@@ -56,9 +76,12 @@ _EXTRACT_SYSTEM = (
 
 
 def extract_patient_facts(history: list[dict]) -> dict:
-    """Best-effort structured extraction of patient facts from recent conversation.
-    Returns {} on ANY failure — this is a non-critical add-on that must never break
-    a turn (it runs off the hot path and only updates the profile for next turn)."""
+    """Pull whatever structured facts the recent conversation supports.
+
+    Returns {} on any failure, including a malformed response. This runs in the
+    background and its result only affects the next turn's prompt, so failing
+    quietly is correct — it must never be able to break a turn in progress.
+    """
     convo = "\n".join(f"{m['role']}: {m.get('content', '')}" for m in history[-8:])
     if not convo.strip():
         return {}
@@ -81,9 +104,10 @@ def extract_patient_facts(history: list[dict]) -> dict:
 
 
 def chat(messages: list[dict]) -> str:
-    """Non-streaming completion. `messages` is the full API message list (system +
-    history + current user) built by the caller. This function does NOT mutate any
-    history — the caller (Pipeline) owns and updates the conversation state."""
+    """One non-streaming completion for a caller-built message list.
+
+    Stateless: the Pipeline owns the conversation and nothing here mutates it.
+    """
     response = _client().chat.completions.create(
         model=config.LLM_MODEL,
         messages=messages,
@@ -93,11 +117,18 @@ def chat(messages: list[dict]) -> str:
 
 def chat_stream(messages: list[dict],
                 cancel_event: threading.Event | None = None):
-    """Yield complete sentences as they arrive from the LLM stream.
+    """Yield whole sentences as the model produces them.
 
-    `messages` is the full API message list built by the caller. This function is
-    pure: it does NOT touch any history — the caller accumulates the yielded
-    sentences and owns the conversation state. Checks cancel_event between chunks.
+    Args:
+        messages: the complete message list, built by the caller.
+        cancel_event: polled between chunks; when set, the stream is closed and
+            iteration ends.
+
+    Yields:
+        One complete sentence at a time, so the caller can start synthesizing
+        the first while the rest is still generating.
+
+    Stateless: the caller accumulates what it receives and owns the history.
     """
     stream = _client().chat.completions.create(
         model=config.LLM_MODEL,
@@ -106,17 +137,18 @@ def chat_stream(messages: list[dict],
     )
 
     buffer = ""
-    # Split ONLY on sentence-final punctuation so each spoken clip is a whole
-    # sentence. The system prompt's short-acknowledgment-first rule keeps the first
-    # clip short enough for a fast start without sub-sentence (comma) splitting.
+    # Sentence-final punctuation only. Splitting at commas as well would start
+    # the audio sooner, but every split becomes a separate synthesis and render,
+    # which shows up as a silence gap and a lip-sync seam at each one. The system
+    # prompt instead asks for a short opening sentence, which gets the same fast
+    # start at no cost.
     sentence_endings = {"。", "！", "？", ".", "!", "?", "\n"}
 
     for chunk in stream:
         if cancel_event and cancel_event.is_set():
-            # Close the response, don't just stop reading it. Breaking out alone
-            # leaves the SSE connection open and the model still generating (and
-            # still billing) into a socket nobody drains — the barge-in flush is
-            # supposed to STOP the work, not abandon it.
+            # Close it rather than just breaking out. Abandoning the iterator
+            # leaves the connection open and the model generating — and billing —
+            # into a socket nobody reads.
             try:
                 stream.close()
             except Exception:
@@ -129,7 +161,8 @@ def chat_stream(messages: list[dict],
         if delta:
             buffer += delta
 
-            # Extract ALL complete sentences from the buffer.
+            # One delta can complete more than one sentence, so drain rather
+            # than checking once.
             while True:
                 split_pos = -1
                 for i, ch in enumerate(buffer):
@@ -145,19 +178,16 @@ def chat_stream(messages: list[dict],
                 if sentence:
                     yield sentence
 
-    # Flush remaining buffer
+    # A final sentence with no terminating punctuation would otherwise be lost.
     if buffer.strip() and not (cancel_event and cancel_event.is_set()):
         yield buffer.strip()
 
 
-# =====================================================================
-# Constrained NLU (P4 -> T4): free text -> ONE validated TurnOut per turn.
-# The coder NEVER guesses: quantities/timeframes the user did not state
-# route to a clarification, not to a code (case-card AUDIT item 10 rule).
-# Deterministic pre-matching handles the unambiguous fast path with zero
-# LLM latency; everything semantic goes through ONE turn() call whose
-# output is gated by turn.validate before it can move anything.
-# =====================================================================
+# Coding a screening answer must never involve a guess: a quantity or timeframe
+# the person did not actually state has to become a clarifying question, not a
+# code, or the resulting score is invalid. Unambiguous short answers are matched
+# deterministically here at no latency; everything else goes through one turn()
+# call whose output is validated before it can move the protocol.
 
 AMBIGUOUS = "AMBIGUOUS"
 
@@ -171,9 +201,13 @@ _WORD_NUMBERS = {
 _DIGIT_RE = re.compile(r"\b(10|[0-9])\b")
 
 def _prematch_option(options, text: str):
-    """Deterministic pre-pass: exact label/alias match, and yes/no shortcuts
-    for binary No/Yes items (short utterances only — a longer reply may carry
-    a question or a caveat the LLM must see). Returns a code or None."""
+    """Code an option answer without a model call, or None if it is not obvious.
+
+    Matches an option's label or alias exactly, plus yes/no shortcuts on binary
+    items. The length limit on those shortcuts matters: a longer reply that
+    merely starts with "yes" may carry a question or a caveat that the model
+    needs to see.
+    """
     t = " ".join(text.strip().lower().split())
     if not t:
         return None
@@ -190,9 +224,13 @@ def _prematch_option(options, text: str):
 
 
 def code_number(user_text: str, low: int = 0, high: int = 10) -> dict:
-    """Code a spoken 0-10 ruler answer. Deterministic digit/word scan first;
-    exactly one distinct in-range number -> that value, else AMBIGUOUS.
-    (No LLM: a readiness number the user didn't clearly say must be re-asked.)"""
+    """Read a single number out of a spoken ruler answer.
+
+    Returns {"value": n} only when exactly one distinct in-range number was
+    said, otherwise {"status": AMBIGUOUS}. Deliberately has no model fallback:
+    two numbers in one sentence ("a four, maybe a seven") is a genuine ambiguity
+    that must be asked about rather than resolved by inference.
+    """
     t = user_text.lower()
     found = {int(m) for m in _DIGIT_RE.findall(t)}
     found |= {v for w, v in _WORD_NUMBERS.items()
@@ -203,10 +241,9 @@ def code_number(user_text: str, low: int = 0, high: int = 10) -> dict:
     return {"status": AMBIGUOUS}
 
 
-# --------------- The ONE per-turn NLU + voice call (T4/T11/T12) ---------------
-
-# Whole-utterance consent matches only: "yes but what does that mean" must
-# reach the LLM (it is a question, not a bare yes).
+# Matched against the whole utterance, never as a prefix: "yes but what does
+# that mean" is a question, and treating it as consent would skip the answer the
+# person actually needs.
 _CONSENT_YES = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
                 "all right", "of course", "sure thing", "go ahead",
                 "yes please", "fine", "sounds good"}
@@ -317,6 +354,13 @@ reply rules — you speak WITH the person, warm and plain-spoken:
 
 
 def _expectation_text(expect) -> str:
+    """Describe, for the model, what a valid answer to the current ask looks like.
+
+    Extraction items are the subtle case: for those the model is told to report
+    raw fields and leave the option code null, because the bucketing is
+    deterministic and a model that picks the bucket itself can silently shift a
+    score across a threshold.
+    """
     kind = expect.kind
     if kind == "consent":
         return "A yes or no."
@@ -365,8 +409,8 @@ def _expectation_text(expect) -> str:
     return "The session has ended; no answer is expected."
 
 
-# Whole-utterance matches only, same rule as the consent sets: "i don't know
-# if that counts" carries content and must reach the LLM.
+# Whole-utterance matches only, for the same reason as the consent sets: "i
+# don't know if that counts" carries content the model needs to see.
 _DONT_KNOW = {"i don't know", "i dont know", "don't know", "dont know",
               "dunno", "i dunno", "no idea", "i have no idea", "not sure",
               "i'm not sure", "im not sure", "i can't remember",
@@ -376,13 +420,16 @@ _DONT_KNOW = {"i don't know", "i dont know", "don't know", "dont know",
 
 
 def _prepass(user_text: str, expect) -> TurnOut | None:
-    """Zero-latency deterministic paths for unambiguous short answers.
-    reply stays empty — skipping the acknowledgment beats guessing one."""
+    """Answer without a model call when the utterance is unmistakable.
+
+    Returns None when anything is in doubt, leaving the decision to turn(). The
+    reply is left empty: no acknowledgment at all reads better than a canned one.
+    """
     t = " ".join(user_text.strip().lower().split()).rstrip(".!,")
     if t in _DONT_KNOW and expect.kind in ("consent", "confirm", "option",
                                            "number"):
-        # T25/F1: a first-class result — the pipeline probes once with a
-        # recall anchor, then marks the item missing. Never an unclear loop.
+        # Distinct from "unclear": the pipeline offers one recall aid and then
+        # records the item as missing, so this can never become a re-ask loop.
         return TurnOut(action="dont_know")
     if expect.kind in ("consent", "confirm"):
         if t in _CONSENT_YES:
@@ -393,8 +440,8 @@ def _prepass(user_text: str, expect) -> TurnOut | None:
     if expect.kind == "option":
         code = _prematch_option(expected_item(expect).options, user_text)
         if code is not None:
-            # exact=True: the utterance WAS the option's wording, so a T20
-            # confirm item commits without a read-back.
+            # exact means the person said the option's own wording, so there is
+            # nothing for a read-back to confirm and the code commits directly.
             return TurnOut(action="answer", code=code, exact=True)
         return None
     if expect.kind == "number":
@@ -408,12 +455,25 @@ def _prepass(user_text: str, expect) -> TurnOut | None:
 def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
          patient: dict | None = None, facts: dict | None = None,
          interview_state: str = "") -> TurnOut:
-    """ONE call per user utterance: classify what the utterance IS relative
-    to the current ask, code it if it is an answer, and produce this turn's
-    bounded reply. The result is ALWAYS gated by turn.validate — an illegal
-    answer comes back as 'unclear' and moves nothing. Total failure returns
-    unclear with an empty reply (the pipeline then re-asks deterministically),
-    so the protocol can never be stranded by the model."""
+    """Classify, code and reply to one user utterance, in a single call.
+
+    Args:
+        user_text: what the person said.
+        expect: the current expectation from the protocol state machine.
+        ask_text: the question they are responding to.
+        history: recent conversation, for context.
+        patient: known patient facts, if any.
+        facts: what the machine knows deterministically — the only permitted
+            factual source for the reply.
+        interview_state: a rendering of the whole interview, so meta questions
+            ("how many are left") can be answered honestly.
+
+    Returns:
+        A TurnOut that has passed turn.validate. Anything illegal comes back as
+        "unclear", which holds the protocol in place. Repeated failure returns
+        unclear with an empty reply and the pipeline re-asks deterministically,
+        so a misbehaving model can stall a turn but never strand a session.
+    """
     pre = _prepass(user_text, expect)
     if pre is not None:
         return validate_turn(pre, expect)
@@ -438,16 +498,16 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
             if start == -1 or end <= start:
                 raise ValueError("no JSON object in turn output")
             out = TurnOut.model_validate_json(raw[start:end + 1])
-            # `exact` belongs to the deterministic pre-pass and assumed/
-            # boundary/note to validate()'s derivation: a model claiming any
-            # of them must never skip (or fake) a T20 read-back.
+            # These fields decide whether an answer is read back to the person
+            # for confirmation, and they are owned by the pre-pass and by
+            # validate(). Clearing them stops a model from asserting certainty
+            # it has not earned and skipping that confirmation.
             out = out.model_copy(update={"exact": False, "assumed": False,
                                          "boundary": False, "note": ""})
             return validate_turn(out, expect)
         except Exception as e:
-            # Log the exception TYPE only — a pydantic/JSON error message can
-            # embed the raw model output, which may quote the user (no-PHI
-            # logs is a non-negotiable).
+            # Type only. A pydantic or JSON error message embeds the raw model
+            # output, which can quote the patient verbatim into the log.
             logger.info("turn() attempt %d failed (%s)",
                         attempt + 1, type(e).__name__)
             messages.append({"role": "user", "content":
@@ -455,8 +515,6 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
                              "JSON object described, nothing else."})
     return TurnOut(action="unclear", reply="")
 
-
-# --------------- Bounded single-utterance generation (P4) ---------------
 
 _UTTER_SYSTEM = (
     "You are the voice of a structured SBIRT screening avatar. The clinical "
@@ -471,9 +529,12 @@ _UTTER_SYSTEM = (
 
 def phrase_utterance(instruction: str, history: list[dict],
                      patient: dict | None = None) -> str:
-    """One bounded LLM utterance at the current protocol node (summaries,
-    reflections, clarifications). Falls back to '' on failure — the caller
-    treats an empty utterance as skippable, the protocol continues."""
+    """Word one utterance the protocol has already decided to deliver.
+
+    Used for summaries, reflections and clarifications, where the content is
+    fixed but the phrasing should suit the person. Returns "" on failure; the
+    caller skips that utterance and the protocol continues rather than stalling.
+    """
     system = _UTTER_SYSTEM
     if patient:
         system += "\nKnown patient facts: " + json.dumps(patient, ensure_ascii=False)
@@ -490,5 +551,6 @@ def phrase_utterance(instruction: str, history: list[dict],
 
 
 if __name__ == "__main__":
+    # Smoke test for credentials and connectivity, not for behaviour.
     msgs = build_messages([{"role": "user", "content": "Hello, please briefly introduce yourself"}])
     print(f"LLM reply: {chat(msgs)}")

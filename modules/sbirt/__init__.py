@@ -1,17 +1,21 @@
-"""SBIRT clinical framework — the single source of truth for the counselor.
+"""The clinical content and machinery of the SBIRT screening, in one place.
 
-Structured, config-free, pure-Python building blocks that fully encode the
-Screening, Brief Intervention, and Referral to Treatment model:
+Screening, Brief Intervention and Referral to Treatment, encoded as plain Python
+data so that the clinical material can be reviewed and edited without touching
+any conversational code.
 
-  instruments.py  — validated screening tools (AUDIT, DAST-10, CAGE-AID, ...)
-  intervention.py — MI/OARS, FRAMES, stages of change, readiness rulers
-  referral.py     — ASAM levels of care, MAT, resources, crisis protocol
-  workflow.py     — the SBIRT conversation state machine
-  prompt.py       — build_system_prompt(): renders ALL of the above into the LLM
-                    system prompt (the guarantee that the Q&A carries every part
-                    of SBIRT)
+Two layers, easily confused:
 
-Edit the clinical content in the data modules; the prompt updates automatically.
+  * The executable protocol — flow.py, runtime.py, instruments.py, coding.py,
+    templates.py, turn.py, crisis.py — decides what is asked, what an answer
+    scores, and where the session goes. It is deterministic, and the model
+    cannot influence it.
+  * The described protocol — workflow.py, intervention.py, referral.py,
+    rendered by prompt.py — is background the model is given so it can converse
+    competently. Nothing here decides anything.
+
+Editing the data updates the prompt automatically; there is no prompt to
+hand-maintain.
 """
 
 from . import (crisis, instruments, intervention, referral, runtime,

@@ -1,19 +1,17 @@
-"""MuseTalk talking-head renderer.
+"""Renders the talking head, one frame at a time as it is produced.
 
-The public API is get_pool() and stream_video(). Nothing here writes a video
-file: stream_video hands each blended frame to a callback as JPEG bytes the
-moment the VAE decoder returns it, and modules/pipeline.py forwards those to the
-browser, which composites them on a canvas against the TTS audio. The first
-frames are therefore available after ONE UNet batch instead of after the whole
-utterance -- that is the entire point of the arrangement.
+Public API: get_pool() and stream_video().
 
-The model swap changes what the avatar IS driven by. FLOAT animated a single
-still portrait and invented head motion from the audio. MuseTalk is an
-inpainting model: it repaints ONLY the mouth region of an existing clip, so
-every other pixel and all head motion comes from config.AVATAR_VIDEO. The
-per-frame face boxes, VAE latents and blend masks of that clip are expensive to
-compute, so they are prepared once into config.MUSETALK_MATERIAL_DIR (keyed by
-config.avatar_fingerprint()) and reused by every render afterwards.
+Nothing here produces a video file. Each blended frame is handed to a callback
+as JPEG bytes the moment the VAE decoder returns it, and the browser draws those
+on a canvas against separately fetched audio. Since the UNet works in batches,
+the first frames are available after one batch rather than after the whole
+utterance — which is the reason for the arrangement.
+
+MuseTalk repaints only the mouth region of an existing clip, so head motion and
+every pixel outside the mouth come from config.AVATAR_VIDEO. Deriving that
+clip's face boxes, latents and blend masks costs minutes, so it is done once per
+avatar and reused by every render afterwards.
 """
 import contextlib
 import glob
@@ -32,7 +30,8 @@ import numpy as np
 
 import config
 
-# Add MuseTalk to path
+# MuseTalk is a sibling checkout rather than an installed package, and the
+# import below reaches into it, so this must precede it.
 sys.path.insert(0, config.MUSETALK_DIR)
 
 import torch
@@ -42,15 +41,16 @@ logger = logging.getLogger(__name__)
 _pool = None
 _pool_lock = threading.Lock()
 
-_mt = None          # cached handles to MuseTalk's own functions
+_mt = None          # handles to MuseTalk's own functions, imported once
 _mt_lock = threading.Lock()
 
-# MuseTalk's marker for "no face found in this frame"
+# What MuseTalk returns as a bounding box when it found no face.
 _NO_FACE = (0.0, 0.0, 0.0, 0.0)
 
 
 @contextlib.contextmanager
 def _cwd(path: str):
+    """Temporarily change the process working directory. See _musetalk()."""
     prev = os.getcwd()
     os.chdir(path)
     try:
@@ -60,15 +60,16 @@ def _cwd(path: str):
 
 
 def _musetalk():
-    """Import MuseTalk's modules once, with CWD == MUSETALK_DIR.
+    """Import MuseTalk's modules once, from inside its own directory.
 
-    The chdir is NOT optional. musetalk/utils/preprocessing.py builds the DWPose
-    landmark model at IMPORT time from the relative paths
-    './musetalk/utils/dwpose/rtmpose-l_...py' and
-    './models/dwpose/dw-ll_ucoco_384.pth', and FaceParsing's BiSeNet checkpoint
-    defaults are relative too. chdir is process-global, so it is confined to
-    this one import (and to material preparation, which constructs FaceParsing);
-    both run under the pool lock at startup, before the server serves anything.
+    The directory change is required, not tidiness. Upstream builds its DWPose
+    landmark model at import time from paths relative to the repository root,
+    and its face parser resolves its checkpoint the same way; imported from
+    anywhere else, both fail to find their weights.
+
+    Since the working directory is process-global, it is confined to this import
+    and to material preparation, both of which run under the pool lock during
+    startup, before any request is served.
     """
     global _mt
     if _mt is None:
@@ -98,18 +99,16 @@ def _musetalk():
     return _mt
 
 
-# --------------- Driving material ---------------
-
 class _Material:
-    """One prepared cycle of driving frames.
+    """One prepared cycle of driving frames, ready to render against.
 
-    The cycle is the source clip forward THEN reversed, so playback wraps
-    without a jump: frame N-1 is the neighbour of frame 0. Everything is
-    per-frame aligned — frames[i], coords[i], latents[i], masks[i] and
-    mask_coords[i] all describe the same frame.
+    The cycle is the source clip forwards then backwards, so an utterance longer
+    than the clip wraps without a visible jump — the last frame is adjacent to
+    the first. All five lists are aligned: index i describes the same frame in
+    every one of them.
 
-    Frames are kept decoded in RAM (~3 bytes/pixel × 2× the source clip's
-    frames), which is why AVATAR_VIDEO should stay a few seconds long.
+    Frames are held decoded in memory, roughly three bytes per pixel for twice
+    the clip's length, which is why the driving video should stay short.
     """
 
     __slots__ = ("frames", "coords", "latents", "masks", "mask_coords")
@@ -130,7 +129,7 @@ def _material_dir() -> str:
 
 
 def _video_to_frames(video_path: str) -> list:
-    """Decode the driving video to BGR frames."""
+    """Decode the driving video to BGR frames, warning on a frame-rate mismatch."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"cannot open driving video {video_path}")
@@ -144,12 +143,11 @@ def _video_to_frames(video_path: str) -> list:
     cap.release()
     if not frames:
         raise RuntimeError(f"driving video {video_path} has no decodable frames")
-    # A mismatch here does NOT drift the lips: whisper features are sampled at
-    # MUSETALK_FPS and the browser draws frame floor(currentTime * MUSETALK_FPS),
-    # so both ends agree regardless of what the source clip was shot at. What it
-    # changes is the playback speed of the clip's own head motion (one driving
-    # frame per output frame), which then differs from the idle loop the browser
-    # plays at native rate. Worth knowing about, not worth failing over.
+    # Not fatal, and lip sync is unaffected — audio sampling and browser
+    # playback both index by MUSETALK_FPS, so they agree whatever the clip was
+    # shot at. What breaks is head-motion speed: one driving frame is consumed
+    # per output frame, so the clip plays at the wrong rate during speech and
+    # visibly changes pace against the natively-played idle loop.
     if abs(src_fps - config.MUSETALK_FPS) > 0.5:
         logger.info("driving video is %.2f fps, rendering at %d fps — head motion "
                     "will play at %.2fx during speech; re-encode the clip to %d fps "
@@ -161,9 +159,11 @@ def _video_to_frames(video_path: str) -> list:
 
 
 def _prepare_material(mat_dir: str, vae) -> _Material:
-    """Run the one-off pass over AVATAR_VIDEO: face boxes, VAE latents, blend
-    masks. Written to a scratch dir and renamed into place, so an interrupted
-    preparation can never leave a half-built material dir that later loads.
+    """Derive face boxes, latents and blend masks from the driving video.
+
+    Takes minutes, so it runs once per avatar. Everything is built in a scratch
+    directory and renamed into place at the end: an interrupted run must not
+    leave a half-built directory that a later startup would happily load.
     """
     mt = _musetalk()
     logger.info("Preparing MuseTalk driving material from %s (one-off, minutes)...",
@@ -177,8 +177,8 @@ def _prepare_material(mat_dir: str, vae) -> _Material:
     os.makedirs(imgs_dir)
     os.makedirs(masks_dir)
 
-    # get_landmark_and_bbox reads image FILES, so the decoded frames go to disk
-    # first (upstream does the same).
+    # Upstream's landmark detector takes file paths, not arrays, so the decoded
+    # frames have to reach disk before it can see them.
     src_frames = _video_to_frames(config.AVATAR_VIDEO)
     for i, frame in enumerate(src_frames):
         cv2.imwrite(os.path.join(imgs_dir, f"{i:08d}.png"), frame)
@@ -188,10 +188,9 @@ def _prepare_material(mat_dir: str, vae) -> _Material:
 
     coords, frames, latents = [], [], []
     for bbox, frame in zip(coord_list, frame_list):
-        # Drop frames with no detected face instead of keeping them. Upstream
-        # skips only the latent, which silently shifts every later frame's
-        # latent onto the wrong image; dropping the whole frame keeps the three
-        # lists aligned.
+        # Drop the whole frame, not just its latent. Skipping only the latent —
+        # as upstream does — shifts every subsequent latent onto the wrong
+        # image, so the lists must be kept the same length here.
         if tuple(bbox) == _NO_FACE:
             continue
         x1, y1, x2, y2 = bbox
@@ -211,7 +210,7 @@ def _prepare_material(mat_dir: str, vae) -> _Material:
         logger.warning("dropped %d of %d driving frames with no detected face",
                        len(frame_list) - len(frames), len(frame_list))
 
-    # Forward + reversed = seamless loop.
+    # Appending the reverse makes the cycle wrap without a jump cut.
     frames = frames + frames[::-1]
     coords = coords + coords[::-1]
     latents = latents + latents[::-1]
@@ -224,16 +223,16 @@ def _prepare_material(mat_dir: str, vae) -> _Material:
         ) if config.MUSETALK_VERSION == "v15" else mt.FaceParsing()
 
     masks, mask_coords = [], []
-    # The png files are rewritten in cycle order so a reload sees exactly the
-    # frames prepared here, not the raw decode.
+    # Rewritten in cycle order, so that a later reload reconstructs exactly this
+    # sequence rather than the raw decode.
     for i, frame in enumerate(frames):
         cv2.imwrite(os.path.join(imgs_dir, f"{i:08d}.png"), frame)
         mask, crop_box = mt.get_image_prepare_material(frame, coords[i], fp=fp, mode=mode)
         cv2.imwrite(os.path.join(masks_dir, f"{i:08d}.png"), mask)
         masks.append(mask)
         mask_coords.append(crop_box)
-    # Any leftover pngs from the raw decode (when faces were dropped) would be
-    # picked up by the glob on reload.
+    # Dropped frames leave surplus files behind, and the reload globs the
+    # directory, so it would pick them back up.
     for stale in sorted(glob.glob(os.path.join(imgs_dir, "*.png")))[len(frames):]:
         os.remove(stale)
 
@@ -262,7 +261,11 @@ def _prepare_material(mat_dir: str, vae) -> _Material:
 
 
 def _load_material(mat_dir: str) -> _Material:
-    """Load material prepared by an earlier run."""
+    """Reload material prepared by an earlier run.
+
+    Raises if the five lists disagree in length: a truncated directory would
+    otherwise render frames against the wrong masks and coordinates.
+    """
     def _imgs(sub):
         paths = sorted(glob.glob(os.path.join(mat_dir, sub, "*.png")))
         return [cv2.imread(p, cv2.IMREAD_UNCHANGED if sub == "mask" else cv2.IMREAD_COLOR)
@@ -284,6 +287,7 @@ def _load_material(mat_dir: str) -> _Material:
 
 
 def _get_material(vae) -> _Material:
+    """Material for the current avatar, preparing it if this is the first run."""
     mat_dir = _material_dir()
     if os.path.exists(os.path.join(mat_dir, "latents.pt")):
         return _load_material(mat_dir)
@@ -291,10 +295,8 @@ def _get_material(vae) -> _Material:
     return _prepare_material(mat_dir, vae)
 
 
-# --------------- Rendering ---------------
-
 class _Worker:
-    """One MuseTalk stack pinned to one GPU."""
+    """One complete MuseTalk model stack, pinned to one GPU."""
 
     def __init__(self, gpu_id: int):
         self.gpu_id = gpu_id
@@ -302,10 +304,11 @@ class _Worker:
         self.material = None
 
     def load(self):
+        """Load the models onto this worker's GPU, in half precision."""
         mt = _musetalk()
-        # load_all_model hardcodes the VAE path as os.path.join("models", vae_type).
-        # Passing an ABSOLUTE vae_type makes that join return the absolute path
-        # unchanged, which is how the VAE gets found without a chdir here.
+        # Upstream builds the VAE path as os.path.join("models", vae_type).
+        # Passing an absolute vae_type makes that join return it unchanged,
+        # which locates the weights without needing another directory change.
         vae, unet, pe = mt.load_all_model(
             unet_model_path=config.MUSETALK_UNET,
             vae_type=config.MUSETALK_VAE,
@@ -326,21 +329,19 @@ class _Worker:
 
     @torch.no_grad()
     def stream(self, audio_path: str, on_frame, abort=None) -> int:
-        """Render one utterance, handing every frame out as it is finished.
+        """Render one utterance, emitting each frame as soon as it is blended.
 
-        `on_frame(idx, jpeg_bytes)` is called once per frame, in order, the
-        moment that frame is blended — NOT after the utterance is complete.
-        Returns the number of frames emitted.
+        Args:
+            audio_path: the utterance's audio. A path, not bytes, because the
+                whisper feature extractor takes a filename.
+            on_frame: called as on_frame(index, jpeg_bytes) once per frame, in
+                order, while the render is still running.
+            abort: polled per batch and per frame; when it returns true the
+                render stops where it is.
 
-        This is the whole point of the streaming rewrite. The UNet+VAE produce
-        MUSETALK_BATCH_SIZE frames per pass, so the first frames are ready after
-        a single batch (~1/3 s of video at the default settings) instead of
-        after the last one. Nothing is written to disk and nothing is muxed: the
-        browser draws these frames on a canvas against the TTS audio, which it
-        fetches separately and plays as one continuous element.
-
-        `abort()` is polled every batch AND every frame, so a barge-in stops the
-        GPU work instead of rendering a reply nobody will hear.
+        Returns:
+            How many frames were emitted, which is short of the full count if
+            the render was aborted.
         """
         mt = _musetalk()
         m = self.material
@@ -352,9 +353,9 @@ class _Worker:
 
         features, librosa_length = self.audio_processor.get_audio_feature(
             audio_path, weight_dtype=self.weight_dtype)
-        # Whisper still needs the WHOLE utterance: get_whisper_chunk trims and
-        # pads against librosa_length, so the audio cannot be fed in pieces. Only
-        # the OUTPUT is streamed.
+        # The audio cannot be streamed in, only the output out: chunking trims
+        # and pads against the total length, so the whole utterance must exist
+        # before any of it can be processed.
         chunks = self.audio_processor.get_whisper_chunk(
             features, self.device, self.weight_dtype, self.whisper, librosa_length,
             fps=fps,
@@ -363,8 +364,9 @@ class _Worker:
         )
 
         idx = 0
-        # device=: datagen's tail batch does a .to() with a cuda:0 default,
-        # which would touch GPU 0 from every worker in a multi-GPU pool.
+        # Passing device explicitly: upstream's final partial batch calls .to()
+        # with a cuda:0 default, so without this every worker in a multi-GPU
+        # pool reaches onto GPU 0.
         for whisper_batch, latent_batch in mt.datagen(
                 chunks, m.latents, config.MUSETALK_BATCH_SIZE,
                 device=str(self.device)):
@@ -385,8 +387,8 @@ class _Worker:
                     face = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
                 except cv2.error:
                     continue
-                # .copy(): the cached frame is reused by every later render,
-                # so blending must never write through to it.
+                # Copy first: this frame is shared with every future render, so
+                # blending in place would permanently deface the material.
                 combined = mt.get_image_blending(
                     m.frames[i].copy(), face, [x1, y1, x2, y2],
                     m.masks[i], m.mask_coords[i])
@@ -402,7 +404,7 @@ class _Worker:
 
 
 class MuseTalkGPUPool:
-    """Pool of MuseTalk models across multiple GPUs for parallel video generation."""
+    """One loaded model stack per GPU, so utterances can render in parallel."""
 
     def __init__(self, gpu_ids: list[int] = config.MUSETALK_GPUS):
         self.gpu_ids = gpu_ids
@@ -411,7 +413,7 @@ class MuseTalkGPUPool:
         self._lock = threading.Lock()
 
     def load_all(self):
-        """Load MuseTalk on each GPU and attach the driving material. Call at startup."""
+        """Load a worker on every configured GPU. Slow; call once at startup."""
         material = None
         for gpu_id in self.gpu_ids:
             logger.info(f"Loading MuseTalk on GPU {gpu_id}...")
@@ -419,9 +421,9 @@ class MuseTalkGPUPool:
             with torch.cuda.device(gpu_id):
                 worker.load()
                 if material is None:
-                    # Prepared once and shared: frames/masks are numpy and the
-                    # latents live on the CPU until a batch is dispatched, so a
-                    # second GPU costs no second copy.
+                    # Prepared once and shared across workers. Frames and masks
+                    # are numpy and the latents stay on the CPU until a batch is
+                    # dispatched, so extra GPUs cost no extra copies.
                     material = _get_material(worker.vae)
             worker.material = material
             self.workers[gpu_id] = worker
@@ -429,43 +431,42 @@ class MuseTalkGPUPool:
         logger.info(f"MuseTalk GPU pool ready: {list(self.workers.keys())}")
 
     def stream_video(self, audio_path: str, on_frame, abort=None) -> int:
-        """Stream one utterance's frames using any free GPU from the pool.
+        """Render one utterance on whichever GPU frees up first.
 
-        Blocks the CALLING thread for the whole render, calling `on_frame` from
-        it as each frame lands. Callers therefore run this off the event loop
-        (pipeline renders in a ThreadPoolExecutor) and `on_frame` must not
-        block — it hands the frame to a queue and returns.
+        Blocks the calling thread for the entire render and invokes `on_frame`
+        from it, so callers must run this off the event loop and `on_frame` must
+        not block — it should queue the frame and return.
         """
         while True:
-            # Bail out promptly on server shutdown so Ctrl+C isn't blocked waiting
-            # here for a free GPU (the caller treats 0 frames as a failed render).
-            # `abort` is polled HERE too, not just once a GPU is in hand: a
-            # barged-in segment must not queue for a GPU it will never use, and
-            # the clip pre-warm — whose abort hook is "someone is talking" — must
-            # not seize the first GPU a live conversation happens to release.
+            # Aborting is checked while waiting for a GPU, not only once one is
+            # held. An interrupted utterance must not queue for a GPU it will
+            # never use, and the pre-warm — whose abort condition is "somebody
+            # is talking" — must not grab the first GPU a live conversation
+            # releases.
             if config.SHUTTING_DOWN.is_set() or (abort is not None and abort()):
                 return 0
             for gpu_id in self.gpu_ids:
                 if self.semaphores[gpu_id].acquire(blocking=False):
                     try:
-                        # Pin the current CUDA device for this thread so any
-                        # device-less tensor creation inside MuseTalk lands on
-                        # THIS gpu instead of the default cuda:0. Without this,
-                        # segments dispatched to GPU 1/2 crash with "tensors on
-                        # cuda:1 and cuda:0".
+                        # Pins this thread's CUDA device so that any tensor
+                        # MuseTalk creates without an explicit device lands
+                        # here. Without it, work dispatched to any GPU but the
+                        # first fails with tensors split across two devices.
                         with torch.cuda.device(gpu_id):
                             return self.workers[gpu_id].stream(audio_path, on_frame, abort)
                     finally:
                         self.semaphores[gpu_id].release()
-            # All GPUs busy, wait briefly
             time.sleep(0.1)
 
 
 def get_pool() -> MuseTalkGPUPool:
+    """The GPU pool, loaded on first use.
+
+    The pool is fully loaded before being published to the global. Assigning it
+    first would let a concurrent caller find it with empty worker and semaphore
+    maps and fail on a missing GPU id.
+    """
     global _pool
-    # Double-checked locking: build the pool FULLY (load_all) before publishing it
-    # to `_pool`. Otherwise concurrent callers during the cold load would see a
-    # half-built pool with empty `workers`/`semaphores` -> KeyError on gpu_id.
     if _pool is None:
         with _pool_lock:
             if _pool is None:
@@ -476,11 +477,13 @@ def get_pool() -> MuseTalkGPUPool:
 
 
 def stream_video(audio_path: str, on_frame, abort=None) -> int:
-    """Public API - uses the GPU pool. See MuseTalkGPUPool.stream_video."""
+    """Render one utterance on the shared pool. See MuseTalkGPUPool.stream_video."""
     return get_pool().stream_video(audio_path, on_frame, abort)
 
 
 if __name__ == "__main__":
+    # Smoke test: model loading and material preparation are what break here,
+    # and both happen before this prints.
     logging.basicConfig(level=logging.INFO)
     pool = get_pool()
     print("MuseTalk GPU pool loaded successfully.")

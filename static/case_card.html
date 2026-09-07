@@ -21,7 +21,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .btn-refresh:active { transform: translateY(1px); }
 .draw-count { font-size: 0.8em; color: #778; }
 
-/* Empty state — shown until the first Refresh click. */
+/* Shown until the first case is drawn. */
 .empty { padding: 40px 20px; text-align: center; border: 1px dashed #0f3460; border-radius: 12px; color: #778; font-size: 0.9em; line-height: 1.6; }
 
 .cc-card { background: #16213e; border: 1px solid #0f3460; border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4); }
@@ -65,20 +65,19 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 
 <script>
 (function() {
-  // ============ Usability Testing — Randomized Case Selection ============
-  // A role-play brief for the PERSON being screened: click Refresh to draw one
-  // case at random and answer the counselor in character, so a run exercises a
-  // known protocol branch instead of whatever the tester invents.
+  // A role-play brief for whoever is playing the person being screened. Drawing
+  // a case at random and answering in character means a test run exercises a
+  // known protocol branch rather than whatever the tester improvises.
   //
-  // MODEL-ISOLATED BY CONSTRUCTION. This page is a static file with NO network
-  // calls of any kind — no fetch, no WebSocket, no form post. The cards exist
-  // only in this file and in the reader's eyes, so there is no path by which
-  // card text can reach the server, the chat history, or the LLM's context.
-  // Keep it that way: never add an outbound call to this page.
+  // This page makes no network calls of any kind, and that is a requirement
+  // rather than an accident: the cards must reach the tester's eyes and nothing
+  // else. Any outbound call from here opens a path for card text to reach the
+  // server and end up in the model's context, which would invalidate the run it
+  // was meant to test. Do not add one.
   //
-  // Card wording supplied by the study team (2026-08-17). The AUDIT and DAST-10
-  // answers are numbered in the order the engine actually administers them
-  // (modules/sbirt/instruments.py), so the tester can answer item by item.
+  // Card wording comes from the study team. The instrument answers are numbered
+  // in the order the engine administers the items, so they can be read off one
+  // at a time as the questions arrive.
   const CASE_CARDS = [
     {
       id: 'Case 1',
@@ -232,9 +231,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 
   let draws = 0;
 
-  // Every draw is independent: a fresh CSPRNG read, with no reference to what
-  // came before. Nothing is persisted, so repeats are possible and expected —
-  // that is what uniform random means, not a bug.
+  // Each draw is independent and nothing is remembered between them, so the
+  // same case can come up twice in a row. That is what uniform random means,
+  // and shuffling instead would bias which branches get tested.
   function drawCard() {
     const i = (window.crypto && crypto.getRandomValues)
       ? crypto.getRandomValues(new Uint32Array(1))[0] % CASE_CARDS.length
@@ -243,7 +242,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   }
 
   function render(card) {
-    // Built with textContent, never innerHTML: card wording is content, not markup.
+    // textContent rather than innerHTML: card wording is text, not markup.
     ccId.textContent = card.id;
     ccTitle.textContent = card.title;
     ccBody.textContent = '';
@@ -286,7 +285,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
     window.scrollTo(0, 0);
   });
 
-  // No draw on load, by design: a page reload leaves the empty state in place.
+  // Nothing is drawn on load, so a reload cannot silently replace the case a
+  // tester is partway through.
 })();
 </script>
 </body>

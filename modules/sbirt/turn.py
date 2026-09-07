@@ -1,15 +1,16 @@
-"""The per-turn NLU contract (T4): what one LLM call may tell the engine.
+"""The only channel through which a language model can reach the clinical engine.
 
-`TurnOut` is the ONLY channel from the language model into the clinical
-engine. One call per user utterance produces BOTH the understanding (action +
-coded answer/slots) and the words to speak for this turn (`reply`). The model
-never sees or moves the protocol pointer: `validate()` is the pure gatekeeper
-that downgrades anything not provably a legal answer for the CURRENT
-expectation to `unclear`, so the engine only ever advances on validated input
-(guess-free by construction, same contract the old per-kind coders had).
+Everything the model has to say about one utterance arrives as a single TurnOut:
+what kind of thing was said, how it codes, and the words to speak back. There is
+no other route in, and the model never sees or touches the protocol pointer.
 
-Pure module: pydantic parsing + instrument lookups. No LLM, no IO — every
-downgrade branch is unit-testable.
+validate() is the gate. Anything not provably a legal answer to the question
+actually on the table is downgraded to "unclear", which holds position and
+re-asks. So the engine advances on validated input only, and a confidently wrong
+model produces a repeated question rather than a corrupted screening.
+
+Pure: parsing and lookups, no model call and no I/O, so every rejection path can
+be tested directly.
 """
 
 from __future__ import annotations
@@ -21,79 +22,73 @@ from pydantic import BaseModel, Field, field_validator
 from . import coding
 from .instruments import BY_KEY, PRE_SCREEN
 
-# What a turn's utterance can BE, relative to the machine's current ask:
-#   answer       — answers the current ask (fully, or partly for slot asks)
-#   continuation — adds to / completes the user's PREVIOUS answer (machine
-#                  holds; the engine absorbs the addition, never re-asks)
-#   question     — the user asks US something (reply answers it from state
-#                  facts, then re-poses the ask; machine holds)
-#   tangent      — off-topic aside (reply briefly acknowledges + returns;
-#                  machine holds)
-#   crisis       — distress/danger cue (deterministic crisis path takes over;
-#                  UNION with crisis.detect — either may fire)
-#   abort        — they want to STOP the whole conversation (T22): the engine
-#                  closes gracefully with partial data kept; never a re-ask,
-#                  never a retention attempt. Distinct from answering "no"
-#                  to the current permission gate (that is an `answer`).
-#   correction   — they are CHANGING an answer they already gave to an
-#                  earlier item of the ACTIVE instrument (T21): `item` names
-#                  the corrected item, `code` its new option. The engine
-#                  overwrites, re-derives skips/score from the declarative
-#                  data, and records old→new for audit.
-#   dont_know    — they cannot or prefer not to answer THIS question ("i
-#                  don't know", "can't remember", "skip that one") — a first-
-#                  class result, NOT unclear (T25/F1). The engine probes once
-#                  with a recall anchor (WHO manual p.18: estimate from the
-#                  heaviest period in the past year), then marks the item
-#                  missing and MOVES ON — never an endless re-ask. Distinct
-#                  from abort (stopping everything) and from answering "no".
-#   unclear      — none of the above is safe to assume (reply gently re-asks)
+# What an utterance is, relative to the question currently being asked. Only
+# "answer" can move the protocol; everything else holds position.
+#
+#   answer       responds to the current ask, wholly or in part
+#   continuation adds to their previous answer rather than this question, so
+#                the addition is absorbed and nothing is re-asked
+#   question     they are asking us something; answered from state, then the
+#                ask is re-posed
+#   tangent      an aside; acknowledged, then back to the ask
+#   crisis       distress or danger, handed to the crisis path
+#   abort        they want to stop entirely. Distinct from declining the
+#                current permission gate, which is an ordinary answer — the
+#                first ends the session, the second is a screening result.
+#   correction   they are changing an answer already given to an earlier item,
+#                which is overwritten with skips and scores re-derived
+#   dont_know    they cannot or would rather not answer this one. Its own
+#                outcome rather than "unclear", because the two need opposite
+#                handling: unclear re-asks, this one offers a recall aid once
+#                and then records the item missing and moves on.
+#   unclear      nothing above can be safely assumed
 Action = Literal["answer", "continuation", "question", "tangent", "crisis",
                  "abort", "correction", "dont_know", "unclear"]
 
 
 class TurnOut(BaseModel):
-    """One turn's structured output. Extra fields are rejected so a drifting
-    model response fails parsing (and retries) instead of smuggling state."""
+    """Everything one model call is permitted to say about one utterance.
+
+    Unknown fields are rejected rather than ignored, so a model that starts
+    inventing keys fails to parse and is retried instead of quietly having its
+    extra state accepted.
+    """
 
     model_config = {"extra": "forbid"}
 
     action: Action
-    # For option/yesno items and consent gates: the option INDEX (gates:
-    # 0=no, 1=yes). For number asks (readiness ruler): the number itself.
-    # For corrections: the corrected item's NEW option index.
+    # An option index for option items and permission gates (0 no, 1 yes), the
+    # number itself for ruler asks, or the new option index for a correction.
     code: int | None = None
-    # For corrections only: the 0-based index of the already-answered item
-    # being corrected (within the active instrument).
+    # Corrections only: which already-answered item of the active instrument is
+    # being changed.
     item: int | None = None
-    # For open slot-asks: whichever declared slots the utterance filled,
-    # e.g. {"drink": "whiskey", "amount": "12 oz"}. Unknown slot names are
-    # dropped by validate(), never stored.
+    # Open asks with declared slots: whichever ones this utterance filled.
+    # validate() discards names that were not declared.
     slots: dict[str, str] = Field(default_factory=dict)
-    # For open single-capture asks: the captured answer text.
+    # Open asks without slots: the captured answer.
     text: str | None = None
-    # T26 extraction fields (the model EXTRACTS, coding.py buckets): for
-    # frequency items `value` + `per` ("every week" -> 1, "week"); for
-    # drink-quantity items `value` + `unit` [+ `beverage`] ("one liter of
-    # whiskey" -> 1, "liter", "whiskey"; "ten or more" -> 10, "drinks").
+    # Raw extraction for frequency and quantity items. The model reports what
+    # was said — "every week" as 1 per week, "a liter of whiskey" as 1 liter of
+    # whiskey — and coding.py decides which bucket that falls in. Splitting it
+    # this way keeps a threshold decision, which can change a score, out of the
+    # model's hands.
     value: float | None = None
     per: str | None = None
     unit: str | None = None
     beverage: str | None = None
-    # What the avatar says THIS turn. For `answer`: a short acknowledgment
-    # only (the engine's own next utterances follow it). For question/
-    # tangent/continuation/unclear: the complete bounded response (answer
-    # the person / acknowledge / clarify, then re-pose the current ask).
+    # What to say this turn. For an answer this is a short acknowledgment only,
+    # since the protocol's own utterances follow it; for everything else it is
+    # the whole response.
     reply: str = ""
-    # Set by the DETERMINISTIC pre-pass only (never trusted from model
-    # output — llm.turn force-clears it after parsing): the utterance was
-    # the option's exact wording, so a T20 confirm item commits without a
-    # read-back.
+    # The utterance was the option's own wording, so there is nothing for a
+    # read-back to confirm. Set by the deterministic pre-pass alone: llm.turn
+    # clears it from model output, because a model asserting it would be
+    # asserting its way past a confirmation step.
     exact: bool = False
-    # Set by validate()'s deterministic derivation only (also force-cleared
-    # from model output): a conversion default entered the coding / the
-    # value sat near a bucket edge — either one earns a read-back (F5) —
-    # and the spoken conversion note for it (F6).
+    # Derived by validate(), and likewise cleared from model output. A unit
+    # conversion was assumed, or the value sits close to a bucket boundary;
+    # either earns a read-back, and `note` is how it is explained aloud.
     assumed: bool = False
     boundary: bool = False
     note: str = ""
@@ -105,8 +100,12 @@ class TurnOut(BaseModel):
 
 
 def _unclear(out: TurnOut, why: str) -> TurnOut:
-    """Downgrade to unclear, KEEPING the model's reply (it is usually already
-    a sensible clarification); the engine treats unclear as hold-and-re-ask."""
+    """Strip everything but the reply and mark the turn unclear.
+
+    The reply is kept deliberately: when the model could not code an answer it
+    has usually already written a sensible clarifying question, which is better
+    than the generic re-ask the engine would otherwise fall back to.
+    """
     return out.model_copy(update={"action": "unclear", "code": None,
                                   "item": None, "slots": {}, "text": None,
                                   "value": None, "per": None, "unit": None,
@@ -115,24 +114,33 @@ def _unclear(out: TurnOut, why: str) -> TurnOut:
 
 
 def expected_item(expect):
-    """The Item under an option expectation (prescreen or instrument)."""
+    """The item an option expectation refers to, from either question source."""
     if expect.instrument == "prescreen":
         return PRE_SCREEN[expect.item_index].item
     return BY_KEY[expect.instrument].items[expect.item_index]
 
 
 def validate(out: TurnOut, expect) -> TurnOut:
-    """Pure gatekeeper: an `answer` that is not a legal answer for the CURRENT
-    expectation is downgraded to `unclear` (T4 rule — the pointer only ever
-    moves on validated input; the model's claim alone moves nothing).
-    Non-answer actions pass through with their payload fields cleared where
-    meaningless. `expect` is the engine's runtime.Expect."""
+    """Downgrade anything that is not provably a legal answer to `expect`.
+
+    Args:
+        out: what the model produced.
+        expect: the engine's current expectation.
+
+    Returns:
+        The same TurnOut when it is legal, otherwise one marked "unclear" with
+        its payload cleared. Non-answer actions pass through with fields that
+        are meaningless for them dropped.
+
+    The model's claim to have answered something is never sufficient on its own;
+    only what this function admits can move the protocol.
+    """
     if out.action == "correction":
-        # T21: shape-gate only what turn.py CAN know without the session —
-        # active non-prescreen instrument, a real item index other than the
-        # one currently being asked, a legal option code for THAT item.
-        # Whether the item was actually ANSWERED is the engine's check
-        # (runtime.correct); an inapplicable correction holds, never moves.
+        # Only the shape can be checked here: the instrument is active and not
+        # the pre-screen, the item exists, is not the one being asked right now,
+        # and the new code is legal for it. Whether that item was ever actually
+        # answered needs the session, so runtime.correct checks it and holds if
+        # not.
         if (expect.kind == "option" and expect.instrument
                 and expect.instrument != "prescreen"
                 and isinstance(out.item, int) and isinstance(out.code, int)):
@@ -144,8 +152,8 @@ def validate(out: TurnOut, expect) -> TurnOut:
         return _unclear(out, "correction needs a known earlier item + option")
 
     if out.action != "answer":
-        # Continuations carry slots/text (absorbed into the PREVIOUS capture);
-        # everything else carries only a reply.
+        # A continuation keeps its payload, which gets folded into the previous
+        # capture. Nothing else has anything to say beyond its reply.
         if out.action == "continuation":
             return out
         if (out.code is not None or out.item is not None or out.slots
@@ -164,10 +172,10 @@ def validate(out: TurnOut, expect) -> TurnOut:
     if kind == "option":
         item = expected_item(expect)
         if item.coding != "choice" and not out.exact:
-            # T26/F4: for frequency/quantity scales a semantic answer is
-            # never taken as a model-claimed code — the code is COMPUTED
-            # from the extracted fields (coding.py), or the turn stays
-            # unclear. "Legal but wrong" buckets cannot pass here.
+            # Frequency and quantity scales never accept a code the model chose:
+            # it is computed from the extracted numbers, or the turn stays
+            # unclear. A model-picked bucket would be legal and therefore
+            # unreviewable when wrong, and these items decide the score.
             derived = coding.derive(item.coding, value=out.value,
                                     per=out.per, unit=out.unit,
                                     beverage=out.beverage)
@@ -188,21 +196,24 @@ def validate(out: TurnOut, expect) -> TurnOut:
             return out
         return _unclear(out, "ruler needs 0-10")
     if kind == "open":
-        # Slot metadata lives on the engine's Expect; accessed via getattr so
-        # this module never imports runtime (runtime imports us).
+        # Reached by getattr rather than imported: runtime imports this module,
+        # so importing runtime here would be circular.
         missing = tuple(getattr(expect, "missing", ()) or ())
-        if missing:                      # slot ask: keep only declared slots
+        if missing:
             declared = set(getattr(expect, "slots", ()) or ())
             slots = {k: v for k, v in out.slots.items()
                      if k in declared and str(v).strip()}
             if slots:
                 return out.model_copy(update={"slots": slots})
-            if out.text:                 # whole answer, unsplit → the slot we
-                return out.model_copy(   # just asked for (declared order)
+            # Answered as one unsplit phrase. It belongs to the slot just asked
+            # for, which is the first still missing.
+            if out.text:
+                return out.model_copy(
                     update={"slots": {missing[0]: out.text}})
             return _unclear(out, "open slot answer captured nothing")
         if out.text:
             return out
         return _unclear(out, "open answer captured nothing")
-    # kind == "end" (session over) or unknown: nothing advances.
+    # The session is over, or the expectation is one this function does not
+    # know: either way there is nothing an answer could advance.
     return _unclear(out, f"no answer possible at kind={kind!r}")

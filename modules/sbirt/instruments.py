@@ -1,27 +1,29 @@
-"""Validated SBIRT screening instruments (the "S" in SBIRT).
+"""The screening instruments themselves: questions, options, scores and zones.
 
-Single source of truth for the screening tools the counselor is allowed to use.
-Each instrument is plain data — items, scoring rule, and risk bands — so the
-clinical content can be reviewed and updated here WITHOUT touching prompt strings
-or pipeline code. `render()` turns any instrument into prompt-ready text, and
-`risk_band_for()` maps a computed score to its SBIRT action.
+Each instrument is plain data, so the clinical content can be reviewed and
+changed here without touching a prompt string or any conversational code.
 
-The instruments this app actually ADMINISTERS (per the study protocol in
-SBIRT_Reference/) carry fully structured items — official interview wording plus
-an ordered option list with per-option scores — so the deterministic scoring
-functions below, the runtime state machine (runtime.py), constrained NLU
-coding, and fixed-clip pre-generation all read from the same data. The remaining
-instruments are prompt-only reference and keep plain-string items.
+Two tiers, which look similar but are not:
 
-Authoritative sources (see SBIRT_Reference/):
-  • AUDIT items/options/skip rules — WHO AUDIT manual, Box 4 interview version
-    ("AUDIT.pdf" / "AUDIT Manual.pdf").
-  • DAST-10 items as worded for THIS study — "Case Cards UH - SBIRT Client
-    Generic Provider.pdf" (see the item-3 deviation note below).
-  • Pre-screen ("SBIRT 3 Questions") and the four feedback risk zones —
-    "AI SBIRT app dialogue for study.docx".
-Other references: Skinner DAST-10; Ewing CAGE / Brown CAGE-AID; NIDA Quick
-Screen / NM ASSIST; TAPS tool; Knight CRAFFT 2.1.
+  * Administered instruments carry structured items — the official interview
+    wording, an ordered option list, per-option scores and skip rules. The
+    scoring below, the state machine, the answer coding and the clip pre-render
+    all read the same rows, so there is no second copy to fall out of step.
+  * Reference instruments carry plain strings. They exist only to be rendered
+    into the prompt as background and are never administered or scored.
+
+Wording is taken from the study's authoritative sources and should not be
+adjusted for readability — these are validated instruments, and paraphrasing an
+item invalidates its score:
+
+  * AUDIT items, options and skip rules: WHO AUDIT manual, Box 4 interview
+    version.
+  * DAST-10 as worded for this study: its case cards. Note the item 3
+    deviation recorded at that item.
+  * Pre-screen and the four feedback zones: the study's app dialogue document.
+
+Further references: Skinner DAST-10; Ewing CAGE and Brown CAGE-AID; NIDA Quick
+Screen and NM ASSIST; TAPS; Knight CRAFFT 2.1.
 """
 
 from __future__ import annotations
@@ -32,12 +34,13 @@ from typing import Callable, Collection, Mapping
 
 @dataclass(frozen=True)
 class Option:
-    """One answer choice: exact wording + the points it contributes.
+    """One answer choice: its exact wording and the points it contributes.
 
-    `aliases` are EXACT spoken equivalents (matched lowercased, whole-answer)
-    for deterministic pre-matching only — never fuzzy. Populating them is a
-    clinical coding decision (PENDING CLINICIAN REVIEW), so they ship empty;
-    semantic mapping stays with the never-guess LLM coder.
+    Aliases are matched as whole answers, lowercased and exactly — never
+    fuzzily — so that a match can code an answer with no model involved. Which
+    phrasings count as equivalent to an option is a clinical decision, so they
+    ship empty and semantic matching is left to the coder that refuses to guess.
+    Pending clinician review.
     """
 
     label: str
@@ -47,58 +50,57 @@ class Option:
 
 @dataclass(frozen=True)
 class Item:
-    """One administered question: official wording + ordered options.
+    """One administered question, as officially worded, with its answer options.
 
-    A recorded response is the option's INDEX in `options` (its "code");
-    the contributed score is `options[code].score`. For most items code ==
-    score, but e.g. AUDIT items 9-10 score 0/2/4 for codes 0/1/2.
+    An answer is recorded as the option's index — its code — and the points it
+    contributes are that option's score. The two are usually the same number,
+    but not always: some items score 0, 2 and 4 for codes 0, 1 and 2. Confusing
+    them silently mis-scores an instrument, so code and score are kept distinct
+    everywhere they appear.
 
-    `verbatim=True` (the conservative default, pending the study's ruling on
-    exact-wording requirements) means the stem is SPOKEN exactly as written;
-    the conversational engine may add acknowledgment around it but never
-    rephrase it. Open/number questions that are protocol conversation (not
-    instrument items) live in the flow layer, not here.
+    verbatim means the question is spoken exactly as written. The engine may add
+    an acknowledgment around it but never rephrase it, because these wordings
+    are what the instrument was validated with. Conversational questions that
+    are not instrument items belong in flow.py rather than here.
 
-    `confirm=True` (T20) marks score-bearing items whose coded answer is read
-    back for a yes/no confirmation BEFORE it is committed. Round 2 makes the
-    read-back the exception, not the default: exact-wording answers and
-    cleanly derived codes (see `coding` below) commit directly; the read-back
-    fires only when a conversion assumption entered the coding, the value sat
-    near a bucket boundary, or the answer contradicts an earlier one
-    (runtime.confirm_reason). A "no" re-collects the item.
+    confirm marks a score-bearing item whose answer may need reading back before
+    it is committed. It is a permission for a read-back, not a demand for one:
+    what actually triggers it is a conversion assumption, a near-boundary value
+    or a contradiction with an earlier answer. A refusal re-collects the item.
 
-    `coding` names the deterministic derivation for semantic answers
-    (coding.py, T26): "choice" items accept a directly coded option;
-    "freq_q1"/"freq5" items require an extracted rate (value + per) and
-    "quantity_drinks" items an extracted amount (value + unit [+ beverage]) —
-    the option code is then COMPUTED from the scale tables, never taken from
-    the model's claim.
+    coding says how a semantic answer becomes a code. "choice" items take the
+    coded option directly; the frequency and quantity scales instead require the
+    raw numbers to be extracted, and compute the option themselves — see
+    coding.py for why that distinction matters.
     """
 
     text: str
     options: tuple[Option, ...]
-    note: str = ""  # skip rule / scoring deviation, rendered with the item
+    note: str = ""  # a skip rule or scoring deviation, rendered with the item
     verbatim: bool = True
     confirm: bool = False
     coding: str = "choice"   # "choice" | "freq_q1" | "freq5" | "quantity_drinks"
 
     @property
     def kind(self) -> str:
-        """Presentation hint for the NLU/ask layer: "yesno" | "scale".
-        Derived from the options so it can never drift from them."""
+        """"yesno" or "scale", for the asking layer.
+
+        Derived from the options rather than declared, so it cannot disagree
+        with them.
+        """
         labels = tuple(o.label.lower() for o in self.options)
         return "yesno" if labels == ("no", "yes") else "scale"
 
 
 @dataclass(frozen=True)
 class SkipRule:
-    """Declarative skip logic: when `when(scores)` is true, every item index
-    in `skip` is never asked and contributes 0 (official-form behavior).
+    """When `when` holds, the listed items are never asked and contribute zero.
 
-    `scores` maps answered item index -> CONTRIBUTED SCORE (never the raw
-    option code), so instruments where code != score (AUDIT items 9-10)
-    can never confuse a predicate. Adding a skip rule = adding data here;
-    the engine (`next_item_index`) needs no changes.
+    The predicate receives contributed scores, never raw option codes. On items
+    where the two differ, a predicate written against codes would be quietly
+    wrong, and this removes the possibility of writing one.
+
+    Adding a skip rule is adding a row here; the engine needs no change.
     """
 
     skip: tuple[int, ...]
@@ -108,25 +110,33 @@ class SkipRule:
 
 @dataclass(frozen=True)
 class RiskBand:
-    """A scoring zone and the SBIRT action it triggers.
+    """A range of scores, what it is called, and what the protocol does about it.
 
-    `zone` is the stable key used by the study's feedback templates and tests:
-    one of "healthy" | "risky" | "harmful" | "dependent" for administered
-    instruments; "" for prompt-only reference instruments.
+    `zone` is the stable key the feedback templates and tests key on, which is
+    why it is separate from the human-readable label: the label can be reworded,
+    the zone cannot. Empty for reference instruments, which are never scored.
     """
 
     label: str
-    low: int          # inclusive lower bound of the raw score
-    high: int         # inclusive upper bound
-    action: str       # which SBIRT step this zone routes to
+    low: int          # inclusive
+    high: int         # inclusive
+    action: str
     zone: str = ""
 
     def contains(self, score: int) -> bool:
+        """Whether a raw score falls in this band."""
         return self.low <= score <= self.high
 
 
 @dataclass(frozen=True)
 class Instrument:
+    """One screening tool.
+
+    `items` holds Item objects for instruments this system administers, and
+    plain strings for the reference-only ones — which is what distinguishes the
+    two tiers described in the module docstring.
+    """
+
     key: str
     name: str
     domain: str            # alcohol | drugs | tobacco | combined | adolescent
@@ -135,10 +145,11 @@ class Instrument:
     response_scale: str
     scoring: str
     bands: tuple[RiskBand, ...]
-    preamble: str = ""     # spoken once before item 1 (from the study protocol)
-    skip_rules: tuple[SkipRule, ...] = ()   # declarative skip logic (see SkipRule)
+    preamble: str = ""     # spoken once before the first item
+    skip_rules: tuple[SkipRule, ...] = ()
 
     def render(self) -> str:
+        """This instrument as prompt text, items and bands included."""
         lines = [f"### {self.name}  ({self.domain}, {len(self.items)} items)",
                  f"When to use: {self.when_to_use}",
                  f"Response scale: {self.response_scale}",
@@ -159,14 +170,14 @@ class Instrument:
 
 
 def risk_band_for(instrument: Instrument, score: int) -> RiskBand | None:
-    """Map a raw score to its risk band (None if out of range)."""
+    """The band a raw score falls in, or None if no band covers it."""
     for band in instrument.bands:
         if band.contains(score):
             return band
     return None
 
 
-# --- Shared option scales (exact wordings from the WHO AUDIT Box 4 form) -----
+# Shared answer scales, worded exactly as the WHO AUDIT interview form has them.
 _FREQ_5 = (
     Option("Never", 0),
     Option("Less than monthly", 1),
@@ -182,13 +193,14 @@ _YES_NO_TIMEFRAMED = (
 _NO_YES = (Option("No", 0), Option("Yes", 1))
 
 
-# --- Pre-screen: the study's "SBIRT 3 Questions" ------------------------------
-# This app's pre-screen per the study protocol (app dialogue + case cards) —
-# NOT the 4-item NIDA Quick Screen below, which stays as prompt-only reference.
-# score > 0 on a question = positive pre-screen for that domain.
+# The study's own three opening questions, from its dialogue document and case
+# cards. Not the NIDA Quick Screen further down, which is reference only and is
+# never administered. Any score above zero opens that domain's full instrument.
 
 @dataclass(frozen=True)
 class PreScreenQuestion:
+    """One opening question, and which arm a positive answer opens."""
+
     key: str      # "tobacco" | "alcohol" | "drugs"
     item: Item
 
@@ -249,9 +261,8 @@ AUDIT_C = Instrument(
     ),
 )
 
-# Official WHO interview version (Box 4). Skip rules are encoded in next_item_index()
-# from the notes below: item 1 "Never" skips to items 9-10; items 2+3 totalling
-# 0 skips to items 9-10. Skipped items score 0.
+# The official WHO interview version. Its skip rules are data further down: a
+# "Never" to item 1, or nothing at all on items 2 and 3, jumps to items 9-10.
 AUDIT = Instrument(
     key="audit",
     name="AUDIT (alcohol, full 10-item)",
@@ -261,11 +272,11 @@ AUDIT = Instrument(
         "Now I am going to ask you some questions about your use of alcoholic "
         "beverages during this past year."
     ),
-    # confirm=True (T20): the quantity/frequency triad (items 1-3) and the
-    # dependence-domain items (4-6, per the manual's Box 2 domains) are the
-    # score-critical answers most exposed to semantic mis-coding, so an
-    # LLM-coded answer is read back before it commits. Which items carry the
-    # flag is a clinical coding decision — PENDING CLINICIAN REVIEW.
+    # confirm marks the items where a mis-coded answer does the most damage:
+    # the quantity and frequency triad, and the dependence-domain items. These
+    # carry the most score weight and are the most exposed to a semantic answer
+    # being read the wrong way. Which items qualify is a clinical decision —
+    # pending clinician review.
     items=(
         Item("How often do you have a drink containing alcohol?",
              (Option("Never", 0),
@@ -309,7 +320,7 @@ AUDIT = Instrument(
     ),
     response_scale="Items 1–8: 0–4; items 9–10: 0/2/4",
     scoring="Sum all items (0–40). Zones per WHO manual.",
-    # WHO AUDIT Box 4 skip rules as data (predicates read contributed SCORES):
+    # The official form's skip rules, as data. Predicates read scores, not codes.
     skip_rules=(
         SkipRule(skip=tuple(range(1, 8)),
                  when=lambda s: s.get(0) == 0,
@@ -330,11 +341,12 @@ AUDIT = Instrument(
     ),
 )
 
-# Items as worded in THIS study's protocol (case cards). NOTE on item 3: the
-# standard Skinner DAST-10 asks "Are you ALWAYS ABLE to stop using drugs when
-# you want to?" and reverse-scores it ('No' = 1). The study's interview script
-# flips the wording to "unable to stop", scored POSITIVELY ('Yes' = 1) — the
-# two are equivalent, but coding must follow the wording actually asked.
+# Worded as this study's case cards have it, which differs from the standard
+# instrument at item 3. Skinner asks whether the person is always able to stop
+# and reverse-scores it, so "No" earns the point; this study asks whether they
+# are unable to stop, so "Yes" does. The two are equivalent, but the scoring
+# must follow the wording actually spoken — swapping one without the other
+# inverts the item.
 DAST_10 = Instrument(
     key="dast_10",
     name="DAST-10 (drug use, non-alcohol)",
@@ -363,9 +375,9 @@ DAST_10 = Instrument(
     ),
     response_scale="Yes/No, 1 point per problem answer",
     scoring="Count problem answers (0–10).",
-    # Zones per the study's app dialogue (feedback is keyed to these four).
-    # The standard Skinner banding splits 1-5 into low (1-2) / moderate (3-5);
-    # this study's protocol treats 1-5 as one "Risky" zone.
+    # Four zones, as the study's dialogue defines them and its feedback text is
+    # keyed to. A deliberate departure from the standard banding, which splits
+    # 1-5 into low and moderate rather than treating it as one zone.
     bands=(
         RiskBand("Healthy (no problems reported)", 0, 0,
                  "Affirm, education", zone="healthy"),
@@ -437,7 +449,7 @@ CRAFFT = Instrument(
     ),
 )
 
-# Ordered registry — iterate this to render the full catalog into the prompt.
+# The order these are rendered into the prompt.
 ALL_INSTRUMENTS: tuple[Instrument, ...] = (
     NIDA_QUICK_SCREEN,
     AUDIT_C,
@@ -452,19 +464,16 @@ BY_KEY = {ins.key: ins for ins in ALL_INSTRUMENTS}
 
 
 def render_catalog() -> str:
+    """Every instrument as prompt text, in registry order."""
     return "\n\n".join(ins.render() for ins in ALL_INSTRUMENTS)
 
-# =====================================================================
-# Deterministic scoring — same file as the instrument data on purpose:
-# a reader sees the AUDIT/DAST items AND exactly how they turn into a
-# score + risk zone in one place. Pure functions, no LLM, no IO.
+# Scoring lives in this file with the instrument data on purpose: a reviewer can
+# see the items and exactly what they turn into without following a reference.
+# All pure functions — no model, no I/O.
 #
-# A response set is {item_index: option_code} (both 0-based); the code is
-# the option's index in Item.options and its score is options[code].score
-# (AUDIT items 9-10: codes 0/1/2 score 0/2/4). Skip logic lives on each
-# instrument as declarative SkipRule data (see AUDIT.skip_rules); skipped
-# items contribute 0, per the official form.
-# =====================================================================
+# Responses throughout are {item index: option code}, both zero-based, and a
+# code's contribution is that option's score. Skipped items contribute zero, as
+# the official forms specify.
 
 
 class InvalidResponse(ValueError):
@@ -472,6 +481,7 @@ class InvalidResponse(ValueError):
 
 
 def _item(instrument: Instrument, item_index: int) -> Item:
+    """The Item at an index, raising InvalidResponse if it is not one."""
     try:
         item = instrument.items[item_index]
     except IndexError:
@@ -485,9 +495,11 @@ def _item(instrument: Instrument, item_index: int) -> Item:
 
 
 def option_score(instrument: Instrument, item_index: int, code: int) -> int:
-    """Score contributed by answering `item_index` with option `code`.
-    Raises InvalidResponse for an unknown item or code — a coding layer bug
-    must surface, never silently score 0."""
+    """Points contributed by answering an item with a given option.
+
+    Raises InvalidResponse for an unknown item or code. Returning zero instead
+    would turn a coding bug into a quietly understated screening score.
+    """
     item = _item(instrument, item_index)
     if not 0 <= code < len(item.options):
         raise InvalidResponse(
@@ -498,9 +510,7 @@ def option_score(instrument: Instrument, item_index: int, code: int) -> int:
 
 def _skipped_items(instrument: Instrument,
                    responses: Mapping[int, int]) -> frozenset[int]:
-    """Item indexes removed by the instrument's declarative skip_rules, given
-    answers so far. Rules read contributed SCORES (never raw codes), so the
-    generalization is safe for instruments where code != score."""
+    """Which items the skip rules remove, given the answers so far."""
     if not instrument.skip_rules:
         return frozenset()
     scores = {i: option_score(instrument, i, code)
@@ -514,11 +524,18 @@ def _skipped_items(instrument: Instrument,
 
 def next_item_index(instrument: Instrument, responses: Mapping[int, int],
                     missing: Collection[int] = ()) -> int | None:
-    """The next item to administer, honoring skip rules; None when complete.
-    Items are asked in order; skipped items are never asked. `missing` items
-    (persistent don't-know / declined single items, F1/F2) are never re-asked
-    and contribute 0 like officially skipped items — but they mark the
-    assessment incomplete (see Assessment.missing)."""
+    """The next item to ask, or None once the instrument is finished.
+
+    Args:
+        instrument: the instrument being administered.
+        responses: answers so far.
+        missing: items the person could not or would not answer.
+
+    Items are asked in order, and skipped ones are never asked. Missing items
+    are likewise not re-asked and contribute zero — but unlike skipped items
+    they mark the assessment incomplete, because the score is then a floor
+    rather than a result.
+    """
     skipped = _skipped_items(instrument, responses)
     for i in range(len(instrument.items)):
         if i in skipped or i in responses or i in missing:
@@ -529,12 +546,12 @@ def next_item_index(instrument: Instrument, responses: Mapping[int, int],
 
 def is_complete(instrument: Instrument, responses: Mapping[int, int],
                 missing: Collection[int] = ()) -> bool:
+    """Whether every item has been answered, skipped or marked missing."""
     return next_item_index(instrument, responses, missing) is None
 
 
 def total_score(instrument: Instrument, responses: Mapping[int, int]) -> int:
-    """Sum of contributed scores. Skipped items count 0 (official form).
-    Validates every recorded response."""
+    """The instrument's raw score. Every recorded response is validated."""
     skipped = _skipped_items(instrument, responses)
     return sum(option_score(instrument, i, code)
                for i, code in responses.items() if i not in skipped)
@@ -542,35 +559,41 @@ def total_score(instrument: Instrument, responses: Mapping[int, int]) -> int:
 
 @dataclass(frozen=True)
 class Assessment:
-    """The authoritative screening result for one instrument.
+    """The screening result for one instrument.
 
-    `missing` lists items the person could not / would not answer (F1/F2):
-    they scored 0, so `score` is a LOWER BOUND and the zone a floor — the
-    audit record carries the flag so the provider sees which items to follow
-    up rather than a false picture of complete data. (Whether the spoken
-    feedback should also mention it: PENDING CLINICIAN REVIEW.)
+    Anything in `missing` was left unanswered and scored zero, which makes
+    `score` a lower bound and the zone a floor rather than a finding. That
+    distinction is carried on the result and into the audit record, so a
+    provider sees which items to follow up instead of a result that looks
+    complete. Whether the spoken feedback should mention it is pending
+    clinician review.
     """
 
     instrument_key: str
     score: int
     complete: bool
-    band: RiskBand | None     # None only if score is out of any band's range
+    band: RiskBand | None     # None only when the score falls outside every band
     missing: tuple[int, ...] = ()
 
     @property
     def zone(self) -> str:
+        """The stable zone key, or "" when no band matched."""
         return self.band.zone if self.band else ""
 
     @property
     def action(self) -> str:
+        """What the protocol does about this zone, or "" when no band matched."""
         return self.band.action if self.band else ""
 
 
 def assess(instrument: Instrument, responses: Mapping[int, int],
            missing: Collection[int] = ()) -> Assessment:
-    """Compute the deterministic score + risk zone for the responses so far.
-    `complete=False` means items remain; the score is the running subtotal.
-    Unanswerable items in `missing` score 0 and are carried on the result."""
+    """Score the answers so far and place them in a risk zone.
+
+    Safe to call mid-instrument: an incomplete result carries the running
+    subtotal, and says so. Missing items score zero and are listed on the
+    result, so a zone derived from a partial screening can be recognised as one.
+    """
     score = total_score(instrument, responses)
     return Assessment(
         instrument_key=instrument.key,

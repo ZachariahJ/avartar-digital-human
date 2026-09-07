@@ -1,38 +1,34 @@
-"""Versioned fixed script for the study protocol (P5 data).
+"""Everything the counselor says word for word, transcribed from the study script.
 
-Every fixed thing the counselor says — permissions, standard-drink education,
-zone feedback, brief-intervention lines, closing — transcribed VERBATIM from
-the study's authoritative dialogue ("AI SBIRT app dialogue for study.docx" in
-SBIRT_Reference/). The runtime speaks these strings exactly; the LLM never
-generates or paraphrases them. Because they are fixed, every one of them can
-be pre-rendered into the in-RAM clip cache (see pipeline.prewarm_fixed_clips).
+Permissions, the standard-drink education, zone feedback, the brief-intervention
+lines and the closings. The engine speaks these exactly; nothing here is ever
+generated or paraphrased, because study fidelity depends on every participant
+hearing the same words. Being fixed is also what makes them cacheable as
+pre-rendered clips.
 
-Clip staleness is handled by pipeline.clip_stamp;
-the consent audit anchors the exact greeting wording by content hash.
+Edits to these strings are clinical changes, not copy edits. Four departures
+from the source document were made deliberately and are recorded here:
 
-Documented normalizations of source-document typos (flagged for clinician
-review; nothing else was reworded):
-  • "How much you usually drink?"        → "How much do you usually drink?"
-  • "I recommended that you cut down"    → "I recommend that you cut down"
-  • ruler: "10 meaning you ready"        → "... you are ready"
-  • The Dependent-alcohol feedback in the source embeds a duplicate
-    "May I give you feedback..." permission sentence (already asked one turn
-    earlier); the duplicate is dropped here.
+  * "How much you usually drink?" reads "How much do you usually drink?"
+  * "I recommended that you cut down" reads "I recommend that you cut down"
+  * the ruler's "10 meaning you ready" reads "you are ready"
+  * the dependent-alcohol feedback repeats a permission sentence that was
+    already asked a turn earlier; the repeat is dropped.
+
+Several entries below have no source text at all, because the study document
+does not cover the path. Each is marked, and all of them are pending clinician
+review.
 """
 
 from __future__ import annotations
 
-# Substance-arm wording: the source writes "alcohol/drug use" and "using
-# alcohol/drugs" meaning "pick the arm's substance"; instantiated per arm.
-_USE_NOUN = {"alcohol": "alcohol", "drugs": "drug"}    # "... about {x} use?"
-_STOP_NOUN = {"alcohol": "alcohol", "drugs": "drugs"}  # "... stop using {x}"
+# The source writes "alcohol/drug use", meaning whichever arm is running. The
+# two nouns differ because English does: "drug use" but "stop using drugs".
+_USE_NOUN = {"alcohol": "alcohol", "drugs": "drug"}
+_STOP_NOUN = {"alcohol": "alcohol", "drugs": "drugs"}
 
 
-# --------------- Fixed lines, keyed for clip caching ---------------
 FIXED: dict[str, str] = {
-    # Alcohol arm — standard-drink education. (The old three-questions-in-one
-    # "alcohol.qf" line is gone: the flow's slot-ask covers drink/amount/
-    # frequency ONE question at a time, phrased by the LLM.)
     "alcohol.edu.permission": (
         "May I provide you some more information about drinking alcohol?"
     ),
@@ -56,10 +52,9 @@ FIXED: dict[str, str] = {
         "past year? In these questions a drink refers to the standard drink "
         "definition we just discussed."
     ),
-    # Spoken INSTEAD of the line above when the user declined the standard-
-    # drink education: it must not claim a definition "we just discussed" was
-    # discussed. The flow picks the variant from state.covered. Wording is the
-    # source line minus the false reference. PENDING CLINICIAN REVIEW.
+    # Replaces the line above when the education was declined, since that one
+    # refers back to a definition "we just discussed". The source line minus
+    # that reference; nothing else changed. Pending clinician review.
     "alcohol.screen.permission.no_defn": (
         "May I ask you a few more questions about your use of alcohol in the "
         "past year?"
@@ -69,7 +64,6 @@ FIXED: dict[str, str] = {
         "your alcohol use?"
     ),
 
-    # Drug arm
     "drugs.kind": "What kind of drugs do you use?",
     "drugs.screen.permission": (
         "May I ask you a few more questions about your drug use in the past "
@@ -80,59 +74,53 @@ FIXED: dict[str, str] = {
         "about your drug use?"
     ),
 
-    # Close (spoken at the end of a COMPLETED session — study text verbatim;
-    # its "few more questions about your experiences" refers to the study's
-    # post-session experience survey)
+    # Spoken at the end of a completed session. Its "few more questions about
+    # your experiences" refers to the study's post-session survey, not to
+    # anything this conversation will ask.
     "close": (
         "Thank you for participating in this process. "
         "Our staff will follow up with you about your experiences."
     ),
-    # Close spoken when the session ends because the user DECLINED a screening/
-    # feedback/BI permission: it must not promise more questions right after
-    # "that's your call" (the session actually ends here — the old close
-    # contradicted itself on this path). Source has no dedicated text; minimal
-    # autonomy-respecting goodbye. PENDING CLINICIAN REVIEW.
+    # For a session that ends because a permission was declined. The close
+    # above promises more questions, which contradicts having just told the
+    # person it was their call. No source text exists for this path; this is a
+    # minimal goodbye that respects the refusal. Pending clinician review.
     "close.declined": (
         "Thank you for your time today. Your provider can pick any of this "
         "up with you during your visit, whenever you're ready."
     ),
-    # All pre-screens negative: the source dialogue has no dedicated text, so a
-    # minimal neutral affirmation precedes the standard close. PENDING
-    # CLINICIAN REVIEW.
+    # When nothing screened positive. No source text; a neutral affirmation
+    # before the standard close. Pending clinician review.
     "prescreen.all_negative": (
         "Thank you for answering those questions. Based on your answers, your "
         "use is not likely to cause you any health problems."
     ),
-    # User declines a mid-protocol permission (education / screening items /
-    # feedback / more questions). Source gives no text; minimal autonomy-
-    # respecting line. PENDING CLINICIAN REVIEW.
+    # For declining a permission mid-protocol, where the session continues. No
+    # source text. Pending clinician review.
     "permission.declined": (
         "That's completely your call, and that's fine."
     ),
-    # User asks to STOP the whole conversation mid-protocol (T22 abort).
-    # Source gives no text; autonomy-respecting goodbye, no retention
-    # attempt, answers so far stay recorded for the provider. PENDING
-    # CLINICIAN REVIEW.
+    # For stopping the whole conversation. No source text. Deliberately makes
+    # no attempt to keep the person; answers already given still reach their
+    # provider. Pending clinician review.
     "close.aborted": (
         "Of course — we can stop here, and that's completely fine. Thank "
         "you for your time today. Anything you shared stays confidential, "
         "and your provider can pick this up with you whenever you're ready."
     ),
-    # A question the person cannot / will not answer after the recall-anchor
-    # probe (F1/F2 missing-data exit): acknowledge and move on — the manual's
-    # guidance is to note uncertainties on the record, not to interrogate
-    # (SBIRT_REF.pdf p.18). Source gives no text; PENDING CLINICIAN REVIEW.
+    # For an item the person still cannot answer after being offered a recall
+    # aid. The manual's guidance is to note uncertainty on the record rather
+    # than press (SBIRT_REF.pdf p.18). No source text; pending clinician review.
     "item.skipped": (
         "That's okay — we can set that one aside. I'll make a note of it "
         "for your provider."
     ),
-    # Brief-intervention closer (source line; the flow Tells it right before
-    # listening for the open answer).
     "bi.leaves_you": "So where does this leave you?",
 }
 
 
-# --------------- Zone feedback (verbatim, keyed by instrument + zone) --------
+# Keyed by instrument and zone; every combination the protocol can reach must
+# have an entry here.
 FEEDBACK: dict[tuple[str, str], str] = {
     ("audit", "healthy"): (
         "Based on your answers you are using alcohol within normal "
@@ -197,10 +185,10 @@ FEEDBACK: dict[tuple[str, str], str] = {
     ),
 }
 
-# Zones whose feedback text ends by asking permission to continue into the
-# brief intervention ("May I ask you some more questions about this?").
-# NOTE: the source's Dependent-DRUG text does NOT end with that question;
-# the machine still routes dependent to the BI/referral arm explicitly.
+# Zones whose feedback already ends by asking permission for the intervention.
+# The flow uses this to avoid asking twice. The dependent-drug text is absent
+# because the source does not end it with that question, so that route asks
+# explicitly.
 FEEDBACK_ASKS_BI: frozenset[tuple[str, str]] = frozenset(
     k for k, v in FEEDBACK.items()
     if v.rstrip().endswith("May I ask you some more questions about this?")
@@ -208,32 +196,40 @@ FEEDBACK_ASKS_BI: frozenset[tuple[str, str]] = frozenset(
 
 
 def feedback_text(instrument_key: str, zone: str) -> str:
-    """The verbatim feedback for a completed screen. KeyError = a zone the
-    protocol does not define — that must surface, never be improvised."""
+    """The verbatim feedback for a completed screen.
+
+    A KeyError means the protocol reached a zone with no authored text, which
+    must surface as a bug — improvising feedback about somebody's screening
+    result is exactly what this module exists to prevent.
+    """
     return FEEDBACK[(instrument_key, zone)]
 
 
-# --------------- Brief intervention (decisional balance + ruler) -------------
 def bi_permission(arm: str) -> str:
-    """Source line 'May I ask you some more questions about your alcohol/drug
-    use?' — spoken when a feedback text doesn't already end with the BI ask."""
+    """Ask permission for the intervention, when the feedback did not already."""
     return f"May I ask you some more questions about your {_USE_NOUN[arm]} use?"
 
 
 def bi_likes(arm: str) -> str:
+    """Half of the decisional balance. Asked before the dislikes, deliberately:
+    leading with what someone values about their use is what makes the exercise
+    read as curiosity rather than as a set-up."""
     return f"What do you like about {_USE_NOUN[arm]} use?"
 
 
 def bi_dislikes(arm: str) -> str:
+    """The other half of the decisional balance."""
     return f"What do you dislike about {_USE_NOUN[arm]} use?"
 
 
 def bi_recommend(arm: str) -> str:
+    """The recommendation. Ends on readiness, which keeps the choice theirs."""
     return (f"Based on your answers I recommend that you cut down or stop "
             f"using {_STOP_NOUN[arm]}, but you have to be ready.")
 
 
 def bi_ruler(arm: str) -> str:
+    """The 0-10 readiness question, with both ends of the scale spelled out."""
     s = _STOP_NOUN[arm]
     return (f"Based on a scale from 0 to 10, with 0 meaning you are not at all "
             f"ready to cut down or stop using {s} and 10 meaning you are "
@@ -242,38 +238,38 @@ def bi_ruler(arm: str) -> str:
 
 
 def bi_why_not_lower(value: int) -> str:
+    """Asks them to argue upward from their own number, which evokes change talk."""
     return f"Why are you a {value} and not a 1 or 2?"
 
 
 def bi_why_not_higher(value: int) -> str:
+    """The counterpart, which surfaces what is holding them back."""
     return f"Why are you a {value} and not a 9 or 10?"
 
-
-
-
-# --------------- Content units (T8): what a turn must convey ---------------
-# A Unit is ONE thing the counselor delivers in a turn. verbatim=True units
-# speak `literal` exactly (study fidelity; cacheable as a clip). verbatim=False
-# units give the LLM `points` — the clinical content it must cover in its own
-# words for THIS person (typically grounded in state the engine passes along,
-# e.g. the user's own likes/dislikes wording). The LLM may rephrase points;
-# it may not drop, extend, or contradict them.
 
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class Unit:
+    """One thing the counselor delivers in a turn.
+
+    A verbatim unit is spoken exactly as written and can be pre-rendered as a
+    clip. A non-verbatim one instead lists the clinical content the turn must
+    convey, and is worded for this particular person — typically around
+    something they said. The model may rephrase those points; it may not drop,
+    extend or contradict them.
+    """
+
     id: str
     verbatim: bool
-    literal: str = ""             # verbatim=True: the exact text
-    points: tuple[str, ...] = ()  # verbatim=False: content the LLM must cover
+    literal: str = ""             # for verbatim units
+    points: tuple[str, ...] = ()  # for non-verbatim ones
 
 
-# Non-verbatim units: the brief-intervention reflections/summaries the LLM
-# phrases each time (these were inline instructions in runtime.py; as data
-# they are reviewable and testable). {likes}/{dislikes}/{ruler}... slots are
-# filled by the engine from captured state before handing to the LLM.
+# The intervention's reflections and summaries, which have to be worded around
+# what this person actually said. The braced slots are filled by the engine from
+# captured state before the model ever sees them.
 POINTS_UNITS: dict[str, Unit] = {
     u.id: u for u in (
         Unit("bi.summary.balance", verbatim=False, points=(
@@ -295,12 +291,13 @@ POINTS_UNITS: dict[str, Unit] = {
 
 
 def all_fixed_utterances() -> dict[str, str]:
-    """Every fixed utterance the protocol can ever speak, keyed exactly as the
-    runtime emits them (runtime.Say.key). Single source for clip pre-warming
-    (pipeline.prewarm_fixed_clips) and for the everything-is-cacheable tests.
-    Parameterized lines are enumerated over their full domain (ruler 0-10) so
-    the runtime never has to render a 'fixed' line on the fly."""
-    from .instruments import BY_KEY, PRE_SCREEN  # local: avoid import cycles
+    """Every fixed utterance the protocol can speak, keyed as the runtime emits it.
+
+    The one source for both clip pre-warming and the tests that assert nothing
+    fixed is ever rendered mid-conversation. Parameterised lines are enumerated
+    across their whole domain, so a fixed line is never a cache miss.
+    """
+    from .instruments import BY_KEY, PRE_SCREEN  # imported here to break a cycle
 
     out = dict(FIXED)
     for (ins_key, zone), text in FEEDBACK.items():
@@ -319,7 +316,9 @@ def all_fixed_utterances() -> dict[str, str]:
         out[f"bi.dislikes.{arm}"] = bi_dislikes(arm)
         out[f"bi.recommend.{arm}"] = bi_recommend(arm)
         out[f"bi.ruler.{arm}"] = bi_ruler(arm)
+    # Every possible ruler value, so both follow-ups are cacheable clips rather
+    # than a render at the moment they are needed.
     for v in range(11):
         out[f"bi.why_not_lower.{v}"] = bi_why_not_lower(v)
         out[f"bi.why_not_higher.{v}"] = bi_why_not_higher(v)
-    return out   # bi.leaves_you arrives via FIXED
+    return out

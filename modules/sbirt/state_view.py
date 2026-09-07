@@ -1,18 +1,21 @@
-"""Read-only rendering of the FULL interview state for the LLM.
+"""Shows the model the whole interview, not just the question in front of it.
 
-Step 1 of the context refactor: every conversational failure traced back to
-the LLM seeing only the current item — never the map. This module renders the
-whole ClinicalSession as ONE compact text block injected into every turn's
-context, so the model can answer "how many questions are left / what is this
-for / what did I already say" from state instead of guessing.
+A model that can only see the current item cannot answer "how many are left",
+"what is this for" or "didn't I already tell you that" — and a model that cannot
+answer those will invent an answer. This renders the entire session as one
+compact block, included in every turn, so those questions are answered from
+state.
 
-Contract:
-  • PURE: same session state -> same string; no IO, no session mutation.
-  • Full re-render every turn — ClinicalSession stays the single source of
-    truth; nothing here is incremental or cached per session.
-  • No PHI: answered items render as option CODE + official option label
-    only; open captures render as "(captured)" — never transcript text.
-  • Compact: MAX_CHARS bounds the whole block (snapshot tests assert it).
+The contract this must keep:
+
+  * Pure. The same session renders the same string, with no I/O and no
+    mutation.
+  * Re-rendered in full every turn. Nothing here is incremental or cached, so
+    the session remains the only source of truth and this cannot go stale.
+  * No patient content. Answered items appear as their code and official option
+    label; open captures appear only as having been captured. Nothing the
+    person said in their own words is ever rendered.
+  * Bounded by MAX_CHARS, since this is prepended to every single turn.
 """
 
 from __future__ import annotations
@@ -21,8 +24,8 @@ from .flow import ARM_INSTRUMENT, ARM_ORDER
 from .instruments import BY_KEY, PRE_SCREEN, _skipped_items
 from .runtime import ClinicalSession, Say, Speak
 
-# Hard budget for the rendered block (~4 chars/token — a few hundred tokens).
-# tests/test_state_view.py asserts every covered protocol state fits.
+# Roughly a few hundred tokens, paid on every turn. The tests assert that every
+# reachable protocol state renders within it.
 MAX_CHARS = 3000
 
 _TITLE = {"audit": "AUDIT", "dast_10": "DAST-10"}
@@ -39,10 +42,12 @@ _ROLE = (
 
 
 def _prescreen_done(session: ClinicalSession) -> bool:
+    """Whether every pre-screen question has been answered."""
     return all(q.key in session.prescreen for q in PRE_SCREEN)
 
 
 def _prescreen_line(session: ClinicalSession) -> str:
+    """The pre-screen results, including which question is being asked now."""
     exp = session.expect
     missing = session.missing.get("prescreen", {})
     parts = []
@@ -60,6 +65,7 @@ def _prescreen_line(session: ClinicalSession) -> str:
 
 
 def _arm_lines(session: ClinicalSession) -> list[str]:
+    """Each arm and where it stands: skipped, active, queued, scored or declined."""
     lines = []
     for arm in ARM_ORDER:
         ins_key = ARM_INSTRUMENT[arm]
@@ -77,6 +83,8 @@ def _arm_lines(session: ClinicalSession) -> list[str]:
         else:
             status = "ended (permission declined)"
         lines.append(f"  {arm} → {name}: {status}")
+    # Tobacco is screened for but has no arm, so say so explicitly — otherwise
+    # a positive answer looks like something the interview forgot about.
     if session.prescreen.get("tobacco", 0) > 0:
         lines.append("  tobacco: POSITIVE flag noted for the provider "
                      "(this protocol has no tobacco question arm)")
@@ -84,8 +92,11 @@ def _arm_lines(session: ClinicalSession) -> list[str]:
 
 
 def _item_lines(session: ClinicalSession, ins_key: str) -> list[str]:
-    """One line per item of the active instrument, with consecutive
-    same-status items ("to ask" / rule-skips) collapsed into ranges."""
+    """One line per item of the active instrument.
+
+    Runs of items sharing a status are collapsed into a range, which is what
+    keeps a ten-item instrument inside the character budget.
+    """
     ins = BY_KEY[ins_key]
     responses = session.responses.get(ins_key, {})
     missing = session.missing.get(ins_key, {})
@@ -140,6 +151,7 @@ def _item_lines(session: ClinicalSession, ins_key: str) -> list[str]:
 
 
 def _next_line(session: ClinicalSession) -> str:
+    """What remains after the current point, so "how much is left" is answerable."""
     rest = ", ".join(f"{a} → {_TITLE[ARM_INSTRUMENT[a]]}"
                      for a in session.arms)
     tail = f" → then {rest}" if rest else ""
@@ -156,7 +168,11 @@ def _next_line(session: ClinicalSession) -> str:
 
 
 def _ask_text(session: ClinicalSession) -> tuple[str, str]:
-    """The verbatim text of the pending ask + how it was delivered."""
+    """The pending question, and a note that it has already been spoken.
+
+    The second half matters: these lines play from cached clips, so a model that
+    assumed it still had to ask would repeat the question the person just heard.
+    """
     exp = session.expect
     if exp.kind == "option" and exp.instrument:
         item = (PRE_SCREEN[exp.item_index].item
@@ -180,6 +196,7 @@ def _ask_text(session: ClinicalSession) -> tuple[str, str]:
 
 
 def _answer_shape(session: ClinicalSession) -> str:
+    """What a valid answer to the pending question looks like."""
     exp = session.expect
     kind = exp.kind
     if kind == "consent":
@@ -212,6 +229,7 @@ def _answer_shape(session: ClinicalSession) -> str:
 
 
 def _goal_lines(session: ClinicalSession) -> list[str]:
+    """What this turn is for: the pending ask, or why there is not one."""
     if session.crisis:
         return ["Crisis protocol is active — no protocol question is "
                 "pending. Respond with empathy and the crisis lines "
@@ -230,6 +248,7 @@ def _goal_lines(session: ClinicalSession) -> list[str]:
 
 
 def _phase_lines(session: ClinicalSession) -> list[str]:
+    """Where the session is overall, and who owns the decisions that follow."""
     if session.crisis:
         stage = "CRISIS PAUSE — the protocol is paused for the rest of the session"
     elif session.aborted:
@@ -251,8 +270,11 @@ def _phase_lines(session: ClinicalSession) -> list[str]:
 
 
 def render_interview_state(session: ClinicalSession) -> str:
-    """The whole interview as one compact, PHI-free text block (see module
-    docstring for the contract). Pure read of ClinicalSession."""
+    """The whole interview as one block, for inclusion in this turn's context.
+
+    A pure read of the session; see the module docstring for what this is
+    required to guarantee.
+    """
     out = ["=== INTERVIEW STATE (program-owned; re-rendered every turn) ==="]
 
     out.append("[MAP]")
@@ -269,6 +291,7 @@ def render_interview_state(session: ClinicalSession) -> str:
     out.append("[CURRENT GOAL]")
     out.extend(_goal_lines(session))
 
+    # Placeholder for answers volunteered before their question is reached.
     out.append("[HARVESTED CANDIDATES]")
     out.append("(none yet — early-answer harvesting lands in a later task)")
 

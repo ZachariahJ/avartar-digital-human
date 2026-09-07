@@ -1,20 +1,16 @@
-"""Patient-data protection: keep PHI out of logs, and record consent.
+"""Two obligations around patient data: keep it out of logs, and record consent.
 
-Two small, related jobs live together here because they answer the same
-question — "what do we do to protect the person's data?":
+Everything a patient says, everything the counselor says back, and the profile
+extracted from either is protected health information. Passing such a value
+through phi() before logging it yields a shape summary like "<phi 7w/41c>",
+which keeps logs useful for debugging without their contents ever becoming a
+disclosure. config.LOG_PHI disables the redaction for local work and must stay
+off wherever real patients are seen.
 
-  • phi() / phi_keys() — everything a patient says (ASR transcripts),
-    everything the counselor says back (LLM sentences), and the extracted
-    patient profile are PHI. Wrap any such value in a log line with phi();
-    it renders a content-free shape summary ("<phi 7w/41c>") so logs stay
-    debuggable without ever leaking content. There is NO opt-out: PHI never
-    reaches the logs, not even in local debugging.
-
-  • record_consent() — append-only JSONL audit trail: one line per consent
-    decision (what, when, and the exact greeting wording by content hash).
-    No transcripts, no screening codes, no names — the session key is the
-    browser-generated pseudonymous UUID. A write failure logs a warning and
-    returns False; it must never break a conversation turn.
+record_consent() writes the audit trail: one line per decision, carrying the
+decision, the time and a hash of the wording consented to. No transcripts, no
+screening results and no names — sessions are identified only by the browser's
+pseudonymous id.
 """
 
 from __future__ import annotations
@@ -31,13 +27,10 @@ import config
 logger = logging.getLogger(__name__)
 
 
-# --------------- PHI-safe logging ---------------
-
 def phi(value) -> str:
-    """Render user/clinical content for a log line without leaking it.
+    """Summarise a value's shape for a log line without revealing its content.
 
-    With config.LOG_PHI set, the value is logged verbatim instead (local
-    debugging only — transcripts then sit in run.log in the clear).
+    Returns the value verbatim when config.LOG_PHI is set.
     """
     s = str(value)
     if config.LOG_PHI:
@@ -46,8 +39,11 @@ def phi(value) -> str:
 
 
 def phi_keys(mapping) -> str:
-    """Render a PHI-bearing dict for logs as its key list only (verbatim when
-    config.LOG_PHI is set)."""
+    """Log which facts a mapping holds without logging any of their values.
+
+    Returns the mapping verbatim when config.LOG_PHI is set. Falls back to a
+    placeholder for anything that is not key-addressable.
+    """
     if config.LOG_PHI:
         return repr(mapping)
     try:
@@ -56,19 +52,30 @@ def phi_keys(mapping) -> str:
         return "<phi mapping>"
 
 
-# --------------- Consent audit trail ---------------
-
 _lock = threading.Lock()
 
 
 def _greeting_version() -> str:
-    """Short content hash of the exact consent wording the user answered to."""
+    """Hash of the wording being consented to.
+
+    Recorded with each decision so that a later edit to the greeting is visible
+    as a version change instead of silently reinterpreting old records.
+    """
     return hashlib.sha256(config.GREETING_TEXT.encode("utf-8")).hexdigest()[:12]
 
 
 def record_consent(session_key: str, decision: str) -> bool:
-    """Append one consent decision. Returns True if written, False on failure
-    (logged, never raised — a turn must not break on an audit write)."""
+    """Append one consent decision to the audit trail.
+
+    Args:
+        session_key: the browser's pseudonymous session id.
+        decision: "yes" or "no".
+
+    Returns:
+        True if the line was written. A failure is logged and returns False
+        rather than raising, so an unwritable audit file cannot break a
+        conversation in progress.
+    """
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "session": session_key,

@@ -1,22 +1,20 @@
-/* Microphone capture for the counselor's audio path.
+/* Batches microphone audio and converts it to the format the server expects.
  *
- * There is deliberately no DSP here. Echo cancellation (WebRTC AEC3), noise
- * suppression and gain control all run inside the browser's own audio pipeline,
- * ahead of this node — see the getUserMedia constraints in index.html. Doing any
- * of it again on this side would only fight them: the browser's canceller is
- * non-linear, and a second stage cannot undo what it has already reshaped.
+ * That is all it does, and the absence of any signal processing is deliberate.
+ * Echo cancellation, noise suppression and gain control already run inside the
+ * browser ahead of this node — see the getUserMedia constraints in index.html.
+ * Adding a second stage here would fight them rather than help: the browser's
+ * canceller is non-linear, so nothing downstream can undo what it has done.
  *
- * All this node does is batch the stream and convert it to the int16 the audio
- * WebSocket carries. It replaces a ScriptProcessorNode, which is deprecated and
- * ran the same conversion on the main thread, where it competed with video
- * playback and the chat UI.
+ * Runs on the audio thread. Doing the same work on the main thread makes it
+ * compete with video playback and the chat UI, which is audible.
  */
 'use strict';
 
-// One Silero VAD chunk (modules/vad.py splits incoming audio on 512 samples, so
-// anything that is not a multiple of 512 gets zero-padded and corrupts the tail).
-// 512 at 16 kHz = 32 ms per message, which also keeps ASR-confirmed barge-in
-// (BARGE_IN_RECHECK in config.py) responsive.
+// Exactly one chunk of what the server's voice detector consumes. Sending any
+// other size means the remainder is zero-padded on that side, which corrupts
+// the tail of every message. At 16 kHz this is 32ms per message, which is also
+// what keeps interrupting the avatar feel immediate.
 const CHUNK = 512;
 
 class MicCapture extends AudioWorkletProcessor {
@@ -28,15 +26,20 @@ class MicCapture extends AudioWorkletProcessor {
 
   process(inputs) {
     const ch = inputs[0] && inputs[0][0];
-    if (!ch) return true;                 // mic not connected yet, or a silent render quantum
+    if (!ch) return true;                 // mic not connected, or a silent quantum
     for (let i = 0; i < ch.length; i++) {
       this.buf[this.n++] = ch[i];
       if (this.n === CHUNK) {
         const pcm = new Int16Array(CHUNK);
         for (let k = 0; k < CHUNK; k++) {
+          // Clamp before scaling: a sample outside [-1, 1] wraps around on
+          // conversion, turning a loud passage into a burst of noise. The two
+          // scale factors differ because the int16 range is asymmetric.
           const c = this.buf[k] < -1 ? -1 : (this.buf[k] > 1 ? 1 : this.buf[k]);
           pcm[k] = c < 0 ? c * 0x8000 : c * 0x7fff;
         }
+        // Transferred rather than copied, so each message costs no allocation
+        // on the receiving side.
         this.port.postMessage(pcm, [pcm.buffer]);
         this.n = 0;
       }

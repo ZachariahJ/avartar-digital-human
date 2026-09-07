@@ -1,28 +1,25 @@
-"""In-memory store for everything the browser plays.
+"""Everything the browser plays, held in memory rather than on disk.
 
-Two things live here:
+Two kinds of entry:
 
-  * blobs — the bytes behind a ``/media/<token>.wav`` URL. A dynamic sentence's
-    audio used to be a file in ``tmp/`` that a janitor deleted after a TTL; it is
-    now bytes with the same TTL, and the URL is the only handle anyone gets.
-  * clips — a fully rendered FIXED utterance: its audio blob plus every JPEG
-    frame, under the utterance's stable key. This replaces the
-    ``assets/clips/<key>.frames/`` directory tree.
+  * blobs — bytes addressed by a token, which is what a ``/media/<token>`` URL
+    resolves to. Dynamic sentences publish here with a TTL.
+  * clips — one fully rendered fixed utterance under a stable key: its audio,
+    pinned, plus every JPEG frame in order.
 
-Why RAM. ``assets/clips`` sits on GPFS, and replaying one cached fixed clip
-meant ~300 sequential ``open()`` calls across a network filesystem: 0.4-0.7s of
-pure I/O before the segment could even be announced, all of it in front of the
-user. Frames leave the GPU as bytes and now reach the browser as bytes.
+The reason for memory is latency. The previous on-disk cache lived on networked
+GPFS, where replaying one cached utterance meant roughly 300 sequential opens,
+costing 0.4-0.7s before playback could even be announced — all of it visible to
+the user. Frames leave the GPU as bytes and now stay bytes the whole way.
 
-The trade is deliberate and has a real cost: nothing survives a restart, so
-``pipeline.prewarm_fixed_clips`` re-renders the protocol on every boot instead
-of reading it back. That is why the pre-warm runs at idle and yields its GPU to
-any live conversation, and why a cache miss during a conversation streams the
-utterance (first frame out fast) rather than blocking on a full render.
+The cost is that nothing survives a restart, so the fixed clips must be
+re-rendered on every boot. That is why the pre-warm yields its GPU to live
+conversations, and why a cache miss during a conversation streams the utterance
+out as it renders instead of waiting for the whole thing.
 
-Thread-safety: one lock over both maps, held only for dict work — never across
-a render. Every stored value is immutable ``bytes``, so a caller reads what it
-was handed without holding anything.
+Thread safety: one lock covers both maps and is held only for dictionary work,
+never across a render. Stored values are immutable bytes, so a caller can use
+what it was handed after releasing the lock.
 """
 
 import logging
@@ -35,17 +32,19 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Every blob here is one utterance's audio and the TTS emits exactly one format
-# — so the type is a constant, not a field. The extension on the URL is cosmetic
-# (the Content-Type header is what the browser obeys) but it costs four
-# characters and makes every log line readable.
+# Every blob is one utterance's audio and the TTS emits a single format, so this
+# is a constant rather than per-blob state. The extension is cosmetic — browsers
+# follow the Content-Type header — but it makes URLs readable in logs.
 MEDIA_TYPE = "audio/wav"
 _MEDIA_EXT = ".wav"
 
 
 class Blob:
-    """Bytes reachable by URL. `expires_at` None means pinned: something (a
-    cached clip) owns it and only that owner may release it."""
+    """Bytes reachable by token.
+
+    An `expires_at` of None means pinned: some clip owns these bytes and only
+    that owner may release them, so the sweeper must leave them alone.
+    """
 
     __slots__ = ("data", "expires_at")
 
@@ -55,12 +54,12 @@ class Blob:
 
 
 class Clip:
-    """One fixed utterance, rendered: pinned audio blob + every frame in order.
+    """One fixed utterance, fully rendered: pinned audio plus frames in order.
 
-    `stamp` is what the clip was rendered FROM (text, avatar fingerprint, fps —
-    see pipeline.clip_stamp). A get() with a different stamp is a miss, not a
-    stale hit, which is what stops an edited GREETING_TEXT from replaying the
-    old wording out of a still-warm cache.
+    `stamp` describes everything the render depended on — the text, the avatar
+    and the frame rate. Looking up with a different stamp misses rather than
+    hitting, which is what stops edited wording or a swapped avatar from being
+    replayed from a cache that is still warm.
     """
 
     __slots__ = ("key", "stamp", "audio_token", "frames", "nbytes")
@@ -76,16 +75,23 @@ class Clip:
 
 _lock = threading.Lock()
 _blobs: dict[str, Blob] = {}
-# LRU: most recently used last, so eviction pops from the front.
+# Ordered so eviction can pop the least recently used from the front.
 _clips: "OrderedDict[str, Clip]" = OrderedDict()
 _clip_bytes = 0
 
 
-# --------------- blobs ---------------
-
 def publish(data: bytes, ttl: float | None = -1.0) -> str:
-    """Store `data` and return its token. Default TTL is MEDIA_BLOB_TTL_SEC;
-    `ttl=None` pins it (the caller is then responsible for release())."""
+    """Store bytes and return the token that addresses them.
+
+    Args:
+        data: the bytes to store.
+        ttl: seconds until expiry. The default sentinel means
+            config.MEDIA_BLOB_TTL_SEC; None pins the blob, and the caller then
+            owns it and must call release().
+
+    Tokens are random, so a URL built from one cannot be guessed or enumerated
+    into somebody else's audio.
+    """
     if ttl == -1.0:
         ttl = config.MEDIA_BLOB_TTL_SEC
     token = secrets.token_urlsafe(12)
@@ -96,26 +102,30 @@ def publish(data: bytes, ttl: float | None = -1.0) -> str:
 
 
 def url_for(token: str) -> str:
-    """The URL main.serve_media answers on for `token`."""
+    """The URL main.serve_media answers for this token."""
     return f"/media/{token}{_MEDIA_EXT}"
 
 
 def publish_url(data: bytes, ttl: float | None = -1.0) -> str:
-    """publish() + url_for() — what a caller that only wants a URL uses."""
+    """Store bytes and return their URL, for callers that never need the token."""
     return url_for(publish(data, ttl))
 
 
 def token_from_url(url: str) -> str:
-    """The token inside a /media/<token>.<ext> URL (or bare filename). The URL
-    is the only handle most of the code holds, so this is how it gets back to
-    the blob — parsed in ONE place rather than re-derived at each call site."""
+    """Recover the token from a media URL or bare filename.
+
+    Most callers only ever hold the URL, so the parsing lives here rather than
+    being repeated — and getting it wrong at one call site would silently 404.
+    """
     return url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
 
 def fetch(token: str) -> bytes | None:
-    """The bytes for a live token, or None. Serving does NOT extend a
-    TTL: the window is measured from publication, when we know the utterance is
-    about to be played once."""
+    """The bytes for a live token, or None if it is unknown or expired.
+
+    Serving does not extend the TTL. The window runs from publication, which is
+    the point at which the utterance is known to be about to play once.
+    """
     with _lock:
         blob = _blobs.get(token)
         if blob is None:
@@ -132,7 +142,7 @@ def release(token: str) -> None:
 
 
 def sweep() -> int:
-    """Drop expired unpinned blobs. Called by the janitor; returns the count."""
+    """Drop every expired unpinned blob and return how many went."""
     now = time.monotonic()
     with _lock:
         dead = [t for t, b in _blobs.items()
@@ -142,15 +152,13 @@ def sweep() -> int:
     return len(dead)
 
 
-# --------------- fixed clips ---------------
-
 def get_clip(key: str, stamp: str) -> Clip | None:
-    """The cached clip for `key`, or None if absent or rendered from a
-    different stamp (in which case the stale one is dropped here).
+    """The cached clip for `key`, or None if absent or built from another stamp.
 
-    The stale clip's audio blob is released OUTSIDE the lock: it is pinned, so
-    nothing else would ever reclaim it, and release() takes the same
-    non-reentrant lock this function is holding.
+    A stamp mismatch drops the stale entry rather than returning it. Its audio
+    is released after the lock is dropped: the blob is pinned, so nothing else
+    will ever reclaim it, and release() would deadlock on this same
+    non-reentrant lock.
     """
     stale = None
     with _lock:
@@ -172,12 +180,20 @@ def has_clip(key: str, stamp: str) -> bool:
 
 
 def put_clip(key: str, stamp: str, audio: bytes, frames, token: str | None = None) -> Clip:
-    """Cache one rendered fixed utterance, evicting LRU clips to stay under the
-    byte cap. `frames` is empty in voice-only mode — an audio-only clip is a
-    complete clip there, not a half-rendered one.
+    """Cache one rendered fixed utterance, evicting as needed to stay under cap.
 
-    `token` names a blob already holding this audio (the segment that was just
-    played from it); the clip pins that one instead of storing the audio twice.
+    Args:
+        key: stable identifier for the utterance.
+        stamp: what it was rendered from; see get_clip.
+        audio: the utterance's audio.
+        frames: JPEG frames in order. Empty in voice-only mode, where an
+            audio-only clip is complete rather than half rendered.
+        token: an existing blob already holding this audio, typically the one
+            the segment just played from. Given it, the clip pins that blob
+            instead of storing a second copy.
+
+    Returns:
+        The cached Clip.
     """
     frames = tuple(frames or ())
     nbytes = len(audio) + sum(len(f) for f in frames)
@@ -210,8 +226,11 @@ def put_clip(key: str, stamp: str, audio: bytes, frames, token: str | None = Non
 
 
 def _drop_locked(key: str) -> str | None:
-    """Remove one clip. Caller holds _lock; releasing the blob is the caller's
-    job AFTER dropping the lock (release() takes it again)."""
+    """Remove one clip and return its audio token, or None if it was absent.
+
+    The caller must hold _lock, and must release the returned token only after
+    dropping it — release() takes the same non-reentrant lock.
+    """
     global _clip_bytes
     clip = _clips.pop(key, None)
     if clip is None:
@@ -221,7 +240,7 @@ def _drop_locked(key: str) -> str | None:
 
 
 def stats() -> dict:
-    """Cache occupancy, for logs and diagnostics."""
+    """Current occupancy: clip count, clip megabytes and live blob count."""
     with _lock:
         return {
             "clips": len(_clips),

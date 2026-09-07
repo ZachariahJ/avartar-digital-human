@@ -1,41 +1,37 @@
-"""The study protocol as ONE declarative program (T5-T10).
+"""The whole study protocol, written as data rather than code.
 
-Every question, permission gate, content unit and branch of the SBIRT session
-is a STEP in `PROTOCOL` below, executed by the generic engine in runtime.py.
-There is no per-question handler code anywhere: adding a question = adding a
-step (or an instrument Item); changing the order = reordering data.
+PROTOCOL below is the session: every question, permission, piece of content and
+branch, in order. runtime.py is a generic interpreter for it, and there is no
+per-question handler anywhere — adding a question means adding a step, and
+changing the order means moving one. That is what makes the protocol reviewable
+by someone who does not read Python, and diffable when the study changes.
 
-Step vocabulary:
-  Label(name)       jump target; also the human-readable node name in logs.
-  Route(fn)         deterministic branch: fn(session) -> label name. Route
-                    functions may update queue state (e.g. pop the next arm)
-                    but never speak and never read anything the machine
-                    didn't code deterministically.
-  Tell(unit)        deliver one content unit, then fall through. `unit` is a
-                    templates.FIXED key (verbatim, cacheable), a
-                    templates.POINTS_UNITS id (LLM phrases the points), or an
-                    "@resolver" computed from state by the engine (e.g.
-                    "@feedback" -> the zone feedback for the completed screen).
-  Gate(key, on_no)  yes/no permission. Speaks FIXED[key] as the ask unless
-                    ask_included=True (a preceding Tell already asked it).
-                    "no" is recorded in session.declined and jumps to on_no.
-  Ask(key, kind)    one conversational question the user answers in free
-                    text (kind="open") or with a 0-10 number (kind="number").
-                    ask="fixed"    speak FIXED[key] / @resolver verbatim
-                    ask="included" a preceding Tell already asked it
-                    ask="compose"  the LLM phrases the ask from points;
-                                   with `slots`, it asks ONE missing slot at
-                                   a time (never a multi-question stack) and
-                                   the engine holds until all slots fill.
-                    The captured answer ALWAYS lands in session state —
-                    there is no ask whose answer is discarded.
-  RunItems(itemset) administer a whole instrument ("prescreen", "audit",
-                    "dast_10") one item per turn via next_item_index (skip
-                    rules included); scoring happens at completion. Adding
-                    an item to the instrument data changes NOTHING here.
-  End(node, close)  terminal: speak the close unit (or nothing for the
-                    consent-declined end, whose fixed goodbye the pipeline
-                    owns) and stop expecting input.
+The step vocabulary:
+
+  Label(name)       a jump target, and the node name that appears in logs.
+  Route(fn)         a branch. fn(session) returns a label name. Routes may
+                    update bookkeeping such as which arm is next, but they
+                    never speak and never consult anything the machine has not
+                    coded deterministically.
+  Tell(unit)        deliver one piece of content, then continue. The unit is
+                    either verbatim text, a set of points for the model to
+                    word, or an "@name" the engine resolves from session state.
+  Gate(key, on_no)  a yes/no permission. A refusal is recorded and jumps to
+                    on_no. ask_included means a preceding Tell already posed
+                    the question, so the gate must not ask it twice.
+  Ask(key, kind)    a question answered in free text or with a 0-10 number.
+                    Its `ask` field says where the wording comes from: fixed
+                    text, an ask already included in a preceding Tell, or
+                    composed by the model from points. With slots, exactly one
+                    missing slot is asked per turn — never a stacked question —
+                    and the engine holds position until all of them fill.
+                    Every captured answer is stored; no ask discards its answer.
+  RunItems(itemset) administer a whole instrument, one item per turn, applying
+                    its skip rules and scoring it on completion. Adding an item
+                    to an instrument requires no change here.
+  End(node, close)  stop expecting input, after speaking the close unit. The
+                    consent-refused ending speaks nothing, because the pipeline
+                    owns that fixed goodbye.
 """
 
 from __future__ import annotations
@@ -45,13 +41,11 @@ from typing import Callable
 
 from .templates import FEEDBACK_ASKS_BI
 
-# Which full instrument each positive pre-screen arm opens (protocol order:
-# alcohol before drugs, matching the study dialogue).
+# Which instrument each positive pre-screen arm opens, and the order the arms
+# run in — alcohol before drugs, following the study dialogue.
 ARM_INSTRUMENT = {"alcohol": "audit", "drugs": "dast_10"}
 ARM_ORDER = ("alcohol", "drugs")
 
-
-# --------------- Step types ---------------
 
 @dataclass(frozen=True)
 class Label:
@@ -81,8 +75,8 @@ class Ask:
     kind: str                                  # "open" | "number"
     ask: str = "fixed"                         # "fixed" | "included" | "compose"
     slots: tuple[str, ...] = ()
-    slot_points: tuple[tuple[str, str], ...] = ()   # slot -> what to ask for it
-    points: tuple[str, ...] = ()               # compose without slots
+    slot_points: tuple[tuple[str, str], ...] = ()   # what to ask for each slot
+    points: tuple[str, ...] = ()               # for composing without slots
 
 
 @dataclass(frozen=True)
@@ -93,21 +87,23 @@ class RunItems:
 @dataclass(frozen=True)
 class End:
     node: str                                  # "closed" | "declined"
-    close: str = ""                            # unit to speak; "" = silent
+    close: str = ""                            # unit to speak; "" for silence
 
-
-# --------------- Deterministic routes ---------------
 
 def _after_prescreen(session) -> str:
-    """Queue the positive arms in protocol order; nothing positive closes the
-    session with the all-negative affirmation. Pre-screen options are
-    (negative, positive) scored 0/1, so code > 0 = positive."""
+    """Queue every arm the pre-screen came back positive on.
+
+    Pre-screen items are scored 0 for negative and 1 for positive, so anything
+    above zero opens that arm. Nothing positive means there is nothing to screen
+    and the session closes with the all-negative affirmation.
+    """
     session.arms = [arm for arm in ARM_ORDER
                     if session.prescreen.get(arm, 0) > 0]
     return "arm.next" if session.arms else "close.all_negative"
 
 
 def _next_arm(session) -> str:
+    """Move to the next queued arm, or close once they are all done."""
     if session.arms:
         session.arm = session.arms.pop(0)
         return session.arm                     # "alcohol" | "drugs"
@@ -115,21 +111,25 @@ def _next_arm(session) -> str:
 
 
 def _after_ruler(session) -> str:
-    """The two ruler follow-ups and the ruler summary presuppose a readiness
-    number; when the ruler went unanswered (marked missing after the F2
-    probes), the BI continues at the wrap-up instead of dereferencing a
-    number that was never given."""
+    """Skip the ruler follow-ups when there is no readiness number.
+
+    Both follow-ups and the summary quote the number back, so with the item
+    unanswered they would have nothing to say. The intervention continues at the
+    wrap-up instead.
+    """
     if session.readiness.get(session.arm) is None:
         return "bi.wrap"
     return "bi.followups"
 
 
 def _after_feedback(session) -> str:
-    """Healthy zone finishes the arm; every other zone routes into the brief
-    intervention. Whether the BI permission still needs ASKING depends on
-    whether the zone's feedback text already ends with the ask
-    (templates.FEEDBACK_ASKS_BI) — the machine routes dependent explicitly
-    even though the source's dependent-drug text drops the question."""
+    """Finish the arm on a healthy result, otherwise go to the intervention.
+
+    Some zones' feedback text ends by asking permission for the intervention
+    itself, and those must not then be asked again — hence two entry points.
+    The dependent zone is routed explicitly even though the study's wording for
+    it omits the question.
+    """
     instrument_key = ARM_INSTRUMENT[session.arm]
     zone = session.assessments[instrument_key].zone
     if zone == "healthy":
@@ -140,38 +140,39 @@ def _after_feedback(session) -> str:
 
 
 def close_unit(session) -> str:
-    """Which close the session earned (T10): a session that ended because the
-    user declined a screening/feedback/BI permission must not promise more
-    questions right after 'that's your call' — the study close text is only
-    for paths that actually completed. Declining the optional education alone
-    does NOT count (the protocol continued normally after it).
-    PENDING CLINICIAN REVIEW."""
+    """Which closing line the session has earned.
+
+    The standard close promises follow-up questions, which reads badly right
+    after somebody declined a permission and was told that was their call. So
+    any refusal of a screening, feedback or intervention permission selects the
+    other close.
+
+    Refusing the optional education does not count: the protocol carried on
+    normally afterwards, so nothing was cut short.
+
+    Pending clinician review.
+    """
     declined_hard = any(not k.endswith("edu.permission")
                         for k in session.declined)
     return "close.declined" if declined_hard else "close"
 
 
-# --------------- The protocol program ---------------
-
 PROTOCOL: tuple = (
-    # Consent — the fixed greeting clip already asked it; the machine's job
-    # starts at the user's reply. Decline ends the session via the pipeline's
-    # fixed decline path.
+    # The greeting clip already asked for consent, so the machine starts at the
+    # reply rather than by asking again.
     Gate("consent.opening", on_no="declined", ask_included=True),
 
-    # Pre-screen: the study's 3 questions, one per turn.
     RunItems("prescreen"),
     Route(_after_prescreen),
 
     Label("arm.next"),
     Route(_next_arm),
 
-    # ---------------- Alcohol arm ----------------
     Label("alcohol"),
-    # Q/F exploration — the source's three-question stack is now three slots
-    # asked ONE at a time (and a user who answers all three in one breath is
-    # asked nothing twice). Context for the conversation; the AUDIT items
-    # below are what gets scored.
+    # The study asks what, how much and how often as one stacked question.
+    # Split into slots, it is asked one part at a time, and somebody who volun-
+    # teers all three at once is not asked again. Conversational context only —
+    # the scored answers are the instrument items below.
     Ask("alcohol.qf", kind="open", ask="compose",
         slots=("drink", "amount", "frequency"),
         slot_points=(("drink", "what they like to drink"),
@@ -181,8 +182,9 @@ PROTOCOL: tuple = (
     Tell("alcohol.edu.standard_drink"),
     Tell("alcohol.edu.limits"),
     Label("alcohol.screen"),
-    # Variant picked from state.covered: only claims "the standard drink
-    # definition we just discussed" if the education was actually delivered.
+    # Resolved from state, so this only refers back to the standard-drink
+    # definition when the education was actually delivered — reachable here
+    # either way, since the gate above can skip it.
     Tell("@alcohol.screen.permission"),
     Gate("alcohol.screen.permission", on_no="arm.declined", ask_included=True),
     RunItems("audit"),
@@ -190,7 +192,6 @@ PROTOCOL: tuple = (
     Tell("@feedback"),
     Route(_after_feedback),
 
-    # ---------------- Drug arm ----------------
     Label("drugs"),
     Ask("drugs.kind", kind="open", ask="fixed"),
     Ask("drugs.qf", kind="open", ask="compose",
@@ -203,7 +204,8 @@ PROTOCOL: tuple = (
     Tell("@feedback"),
     Route(_after_feedback),
 
-    # ------- Brief intervention (shared; @keys resolve per session.arm) -------
+    # Shared by both arms; the "@" units resolve against whichever arm is
+    # currently running.
     Label("bi.ask"),
     Gate("@bi.permission", on_no="arm.declined"),
     Route(lambda s: "bi.body"),
@@ -229,7 +231,6 @@ PROTOCOL: tuple = (
     Tell("bi.reflect"),
     Route(lambda s: "arm.next"),
 
-    # ---------------- Shared endings ----------------
     Label("arm.declined"),
     Tell("permission.declined"),
     Route(lambda s: "arm.next"),
@@ -251,6 +252,10 @@ LABELS: dict[str, int] = {
 
 
 def label_index(name: str) -> int:
-    """Index of a jump target. KeyError here is a program bug (a Route/Gate
-    naming a label that doesn't exist) — the integrity test catches it."""
+    """Where a label sits in PROTOCOL.
+
+    A KeyError means a Route or Gate names a label that does not exist, which is
+    a bug in the protocol data rather than anything a session can cause. The
+    integrity test catches it before it can reach a conversation.
+    """
     return LABELS[name]

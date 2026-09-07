@@ -1,11 +1,9 @@
-"""Assemble the complete SBIRT system prompt from the structured modules.
+"""Renders the structured clinical data into the model's system prompt.
 
-`build_system_prompt()` is the single guarantee that the Q&A carries ALL SBIRT
-information: it renders every screening instrument, the full MI/OARS + FRAMES
-brief-intervention toolkit, the stages of change, the referral continuum, and
-the crisis protocol into one prompt. Nothing clinical is hand-written here — it
-all comes from instruments.py / intervention.py / referral.py / workflow.py, so
-editing the framework in those files updates the prompt automatically.
+Nothing clinical is written here. Every instrument, technique, referral pathway
+and crisis rule is rendered from its own module, which is what guarantees the
+prompt cannot drift from the framework the rest of the code executes — and means
+the way to change what the counselor knows is to edit the data.
 """
 
 from __future__ import annotations
@@ -14,10 +12,12 @@ from . import instruments, intervention, referral, workflow
 
 
 def _bullets(items) -> str:
+    """Render plain strings as a bulleted block."""
     return "\n".join(f"  • {x}" for x in items)
 
 
 def _techniques(items) -> str:
+    """Render objects that know how to render themselves."""
     return "\n".join(t.render() for t in items)
 
 
@@ -55,6 +55,7 @@ questionnaire, and never re-ask anything already in KNOWN PATIENT."""
 
 
 def build_system_prompt() -> str:
+    """The counselor's complete system prompt. Built once, at import."""
     parts = [
         PERSONA,
         "",

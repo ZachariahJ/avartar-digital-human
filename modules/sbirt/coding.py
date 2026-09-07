@@ -1,31 +1,32 @@
-"""Deterministic answer coding (T26): extracted facts -> option codes.
+"""Turns what somebody said about drinking into a scored option, arithmetically.
 
-Round-2 backbone. The NLU turn no longer picks frequency/quantity buckets
-itself: for items whose `Item.coding` names a scale here, the model only
-EXTRACTS what the person said — a count and a period ("every week" -> value 1,
-per "week"), or an amount, unit and beverage ("one liter of whiskey" ->
-value 1, unit "liter", beverage "whiskey") — and the code is COMPUTED from
-the tables below. "Legal but wrong" codes (the over-coding class of field
-defects) become structurally impossible at the bucketing step; what remains
-fallible is extraction itself, which is why conversions and boundary values
-still get a T20 read-back.
+For frequency and quantity items the model does not choose the answer bucket.
+It reports what was said — "every week" as one per week, "a liter of whiskey" as
+one liter of whiskey — and the bucket is computed here from the tables below.
 
-Everything here is data + arithmetic, defined once and reviewable:
-  • bucket thresholds per option scale (incl. the "once a week" boundary
-    ruling: 1/week falls INSIDE "2 to 4 times a month", whose label spans
-    4.3 times a month — not "2 to 3 times a week");
-  • a beverage -> ABV table and a container -> volume table for converting
-    spoken amounts into the study's standard drink (12 oz beer / 5 oz wine /
-    1.5 oz spirits — 0.6 fl oz of ethanol each, templates.FIXED
-    ["alcohol.edu.standard_drink"]), per the WHO manual's instruction that
-    screening must define drinks in local terms (SBIRT_REF.pdf p.15). The
-    conversion no longer depends on whether the person accepted the
+That division exists because of a specific failure mode. A model that picks the
+bucket itself can return a code that is perfectly legal and simply wrong, and
+nothing downstream can tell: the answer looks like every other answer, and the
+score is silently off. Moving the threshold decision into arithmetic makes that
+class of error impossible. Extraction can still be wrong, which is why
+conversions and near-boundary values are read back to the person.
+
+The tables are the reviewable part, and the values in them are clinical
+decisions rather than implementation details:
+
+  * where each option's bucket begins and ends, including the one genuinely
+    ambiguous case — once a week is 4.3 times a month, which the code places
+    inside "2 to 4 times a month" rather than "2 to 3 times a week";
+  * alcohol by volume per drink and millilitres per container, which convert a
+    spoken amount into standard drinks. The WHO manual requires screening to
+    define drinks in local terms (SBIRT_REF.pdf p.15), and doing the conversion
+    here means it does not depend on whether the person accepted the
     standard-drink education;
-  • cross-item consistency bounds (AUDIT Q1 vs Q3; Q/F frequency vs Q1).
+  * bounds for catching answers that contradict each other across items.
 
-Pure module: no LLM, no IO, no session state — every table row and boundary
-is unit-testable. Threshold and ABV values are clinical data, PENDING
-CLINICIAN REVIEW like the rest of the instrument content.
+Pure arithmetic and lookups: no model, no I/O, no session state, so every row
+and every boundary can be tested directly. Pending clinician review, like the
+rest of the instrument content.
 """
 
 from __future__ import annotations
@@ -33,17 +34,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# --------------- The study's standard drink ---------------
-
-# 0.6 US fl oz of pure ethanol (≈14 g): 12 oz x 5% beer = 5 oz x 12% wine =
-# 1.5 oz x 40% spirits, exactly the three examples the study's education
-# unit speaks.
+# 0.6 US fl oz of pure ethanol, about 14g. The three examples the education unit
+# speaks all come to this: 12 oz of 5% beer, 5 oz of 12% wine, 1.5 oz of 40%
+# spirits.
 ETHANOL_ML_PER_DRINK = 17.74
 
 _OZ_ML = 29.574
 
-# Default alcohol-by-volume per beverage (fractions). Data, not code:
-# override/extend here, never in the extraction prompt.
+# Alcohol by volume, as a fraction. Extend this table to teach the system a new
+# drink; putting it in the extraction prompt instead would make the conversion
+# depend on the model rather than on reviewable data.
 ABV: dict[str, float] = {
     "beer": 0.05, "light beer": 0.042, "lager": 0.05, "ale": 0.055,
     "stout": 0.06, "ipa": 0.065, "malt liquor": 0.07,
@@ -60,12 +60,14 @@ ABV: dict[str, float] = {
     "liqueur": 0.25, "schnapps": 0.25, "absinthe": 0.60,
 }
 
-# Spirits containers imply a spirits ABV even when no beverage was named.
+# Naming one of these implies spirits, so "three shots" is convertible even
+# though no drink was named.
 _SPIRIT_UNITS = {"shot", "jigger", "fifth", "handle", "nip", "mini"}
 
-# Container/unit -> milliliters. `None` means beverage-dependent (looked up
-# in _SIZED_UNITS below); a unit absent from both tables cannot be converted
-# and the answer stays unclear (the model then asks, never guesses).
+# Millilitres per container. None means the size depends on what is in it — a
+# bottle of beer and a bottle of wine differ — and is looked up below. A unit in
+# neither table cannot be converted, so the answer stays unclear and the person
+# is asked, rather than a size being assumed.
 ML_PER_UNIT: dict[str, float | None] = {
     "ml": 1.0, "milliliter": 1.0, "cl": 10.0, "liter": 1000.0,
     "litre": 1000.0, "l": 1000.0, "half liter": 500.0,
@@ -82,7 +84,7 @@ ML_PER_UNIT: dict[str, float | None] = {
     "bottle": None, "can": None, "glass": None,
 }
 
-# Beverage-dependent container sizes (ml).
+# Sizes for the containers above whose volume depends on the drink.
 _SIZED_UNITS: dict[str, dict[str, float]] = {
     "bottle": {"beer": 355.0, "wine": 750.0, "spirits": 750.0},
     "can": {"beer": 355.0, "wine": 250.0, "spirits": 355.0},
@@ -94,7 +96,7 @@ _DRINK_UNITS = {"", "drink", "drinks", "standard drink", "standard drinks",
 
 
 def _family(beverage: str) -> str:
-    """Coarse family for beverage-dependent container sizes."""
+    """Group a drink as beer, wine or spirits by strength, for container sizes."""
     abv = ABV.get(beverage, 0.0)
     if abv >= 0.20:
         return "spirits"
@@ -105,14 +107,16 @@ def _family(beverage: str) -> str:
 
 @dataclass(frozen=True)
 class Derived:
-    """A deterministically computed option code plus the confirm triggers.
+    """A computed option code, and whether it should be read back for confirmation.
 
-    `assumed`  — a default (ABV, container size) entered the computation:
-                 the read-back must surface the conversion.
-    `boundary` — the normalized value sits close to a bucket edge: worth a
-                 read-back even though the arithmetic is exact.
-    `note`     — the human-readable conversion, spoken in the read-back
-                 ("1 liter of whiskey is about 23 standard drinks").
+    assumed:  a table default entered the calculation — a strength or a
+              container size — so the person never stated the number the code
+              rests on, and the conversion has to be said aloud.
+    boundary: the value sits close enough to a bucket edge that a small
+              extraction error would change the code, even though the
+              arithmetic itself is exact.
+    note:     that conversion in plain words, e.g. "1 liter of whiskey is about
+              23 standard drinks".
     """
 
     code: int
@@ -121,26 +125,25 @@ class Derived:
     note: str = ""
 
 
-# --------------- Frequency scales ---------------
-
 _PER_WEEK = {"day": 7.0, "week": 1.0, "month": 1 / 4.345, "year": 1 / 52.18}
 
-# (upper bound in times-per-week, code); above the last bound -> top code.
-# AUDIT Q1: Never / Monthly or less / 2-4 a month / 2-3 a week / 4+ a week.
-# Boundary ruling (decision point, defined ONCE here): once a week = 4.3
-# times a month -> inside "2 to 4 times a month" (code 2).
+# (upper bound in times per week, code). Anything above the last bound takes the
+# top code. The scales are Never / Monthly or less / 2-4 a month / 2-3 a week /
+# 4+ a week, and Never / Less than monthly / Monthly / Weekly / Daily or almost.
+#
+# The one judgement call is settled here and nowhere else: once a week is 4.3
+# times a month, which puts it inside "2 to 4 times a month" rather than "2 to 3
+# times a week". "Daily or almost daily" is taken to start at 5 times a week.
 _Q1_BOUNDS = ((0.25, 1), (1.5, 2), (3.5, 3))
-# WHO _FREQ_5: Never / Less than monthly / Monthly / Weekly / Daily-or-almost.
-# "Daily or almost daily" starts at 5 times a week.
 _FREQ5_BOUNDS = ((0.23, 1), (0.9, 2), (5.0, 3))
 
 _FREQ_SCALES = {"freq_q1": (_Q1_BOUNDS, 4), "freq5": (_FREQ5_BOUNDS, 4)}
 
-_BOUNDARY_MARGIN = 0.15   # within 15% of a threshold -> read back
+_BOUNDARY_MARGIN = 0.15   # this close to a threshold earns a read-back
 
 
 def per_week(value: float, per: str | None) -> float | None:
-    """Normalize a spoken rate to times-per-week; None when not computable."""
+    """Convert a rate to times per week, or None if the period is unrecognised."""
     if value is None or value < 0:
         return None
     if value == 0:
@@ -153,8 +156,11 @@ def per_week(value: float, per: str | None) -> float | None:
 
 def derive_frequency(scale: str, value: float | None,
                      per: str | None) -> Derived | None:
-    """Bucket an extracted rate onto a frequency scale. None = not derivable
-    (the turn stays unclear and the avatar clarifies)."""
+    """Place an extracted rate on a frequency scale.
+
+    Returns None when the extraction does not determine a rate, which leaves the
+    turn unclear so the person is asked rather than guessed at.
+    """
     bounds, top = _FREQ_SCALES[scale]
     rate = per_week(value, per) if value is not None else None
     if rate is None:
@@ -170,13 +176,13 @@ def derive_frequency(scale: str, value: float | None,
     return Derived(code=code, boundary=boundary)
 
 
-# --------------- Drink quantities ---------------
-
-# AUDIT Q2 buckets: 1-2 / 3-4 / 5-6 / 7-9 / 10+ (edges between buckets).
+# Edges between the 1-2 / 3-4 / 5-6 / 7-9 / 10+ buckets, placed between whole
+# drinks so that a count never lands exactly on a threshold.
 _Q2_EDGES = (2.5, 4.5, 6.5, 9.5)
 
 
 def _q2_code(drinks: float) -> int:
+    """Which quantity bucket a number of standard drinks falls in."""
     for code, edge in enumerate(_Q2_EDGES):
         if drinks < edge:
             return code
@@ -184,16 +190,24 @@ def _q2_code(drinks: float) -> int:
 
 
 def standard_drinks(value: float, unit: str, beverage: str) -> float | None:
-    """Spoken amount -> standard drinks; None when the unit/beverage cannot
-    be resolved from the tables (never guessed)."""
+    """Convert a spoken amount into standard drinks.
+
+    Returns None whenever the unit or the drink is not in the tables. Nothing is
+    approximated: an unknown container has no defensible size, and inventing one
+    would move a score.
+    """
     unit = " ".join(unit.strip().lower().split())
+    # Depluralise only if the plural is not itself a table key, so a unit that
+    # genuinely ends in "s" survives.
     if unit.endswith("s") and unit not in ML_PER_UNIT:
         unit = unit[:-1]
     beverage = " ".join((beverage or "").strip().lower().split())
     if unit not in ML_PER_UNIT:
         return None
     ml = ML_PER_UNIT[unit]
-    if ml is None:                       # beverage-dependent container
+    if ml is None:
+        # The container's size depends on what is in it, so without the drink
+        # there is nothing to look up.
         if not beverage or beverage not in ABV:
             return None
         ml = _SIZED_UNITS[unit][_family(beverage)]
@@ -208,10 +222,13 @@ def standard_drinks(value: float, unit: str, beverage: str) -> float | None:
 
 def derive_quantity(value: float | None, unit: str | None,
                     beverage: str | None) -> Derived | None:
-    """Bucket an extracted amount onto the AUDIT Q2 scale. Drink counts map
-    directly; volumes convert through the ABV/container tables (assumed=True
-    -> the read-back speaks the conversion, which doubles as the standard-
-    drink explanation for people who declined the education unit)."""
+    """Place an extracted amount on the quantity scale.
+
+    A count of drinks maps straight across. A volume is converted through the
+    tables, and marked assumed so that the conversion is spoken back — which
+    also serves as the standard-drink explanation for anyone who declined the
+    education unit.
+    """
     if value is None or value <= 0:
         return None
     u = " ".join((unit or "").strip().lower().split())
@@ -233,15 +250,17 @@ def derive_quantity(value: float | None, unit: str | None,
 def derive(coding: str, *, value: float | None = None, per: str | None = None,
            unit: str | None = None, beverage: str | None = None
            ) -> Derived | None:
-    """Dispatch on Item.coding. None = not derivable from what was extracted."""
+    """Compute an option code for an item, or None if the extraction is insufficient.
+
+    Raises ValueError for an unknown coding kind, which is a data error in the
+    instrument rather than anything a conversation can produce.
+    """
     if coding in _FREQ_SCALES:
         return derive_frequency(coding, value, per)
     if coding == "quantity_drinks":
         return derive_quantity(value, unit, beverage)
     raise ValueError(f"unknown coding kind {coding!r}")
 
-
-# --------------- Free-text frequency (Q/F slot) parsing ---------------
 
 _WORD_N = {"once": 1, "twice": 2, "one": 1, "two": 2, "three": 3, "four": 4,
            "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
@@ -264,9 +283,12 @@ _SIMPLE = (
 
 
 def parse_freq_text(text: str) -> float | None:
-    """Conservative times-per-week from a free-text frequency phrase (the
-    Q/F slot). Only unambiguous patterns parse; anything else -> None (the
-    consistency rules must never fire on a guess)."""
+    """Read a rate out of a free-text phrase, or None if it is not unambiguous.
+
+    Deliberately narrow. Its output feeds the consistency checks below, which
+    accuse the person of contradicting themselves — so a guess here would
+    produce a confusing challenge to something they never said.
+    """
     t = " ".join((text or "").strip().lower().split())
     if not t:
         return None
@@ -283,15 +305,13 @@ def parse_freq_text(text: str) -> float | None:
     return None
 
 
-# --------------- Cross-item consistency bounds (Phase 5) ---------------
-
-# Highest drinking rate (times/week) each AUDIT Q1 code can honestly mean,
-# and the lowest rate of 6+-drink occasions each Q3 code implies. A Q3
-# answer implying MORE heavy-drinking days than Q1 allows drinking days at
-# all is a contradiction worth one gentle read-back.
+# The most drinking days a "how often" answer can mean, against the fewest
+# heavy-drinking days a "how often six or more" answer implies. Claiming more
+# heavy days than drinking days is impossible, and worth one gentle read-back.
 Q1_MAX_PER_WEEK = {0: 0.0, 1: 0.25, 2: 1.5, 3: 3.5, 4: 14.0}
 Q3_MIN_PER_WEEK = {0: 0.0, 1: 0.0, 2: 0.2, 3: 0.9, 4: 5.0}
 
-# A Q/F frequency this many times above the Q1 code's ceiling flags the Q1
-# answer (margin absorbs casual overstatement like "every day" said loosely).
+# How far a conversational frequency may exceed the coded one before the coded
+# answer is questioned. The margin absorbs loose speech — "every day" said as a
+# figure of speech is common and is not a contradiction.
 QF_VS_Q1_MARGIN = 1.9

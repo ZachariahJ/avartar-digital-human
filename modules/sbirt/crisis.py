@@ -1,26 +1,28 @@
-"""Deterministic crisis safety net (P2) — the non-LLM backstop.
+"""Detects a crisis without asking a model, and answers it with fixed words.
 
-Crisis detection must NOT depend on an LLM judgment call: this module scans the
-user's transcribed words with fixed, reviewable patterns and, on a hit, the
-pipeline speaks a FIXED response (hardcoded below, pre-rendered to a cached
-clip) and routes the session into the crisis protocol. The LLM's own crisis
-handling (prompt) stays active — detection is the UNION of both, so the
-deterministic net catches what the model misses, and the model catches subtle
-cues no pattern can. Over-triggering is acceptable by design; missing is not.
+Whether somebody is in danger is not a judgement this system delegates. Fixed,
+reviewable patterns are matched against the transcript, and a hit routes the
+session into the crisis protocol with a fixed spoken response — so what a person
+in crisis hears is auditable, and does not depend on a model being available,
+being right, or being consistent between runs.
 
-Categories mirror referral.py CRISIS_PROTOCOL. Patterns are word-boundary,
-case-insensitive regexes tuned for ASR text (lowercase, unreliable
-punctuation). Deliberate scope notes:
-  • "withdrawal" alone is NOT a trigger — DAST item 9 asks "Have you ever
-    experienced withdrawal symptoms...", so a normal screening answer would
-    fire on every positive patient. The withdrawal category targets the
-    ACUTE danger presentation instead (seizures, DTs, hallucinations).
-  • Negations ("I'm not suicidal") still trigger — a false positive costs one
-    empathetic safety message; a false negative can cost a life.
+The model's own crisis handling stays active alongside this. Either firing is
+enough: patterns catch what the model misses, and the model catches cues no
+pattern can express. The asymmetry is deliberate — a false positive costs one
+unnecessary safety message, a false negative can cost a life.
 
-The RESPONSES texts are clinical safety copy assembled from referral.py
-(crisis lines 988/911/SAMHSA) — flagged for clinician review; they are fixed
-strings, never LLM-generated or paraphrased at runtime.
+The patterns assume ASR output: lowercase, no reliable punctuation, no
+capitalisation to lean on. Two consequences worth knowing before editing them:
+
+  * "withdrawal" on its own cannot be a trigger, because DAST item 9 asks
+    whether the person has ever experienced withdrawal symptoms — the pattern
+    would fire on every positive answer to a routine screening question. That
+    category therefore matches the acute presentation instead.
+  * Negation is not handled, so "I'm not suicidal" fires. That is the intended
+    trade, not an oversight.
+
+The spoken responses are clinical safety copy and are fixed strings, never
+generated or paraphrased. They await clinician sign-off.
 """
 
 from __future__ import annotations
@@ -32,15 +34,16 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class CrisisHit:
     category: str      # "suicide" | "overdose" | "withdrawal" | "acute_danger"
-    pattern: str       # the pattern that fired (safe for logs: no user text)
+    pattern: str       # what fired; contains no user text, so it is loggable
 
 
-# Category order = check order = severity order; first hit wins.
+# Listed in severity order, and checked in that order, so the first hit is the
+# most serious one present rather than merely the first mentioned.
 _PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("suicide", (
         r"\bsuicid\w*",
-        # 'myself' only — '...is killing me' is a common idiom (esp. in a
-        # drinking context: 'this hangover is killing me') and must not fire.
+        # Restricted to "myself": "this hangover is killing me" is ordinary
+        # speech, and especially likely in a drinking conversation.
         r"\bkill(?:ing)?\s+myself\b",
         r"\bend(?:ing)?\s+(?:my|it)\s+(?:life|all)\b",
         r"\btak(?:e|ing)\s+my\s+(?:own\s+)?life\b",
@@ -59,7 +62,8 @@ _PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
         r"\bnot\s+breathing\b",
     )),
     ("withdrawal", (
-        # Acute alcohol/benzo withdrawal danger — abrupt cessation can be fatal.
+        # The acute presentation only; see the note in the module docstring
+        # about why the word itself cannot appear here.
         r"\bseizures?\b",
         r"\bdelirium\s+tremens\b",
         r"\bthe\s+dts\b",
@@ -80,8 +84,11 @@ _COMPILED = tuple(
 
 
 def detect(text: str) -> CrisisHit | None:
-    """Scan one utterance; return the first (most severe) crisis hit, else None.
-    Pure function — no LLM, no IO — so it can never be down when needed."""
+    """The most severe crisis indication in one utterance, or None.
+
+    A pure function with no model call and no I/O, so it cannot be slow,
+    unavailable or nondeterministic at the moment it matters most.
+    """
     if not text or not text.strip():
         return None
     for category, patterns in _COMPILED:
@@ -91,10 +98,10 @@ def detect(text: str) -> CrisisHit | None:
     return None
 
 
-# Fixed spoken responses — one per category, pre-rendered to cached clips so a
-# crisis answer plays instantly with no LLM/TTS/FLOAT on the hot path.
-# Copy assembled from referral.py CRISIS_PROTOCOL / CRISIS_LINES; pending
-# clinician sign-off, tracked as a human decision point.
+# One fixed response per category. Phone numbers are spaced out ("9 8 8")
+# because the synthesizer otherwise reads them as a single number, which is
+# useless to someone trying to dial. Pre-rendered into cached clips, so a crisis
+# reply plays immediately rather than waiting on generation.
 RESPONSES: dict[str, str] = {
     "suicide": (
         "Thank you for telling me — I'm really glad you said that, and I want "
@@ -124,5 +131,6 @@ RESPONSES: dict[str, str] = {
     ),
 }
 
-# Every category must have a response — a KeyError in a crisis is unacceptable.
+# Checked at import rather than at use: a missing category would otherwise
+# surface as a KeyError during a crisis.
 assert set(RESPONSES) == {c for c, _ in _PATTERNS}

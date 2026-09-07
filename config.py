@@ -8,27 +8,21 @@ from modules.sbirt import build_system_prompt
 
 load_dotenv()
 
-# Set once on server shutdown so every background worker (state poller, temp
-# janitor, MuseTalk render busy-wait, LLM producer) can bail out promptly. This is
-# what makes Ctrl+C exit cleanly instead of hanging or throwing tracebacks.
+# Cooperative shutdown flag. Background workers poll it instead of being killed
+# mid-work, which is what makes Ctrl+C exit without hung threads or tracebacks.
 SHUTTING_DOWN = threading.Event()
 
-# Paths — single source of truth. Every directory root is defined ONCE here;
-# everything else (this file, main.py, modules/) derives from these, never by
-# reverse-engineering a root out of some file's location (e.g. dirname of a clip
-# path — that silently breaks the moment the clip moves). Move a root → one edit.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # digital-human/
-ASSETS_DIR = os.path.join(BASE_DIR, "assets")           # source imgs + all cached clips live under here
-# NOTE: assets/clips/ was the on-disk fixed-clip cache. Nothing reads or writes
-# it any more (clips live in RAM — see modules/clipcache.py); whatever is left
-# there is dead weight and safe to delete.
-TEMP_DIR = os.path.join(BASE_DIR, "tmp")                # fallback render scratch only (see RENDER_SCRATCH_DIR)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+TEMP_DIR = os.path.join(BASE_DIR, "tmp")
 CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
 RECORDS_DIR = os.path.join(BASE_DIR, "records")
 CERTS_DIR = os.path.join(BASE_DIR, "certs")
 
-MUSETALK_DIR = os.path.join(os.path.dirname(BASE_DIR), "MuseTalk")   # sibling repo
-MUSETALK_VERSION = "v15"                        # "v15" or "v1" (picks the UNet below)
+# MuseTalk is a sibling checkout, not a dependency: modules/avatar.py puts this
+# on sys.path and imports from it. Its models/ layout is upstream's, not ours.
+MUSETALK_DIR = os.path.join(os.path.dirname(BASE_DIR), "MuseTalk")
+MUSETALK_VERSION = "v15"
 _MT_MODELS = os.path.join(MUSETALK_DIR, "models")
 _MT_UNET_DIR = os.path.join(_MT_MODELS, "musetalkV15" if MUSETALK_VERSION == "v15" else "musetalk")
 MUSETALK_UNET = os.path.join(_MT_UNET_DIR, "unet.pth" if MUSETALK_VERSION == "v15" else "pytorch_model.bin")
@@ -36,38 +30,33 @@ MUSETALK_UNET_CONFIG = os.path.join(_MT_UNET_DIR, "musetalk.json")
 MUSETALK_VAE = os.path.join(_MT_MODELS, "sd-vae")
 MUSETALK_WHISPER = os.path.join(_MT_MODELS, "whisper")
 
-# Where the prepared driving material (per-frame crops, VAE latents, blend masks)
-# is cached. Preparing it is a one-off multi-minute pass over AVATAR_VIDEO; it is
-# keyed by avatar_fingerprint() so swapping the driving video prepares a fresh
-# set instead of silently reusing the old face's crops.
+# Face crops, VAE latents and blend masks precomputed from AVATAR_VIDEO. Costs
+# minutes to build, so it is written once per avatar_fingerprint() and reused.
 MUSETALK_MATERIAL_DIR = os.path.join(CHECKPOINTS_DIR, "musetalk_avatar")
-# The driving video the digital human is rendered from. MuseTalk is an INPAINTING
-# model: it only repaints the mouth region, every other pixel and ALL head motion
-# comes from this clip, so it must be a real clip and not a still (a still gives a
-# frozen head with a moving mouth). Requirements: single face, front-facing, never
-# leaves frame, 25 fps (MUSETALK_FPS), and first/last frame close together — it
-# doubles as the source of the idle loop.
+
+# MuseTalk inpaints the mouth region of an existing clip; head motion and every
+# pixel outside the mouth come from this file. A still image therefore yields a
+# frozen head with a moving mouth. Needs one front-facing face that stays in
+# frame, at MUSETALK_FPS, with matching first and last frames so it also serves
+# as the seamless idle loop.
 #
-# MUST be a synthetic (AI-generated) face that does not depict, and is not
-# recognisably modelled on, an identifiable real person — rendering a real
-# person's likeness into a clinician persona is a portrait-rights (肖像权)
-# exposure. The former avatar.png / avatar2.png / avatar3.png were
-# celebrity-likeness renders and have been deleted for exactly that reason — do
-# not restore them from git history and point this at them.
+# The face must be synthetic and not resemble an identifiable real person:
+# putting a real likeness in a clinician role is a portrait-rights exposure.
+# Earlier celebrity-lookalike renders were deleted for this reason.
 AVATAR_VIDEO = os.path.join(ASSETS_DIR, "loop.mp4")
 
-# Still portrait shown in the frontend's side panel (main.py's portraitUrl). It is
-# NOT what gets rendered — that is AVATAR_VIDEO — but it should be a frame of the
-# same person, or the panel shows one face and the video another.
+# Still shown in the page's side panel. Purely decorative — nothing renders from
+# it — but it should be a frame of AVATAR_VIDEO, or panel and video disagree.
 AVATAR_IMAGE = os.path.join(ASSETS_DIR, "avatar1.png")
 
 
 @functools.lru_cache(maxsize=8)
 def _video_digest(path: str, size: int, mtime: float) -> str:
-    """md5 of a video's first 4 MB, keyed (via the args) on size+mtime so an
-    edited file re-digests. Hashing only the head keeps this cheap: unlike the
-    old still portrait, AVATAR_VIDEO is tens of MB and clip_stamp() calls the
-    fingerprint once per cached clip at every startup.
+    """Hash a video cheaply enough to call on every cached clip at startup.
+
+    `size` and `mtime` are unused in the body: they are parameters so that the
+    lru_cache key changes when the file is edited. Only the first 4 MB is read,
+    which is enough to separate two clips but bounded for a large file.
     """
     h = hashlib.md5(str(size).encode())
     with open(path, "rb") as f:
@@ -76,16 +65,12 @@ def _video_digest(path: str, size: int, mtime: float) -> str:
 
 
 def avatar_fingerprint() -> str:
-    """Content digest of AVATAR_VIDEO — the cache key for everything MuseTalk
-    renders.
+    """Identity of the current driving video, used as a cache key.
 
-    Every cached artifact (the fixed protocol clips, greeting/decline/crisis
-    clips, the idle loop, and the prepared driving material under
-    MUSETALK_MATERIAL_DIR) is a function of BOTH the spoken text AND this
-    driving video. The caches therefore key on this digest as well as the text,
-    so swapping the video invalidates them and they re-render on next startup.
-    Keying on text alone was a face-swap trap: changing the driving clip left
-    every cached clip silently replaying the OLD face.
+    Rendered artifacts depend on the video as much as on the words, so caches
+    that key on text alone keep replaying the previous face after the video is
+    swapped. Returns "no-avatar" when the file is missing, which simply makes
+    every lookup miss rather than raising during startup.
     """
     try:
         st = os.stat(AVATAR_VIDEO)
@@ -93,256 +78,190 @@ def avatar_fingerprint() -> str:
     except OSError:
         return "no-avatar"
 
-# LLM
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = "google/gemini-2.5-flash"
 
-# The SBIRT counselor's system prompt is BUILT from the structured clinical
-# framework in modules/sbirt/ (instruments, brief-intervention techniques,
-# referral pathways, state machine) rather than hand-written here. This
-# guarantees the Q&A always carries the complete SBIRT content, and the clinical
-# material stays maintainable in one place. To edit what the counselor knows,
-# change the data modules under modules/sbirt/ — not this string.
+# Assembled from the clinical data in modules/sbirt/ (instruments, techniques,
+# referral pathways, state machine). Change the counselor's knowledge there, not
+# by editing a prompt string.
 SYSTEM_PROMPT = build_system_prompt()
 
-# Sentence splitting for synthesis breaks ONLY on sentence-final punctuation, so
-# each spoken clip is a whole sentence (comma-level splitting was removed — it made
-# the avatar choppy, with a silence gap and lip-sync seam at every comma, and it
-# multiplied MuseTalk renders). The system prompt's "open with a 4–8 word
-# acknowledgment as its own sentence" rule keeps the first clip short for a fast
-# start without needing sub-sentence splits.
-
-# --- TTS: local GPT-SoVITS ---
-# Runs as a SEPARATE process (scripts/tts_server.sh) because GPT-SoVITS needs
-# torch 2.14/cu126 while MuseTalk pins 2.0.1/cu118 — one virtualenv cannot hold
-# both. modules/tts.py is an HTTP client to it; a TTS restart therefore does not
-# disturb the avatar, and the model can move to another GPU or host by changing
-# this URL alone.
+# GPT-SoVITS runs as its own HTTP service (scripts/tts_server.sh) because it
+# needs torch 2.14/cu126 while MuseTalk pins 2.0.1/cu118 — the two cannot share
+# a virtualenv. modules/tts.py is only a client, so TTS can be restarted or
+# moved to another host by changing this URL.
 TTS_SERVER_URL = os.getenv("TTS_SERVER_URL", "http://127.0.0.1:9880")
-TTS_TIMEOUT_SEC = 60          # a long sentence on a cold model can take a while
+TTS_TIMEOUT_SEC = 60
 TTS_LANG = "en"
-TTS_BATCH_SIZE = 1            # one sentence per request; nothing to batch
-TTS_SPEED = 1.0
 
-# Zero-shot voice cloning reference: a 3-10s clip and its VERBATIM transcript.
-# The two must agree exactly — the transcript is the model's alignment prompt,
-# not a label. This clip was generated with the previous edge-tts voice
-# (en-US-GuyNeural), so moving to a local model did not change how the
-# counselor sounds; replace both files together to change the voice.
+# Zero-shot voice cloning: a 3-10s sample plus its transcript. The transcript is
+# the model's alignment prompt, so it must match the audio word for word — a
+# rough description degrades every synthesis. Replace both files together.
 TTS_REF_AUDIO = os.path.join(ASSETS_DIR, "voice", "reference.wav")
 _TTS_REF_TEXT_PATH = os.path.join(ASSETS_DIR, "voice", "reference.txt")
 with open(_TTS_REF_TEXT_PATH, encoding="utf-8") as _f:
     TTS_REF_TEXT = _f.read().strip()
 
-# ASR
 ASR_MODEL = "iic/SenseVoiceSmall"
 
-# Render the talking-head video at all. Set ENABLE_VIDEO_AVATAR=0 to run the
-# counselor as a VOICE-ONLY assistant: TTS still speaks every line, but MuseTalk is
-# never loaded and never renders, so the whole clip pipeline collapses to "the
-# TTS file IS the clip". Everything else — ASR, VAD, EOU, barge-in, echo
-# suppression, the clinical protocol — is text-driven and behaves identically.
-# The browser plays the audio through the same <video> elements (an audio-only
-# source drives canplay/ended/duration exactly like an mp4), so the frontend's
-# double-buffered playback machinery is shared by both modes.
-# Consequences of turning this off: MUSETALK_GPUS goes unused (ASR_GPU is still
-# needed), startup no longer pre-renders anything on the GPU, and cached clips
-# live under a separate cache key (see pipeline.clip_stamp) so the two modes
-# never serve each other's files.
+# 0 runs the counselor voice-only: MuseTalk is never imported (no GPU memory, no
+# checkpoints, no material preparation) and an utterance's audio becomes the
+# whole clip. Everything text-driven behaves the same. The two modes use
+# separate clip cache keys, so neither ever serves the other's cached output.
 ENABLE_VIDEO_AVATAR = 1
 
-# GPU allocation
-MUSETALK_GPUS = [0]  # GPUs MuseTalk renders on (one worker per listed GPU id)
-ASR_GPU = 0          # GPU for ASR (currently shared with MuseTalk)
+MUSETALK_GPUS = [0]
+ASR_GPU = 0
 
-# MuseTalk render knobs. There is no quality/speed dial like FLOAT's NFE — MuseTalk
-# is a single-step inpainting UNet, so a clip costs one pass per frame regardless.
-# Playback frame rate, and the rate whisper features are sampled at. It does NOT
-# have to match AVATAR_VIDEO's own frame rate, and here it deliberately does not
-# (the clip is 24 fps): lip sync is preserved either way, because output frame i
-# is driven by the audio at i/MUSETALK_FPS and the browser draws frame
-# floor(currentTime * MUSETALK_FPS) — both sides use THIS number, not the clip's.
+# Must match AVATAR_VIDEO's own frame rate. Lip sync survives any value — audio
+# and browser both index by this number — but one driving frame is consumed per
+# output frame, so a mismatch replays the clip's head motion at the wrong speed,
+# and the idle loop (the same file, played natively by a <video> element) then
+# visibly changes speed when the avatar starts talking. Changing this means
+# re-encoding loop.mp4 too, which re-keys avatar_fingerprint().
 #
-# What the mismatch does change is head motion. One driving frame is consumed
-# per output frame, so at 15 fps the clip's own motion plays back at 15/24 =
-# 0.63x. The idle loop is the same file played by a <video> element at its
-# native 24 fps, so the head visibly slows down when the avatar starts speaking.
-# Re-encoding assets/loop.mp4 to 15 fps removes that seam (and re-keys
-# avatar_fingerprint(), forcing a one-off material rebuild).
-#
-# 15 rather than 24 because the renderer is the bottleneck: measured throughput
-# on a V100 at MUSETALK_BATCH_SIZE=4 is ~17.5 frames/s, which is 0.73x a 24 fps
-# clock (the video falls behind the audio for as long as the utterance runs) but
-# ~1.17x a 15 fps one. Streaming playback only works while this is above 1.0x.
-MUSETALK_FPS = 15
-MUSETALK_BATCH_SIZE = 6      # frames per UNet batch AND the streaming flush unit.
-# Every batch is blended, JPEG-encoded and pushed to the browser the moment the
-# VAE decoder returns it, so this is the first-frame latency dial: 4 frames at
-# MUSETALK_FPS=24 is one sixth of a second of video per flush.
-MUSETALK_BBOX_SHIFT = 0      # v1 only; v15 ignores it (upstream forces 0)
-MUSETALK_EXTRA_MARGIN = 10   # v15: extra pixels below the face box, chin coverage
-MUSETALK_PARSING_MODE = "jaw"      # v15 blend mask mode ("jaw" or "raw")
-MUSETALK_LEFT_CHEEK_WIDTH = 90     # face-parsing cheek protection, in px
+# Note this is faster than the renderer: ~17.5 frames/s measured on a V100 at
+# batch size 4, i.e. 0.73x realtime here, so video falls progressively further
+# behind the audio over a long utterance.
+MUSETALK_FPS = 24
+# UNet batch size, and also the streaming granularity: a batch is blended,
+# encoded and pushed as soon as the VAE decoder returns it, so this trades
+# first-frame latency against throughput.
+MUSETALK_BATCH_SIZE = 6
+MUSETALK_BBOX_SHIFT = 0      # v1 only; v15 forces 0 upstream
+MUSETALK_EXTRA_MARGIN = 10   # v15: pixels added below the face box for the chin
+MUSETALK_PARSING_MODE = "jaw"      # v15 blend mask: "jaw" or "raw"
+MUSETALK_LEFT_CHEEK_WIDTH = 90     # px of cheek the face parser must not repaint
 MUSETALK_RIGHT_CHEEK_WIDTH = 90
-MUSETALK_AUDIO_PAD_LEFT = 2        # whisper context frames before each video frame
-MUSETALK_AUDIO_PAD_RIGHT = 2       # ... and after
+MUSETALK_AUDIO_PAD_LEFT = 2        # whisper context frames each side of the
+MUSETALK_AUDIO_PAD_RIGHT = 2       # frame being generated
 
-# Frame streaming (the browser composites JPEG frames on a canvas against one
-# continuous <audio> element, instead of fetching a muxed mp4 per sentence).
-MUSETALK_JPEG_QUALITY = 82   # per-frame JPEG quality pushed over the WebSocket
-# Frames the client buffers before it starts the audio clock. The audio, once
-# started, cannot be paused without an audible gap, so playback must not begin
-# until the renderer is far enough ahead to stay ahead — and at MUSETALK_FPS=15
-# it does stay ahead (see the throughput note above), so a fixed lead is enough:
-# the gap grows in the renderer's favour, not the clock's.
-# 12 frames is 0.8s at 15 fps.
+MUSETALK_JPEG_QUALITY = 82
+# Frames the client holds before starting the audio clock. Audio cannot pause
+# without an audible gap, so it must not start until there is a lead. Since the
+# renderer runs below realtime (see MUSETALK_FPS) this lead is consumed as the
+# utterance plays; it covers the opening, not the whole sentence.
 STREAM_PREBUFFER_FRAMES = 12
 
-# VAD
 VAD_THRESHOLD = 0.5
-VAD_SILENCE_DURATION = 0.35  # seconds of silence to trigger speech_end (lower = snappier)
+VAD_SILENCE_DURATION = 0.35  # silence before speech_end; lower is snappier
 
-# Discard the first N seconds of every mic stream before the VAD ever sees them.
-# Opening the mic emits a start-up transient (device pop + AGC ramping down from
-# max gain); measured on this box it runs ~0.5s and clips full scale (chunk #3 hit
-# max=32719 with the room silent). Silero scores it as speech, so the avatar
-# answers an utterance the user never spoke. 0 disables the discard.
+# Seconds of microphone audio dropped before the VAD sees anything. Opening a
+# mic emits a start-up transient (device pop plus AGC winding down from full
+# gain) that clips full scale and reads as speech, producing an utterance nobody
+# spoke. Measured at ~0.5s on this hardware. 0 disables.
 MIC_WARMUP_DISCARD = float(os.getenv("MIC_WARMUP_DISCARD", "0.5"))
 
-# --- Barge-in during avatar playback (ASR-confirmed / semantic) ---
-# While the avatar is speaking the VAD onset (speech_start) is unreliable — its own
-# audio can keep the VAD "in speech", and the onset heuristic misses — so barge-in
-# often doesn't fire until the clip finishes. Instead, while the avatar plays,
-# transcribe the incoming mic audio and interrupt the MOMENT it turns into real words
-# (a detected sentence), rejecting the avatar's own echo. Set BARGE_IN_ASR=0 to
-# fall back to VAD-onset-only barge-in.
+# Barge-in path 1: transcribe incoming audio while the avatar talks and
+# interrupt once it forms real words, discarding matches against what the avatar
+# is currently saying. Accurate, but costs a transcription before it fires.
+# VAD onset alone is unreliable here, because the avatar's own audio can hold
+# the VAD in-speech and mask the user's onset.
 BARGE_IN_ASR = os.getenv("BARGE_IN_ASR", "1").lower() not in ("0", "false", "no")
-BARGE_IN_MIN_SPEECH = 0.30   # seconds of user speech before the first ASR check
-BARGE_IN_RECHECK = 0.20      # re-run ASR every this many more seconds of speech until it fires
+BARGE_IN_MIN_SPEECH = 0.30   # speech accumulated before the first ASR check
+BARGE_IN_RECHECK = 0.20      # additional speech between subsequent checks
 
-# Instant (full-duplex) barge-in. The ASR-confirmed path above is accurate but
-# costs BARGE_IN_MIN_SPEECH + a transcription before it fires, which is audible
-# as the avatar talking over the user. This fires the cascade flush on SUSTAINED
-# VAD voice alone, with no transcription in the loop.
+# Barge-in path 2: interrupt on sustained VAD voice with no transcription, so
+# the cut is immediate. Checked before the ASR path.
 #
-# It is safe here only because getUserMedia is opened with
-# echoCancellation:{exact:true} (static/index.html) — without AEC the avatar's
-# own leaked voice is "sustained voice" and it would interrupt itself in a loop.
-# Set BARGE_IN_VAD=0 to fall back to ASR-confirmed interruption only.
+# Only safe because getUserMedia is opened with echoCancellation:{exact:true}
+# (static/index.html). Without echo cancellation the avatar's leaked voice is
+# itself "sustained voice" and it interrupts itself in a loop; set this to 0 if
+# a deployment shows that symptom.
 BARGE_IN_VAD = os.getenv("BARGE_IN_VAD", "1").lower() not in ("0", "false", "no")
-# Seconds of CONTINUOUS detected voice before the flush fires. Below ~0.12s the
-# trigger starts catching lip smacks and chair creaks that survive AEC; above
-# ~0.25s the user hears themselves talking over the avatar.
+# Continuous voice required before firing. Below ~0.12s this catches lip smacks
+# and chair creaks that survive echo cancellation; above ~0.25s the user hears
+# themselves talking over the avatar.
 BARGE_IN_VAD_SUSTAIN = 0.18
 
-# --- Performance / latency tuning ---
-# How often the server polls the pipeline for finished video segments and pushes
-# them to the browser. Lower = video is delivered more promptly after it renders.
-STATE_POLL_INTERVAL = 0.1   # seconds
+STATE_POLL_INTERVAL = 0.1   # how often finished video is pushed to the browser
 
-# Sliding window on the LLM conversation history sent to the API. Keeps long
-# sessions from ballooning the prompt (which slows first-token latency and costs).
-# Counts messages (user+assistant); the system prompt is always kept on top.
+# Messages of history sent to the LLM. The system prompt is always kept; this
+# only bounds the conversational tail, which otherwise slows first-token latency
+# as a session grows.
 LLM_HISTORY_MAX_MESSAGES = 20
 
-# Temp-file janitor: sweeps whatever still lands in tmp/ (debug dumps, an
-# abandoned render scratch file) plus the expired in-RAM media blobs.
 TEMP_FILE_TTL_SEC = 180
 TEMP_CLEAN_INTERVAL_SEC = 30
 
-# --- In-memory media (modules/clipcache.py) ---
-# Nothing the browser plays is written to disk: a rendered utterance is audio
-# bytes plus JPEG frames held in RAM and served from /media/<token>.mp3.
-#
-# How long a DYNAMIC sentence's audio stays reachable after it was published.
-# It only has to outlive the browser fetching and playing it once; a fixed
-# clip's audio is pinned for as long as the clip is cached and ignores this.
+# How long a dynamic sentence's audio stays fetchable after it is published. It
+# only has to outlive one browser fetch. Fixed clips pin their audio instead and
+# ignore this.
 MEDIA_BLOB_TTL_SEC = 300
-# Ceiling on the fixed-clip cache (audio + frames). Past it the least recently
-# used clip is dropped and will be re-rendered on demand. The full protocol is
-# ~81 utterances at roughly 5MB of JPEG each, so the default holds all of them
-# with room to spare; it exists to bound a runaway, not to force eviction.
+# Ceiling on the in-RAM fixed-clip cache. The full protocol is roughly 81
+# utterances at ~5MB of JPEG each, so the default holds all of them: this bounds
+# a runaway rather than forcing routine eviction.
 CLIP_CACHE_MAX_MB = int(os.getenv("CLIP_CACHE_MAX_MB", "2048"))
-# MuseTalk's whisper feature extraction takes a FILENAME, so each render spills
-# its mp3 to one scratch file and deletes it immediately. /dev/shm is RAM; the
-# fallback is tmp/, which on this deployment sits on GPFS (slow, networked).
+# MuseTalk's whisper feature extraction takes a filename, so each render spills
+# its audio to one short-lived file. /dev/shm is RAM; the fallback TEMP_DIR sits
+# on networked GPFS in this deployment and is markedly slower.
 _SHM = "/dev/shm"
 RENDER_SCRATCH_DIR = os.getenv(
     "RENDER_SCRATCH_DIR",
     os.path.join(_SHM, f"digital-human-{os.getuid()}") if os.path.isdir(_SHM) else TEMP_DIR,
 )
 
-# --- Fixed-clip pre-warm ---
-# Every fixed utterance is rendered once into the clip cache. The cache is RAM,
-# so this happens on every boot rather than being read back off disk — which is
-# why it runs ONLY while nobody is mid-turn, and hands the GPU straight back
-# (MuseTalk polls the abort hook every batch) the moment someone speaks.
+# The fixed-clip cache lives in RAM, so it is rebuilt from scratch on every
+# boot. The pre-warm renders it on the same GPUs that serve conversations, which
+# is why it only runs while nobody is mid-turn.
 CLIP_PREWARM = os.getenv("CLIP_PREWARM", "1").lower() not in ("0", "false", "no")
-# Treat the conversation as still live for this long after a turn ends, so the
-# pre-warm doesn't grab a GPU in the gap between two turns of the same exchange.
+# Treat a conversation as still live for this long after a turn ends, so the
+# pre-warm does not seize a GPU in the gap between two turns of one exchange.
 CLIP_PREWARM_IDLE_SEC = float(os.getenv("CLIP_PREWARM_IDLE_SEC", "5"))
-CLIP_PREWARM_POLL_SEC = 0.5     # how often the pre-warm re-checks for idle
+CLIP_PREWARM_POLL_SEC = 0.5
 CLIP_PREWARM_MAX_ATTEMPTS = 3   # give up on a clip that keeps failing to render
 
-
-# Write patient/clinical content to the logs VERBATIM instead of the redacted
-# "<phi 7w/41c>" shape summary. Off by default. For local debugging only: with
-# this on, transcripts land in run.log in the clear.
+# Log patient and clinical content verbatim instead of redacting it to a shape
+# summary. Local debugging only: transcripts then sit in the log in the clear.
 LOG_PHI = os.getenv("LOG_PHI", "0").lower() in ("1", "true", "yes")
 
-# Consent audit trail (append-only JSONL): decision + timestamp + exact-wording
-# version per session. No transcripts, no screening data. records/ is
-# gitignored; the directory is created on first write.
+# Append-only record of consent decisions: decision, timestamp and a hash of the
+# exact wording consented to. No transcripts and no screening data. The
+# directory is gitignored and created on first write.
 CONSENT_LOG_PATH = os.getenv(
     "CONSENT_LOG_PATH",
     os.path.join(RECORDS_DIR, "consent_log.jsonl"),
 )
 
-# --- EOU: semantic end-of-utterance / turn detection (smart-turn v3) ---
-# When enabled, a VAD-detected pause is only treated as the end of the user's turn
-# if the smart-turn model agrees the utterance is semantically complete. This stops
-# the avatar from cutting people off when they pause to think, while still ending
-# promptly on a finished thought. Tiny ONNX model on CPU (~28ms); isolated from the
-# MuseTalk GPUs. If the model can't load, VAD transparently falls back to pure silence.
+# End-of-utterance detection: a small ONNX model that judges whether a pause is
+# semantically the end of a turn, so the avatar does not cut in when someone
+# pauses to think. Runs on CPU, isolated from the MuseTalk GPUs; if it fails to
+# load the VAD falls back to plain silence timing.
 USE_EOU = os.getenv("USE_EOU", "1").lower() not in ("0", "false", "no")
 EOU_MODEL_PATH = os.path.join(CHECKPOINTS_DIR, "smart-turn", "smart-turn-v3.2-cpu.onnx")
-EOU_THRESHOLD = 0.5          # P(complete) >= this -> end the turn (↑ more patient, ↓ snappier)
-EOU_CONFIRM_CONSULTS = 2     # require this many CONSECUTIVE 'complete' verdicts before
-                             # ending — hysteresis against a momentary clause-boundary
-                             # spike cutting the user off mid-sentence. 1 = no hysteresis.
-EOU_PAUSE_DURATION = 0.20    # silence before the FIRST EOU consult (keep short)
-EOU_RECHECK_DURATION = 0.15  # re-consult cadence while silence continues
-EOU_MAX_SILENCE = 2.0        # hard cap: force end after this much silence regardless of EOU
-EOU_ONNX_THREADS = 2         # CPU threads for the ONNX session
+EOU_THRESHOLD = 0.5          # P(complete) at or above this ends the turn
+# Consecutive "complete" verdicts required. Hysteresis against a single spike at
+# a clause boundary cutting someone off mid-sentence; 1 disables it.
+EOU_CONFIRM_CONSULTS = 2
+EOU_PAUSE_DURATION = 0.20    # silence before the first consult
+EOU_RECHECK_DURATION = 0.15  # consult cadence while silence continues
+EOU_MAX_SILENCE = 2.0        # end the turn regardless once silence reaches this
+EOU_ONNX_THREADS = 2
 
-# Reap a per-user session this long after its last client disconnects (idle only).
-SESSION_IDLE_TTL_SEC = 600
+SESSION_IDLE_TTL_SEC = 600   # reap a session this long after its last client left
 
-# Idle video (ambient loop). It IS the driving clip: loop.mp4 is authored to
-# loop seamlessly, so the frontend can play it directly between answers and
-# nothing has to be generated, cached or invalidated.
+# The driving video doubles as the ambient loop: it is authored to loop
+# seamlessly, so the page can play it directly and nothing has to be generated
+# or invalidated.
 IDLE_VIDEO_PATH = AVATAR_VIDEO
 
-# Voice-only counterpart of the idle loop. The frontend's playback state machine
-# pivots on an "idle" item it can loop between answers; with no video there is
-# nothing to show, so it loops this silent clip instead and the swap/drain logic
-# stays byte-identical across both modes. Generated once by ffmpeg at startup
-# (no GPU) — see main._ensure_idle_media.
+# Voice-only equivalent. The page's playback machinery is built around having an
+# idle item to loop, so silence keeps that machinery identical across both modes
+# instead of forking it. Encoded once at startup by main._ensure_idle_media.
 IDLE_AUDIO_PATH = os.path.join(ASSETS_DIR, "idle_silence.mp3")
 IDLE_AUDIO_DURATION = 2.0
 
 
 def idle_media_path() -> str:
-    """The ambient clip the frontend loops when nobody is speaking."""
+    """The clip the page loops when nobody is speaking, for the current mode."""
     return IDLE_VIDEO_PATH if ENABLE_VIDEO_AVATAR else IDLE_AUDIO_PATH
 
-# Fixed opening the counselor always says first. Because it is IDENTICAL every
-# session, it is rendered ONCE per process into the in-RAM clip cache and replayed
-# from there — no per-session LLM/TTS/MuseTalk, and it appears instantly. Editing
-# GREETING_TEXT invalidates the cached clip (clip_stamp covers the text), so the
-# next play re-renders it. The spoken part only; the yes/no consent branch is
-# handled by the LLM (see modules/sbirt/workflow.py).
+# Study-verbatim consent wording. Identical every session, so it is rendered
+# once per process into the clip cache and replayed from there. Editing it
+# changes the cache stamp and forces a re-render; it is also hashed into the
+# consent audit record, so past records stop matching the current text. Only the
+# spoken half — the yes/no branch is handled by modules/sbirt/workflow.py.
 GREETING_TEXT = (
     "Hello, I am an AI assistant designed to help understand some important factors "
     "that may impact your health. This information will be shared with your medical "
@@ -352,18 +271,17 @@ GREETING_TEXT = (
 )
 GREETING_CLIP_KEY = "greeting"
 
-# Fixed reply when the user DECLINES consent at the greeting. Cached the same way,
-# so it is verbatim + instant like the greeting (no per-session LLM/TTS/MuseTalk).
+# Spoken when consent is refused, then the session ends. Cached like the
+# greeting, so it plays verbatim and immediately.
 DECLINE_TEXT = "Thank you, and your provider will address these during your visit."
 DECLINE_CLIP_KEY = "decline"
 
-# Server / public access
-SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")  # bind all interfaces for public access
+SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "17861"))
 WS_PORT = int(os.getenv("WS_PORT", "17862"))
 
-# HTTPS — required for browser microphone (getUserMedia) on non-localhost origins.
+# Browsers only grant microphone access in a secure context, so a non-localhost
+# deployment needs working certificates here or the page cannot listen at all.
 SSL_CERT_FILE = os.getenv("SSL_CERT_FILE", os.path.join(CERTS_DIR, "cert.pem"))
 SSL_KEY_FILE = os.getenv("SSL_KEY_FILE", os.path.join(CERTS_DIR, "key.pem"))
-# Enabled by default; set ENABLE_HTTPS=0 to force plain HTTP (mic then only works on localhost).
 ENABLE_HTTPS = os.getenv("ENABLE_HTTPS", "1").lower() not in ("0", "false", "no")
