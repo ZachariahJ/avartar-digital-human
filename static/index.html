@@ -486,6 +486,14 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
           // requirement, the failure is loud and arrives before the session.
           echoCancellation: { exact: true },
           noiseSuppression: { ideal: true },
+          // Off, because the server decides who is talking to it by how loud
+          // they are relative to the room (see modules/vad.py). Automatic gain
+          // is the one thing that destroys that comparison: in a quiet library
+          // it winds the gain up until the people at the next table are as loud
+          // as the user. Requested as a hint rather than exactly, since not
+          // every browser exposes the control — the ambient estimate still
+          // tracks a stream that has AGC forced on, just less sharply.
+          autoGainControl: { ideal: false },
         }
       });
 
@@ -493,9 +501,14 @@ body.with-card .btn-card { border-color: #e94560; color: #e94560; }
       // was actually applied catches everything else.
       const settings = mediaStream.getAudioTracks()[0].getSettings();
       console.log('[Audio] echoCancellation:', settings.echoCancellation,
-                  ' noiseSuppression:', settings.noiseSuppression);
+                  ' noiseSuppression:', settings.noiseSuppression,
+                  ' autoGainControl:', settings.autoGainControl);
       if (settings.echoCancellation === false) {
         console.warn('[Audio] echo cancellation is OFF — the avatar will hear itself');
+      }
+      if (settings.autoGainControl === true) {
+        console.warn('[Audio] automatic gain control is ON — background voices will '
+                     + 'be levelled up toward yours, so far-field rejection is weaker');
       }
 
       audioCtx = new AudioContext({ sampleRate: 16000 });

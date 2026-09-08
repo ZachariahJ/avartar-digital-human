@@ -134,6 +134,36 @@ STREAM_PREBUFFER_FRAMES = 12
 VAD_THRESHOLD = 0.5
 VAD_SILENCE_DURATION = 0.35  # silence before speech_end; lower is snappier
 
+# Near-field gate. Silero answers "is this speech", which is not the question
+# the turn-taker needs answered: in a library or an open office the people at
+# the next table are speech, and every interrupt path downstream is built on
+# Silero's verdict. Loudness is the dimension that separates them — a speaker
+# 2m away arrives 15-25dB below one at the microphone — so a chunk counts as
+# speech only if it is both voice-like AND near-field. Gating here rather than
+# per interrupt path is deliberate: barge-in, speech_start and speech_end all
+# read the same buffer, so one gate fixes all of them.
+#
+# Near-field is judged against the room, not against a fixed number: the
+# detector tracks the ambient level continuously and requires speech to stand
+# this far above it, so a quiet library and a noisy cafe both work without
+# retuning. 0 disables the gate entirely.
+VAD_NEAR_FIELD_MARGIN_DB = float(os.getenv("VAD_NEAR_FIELD_MARGIN_DB", "15"))
+# Once someone is speaking the bar drops to this, because unvoiced consonants
+# and the tail of a sentence fall well below its loudest syllable. Without the
+# hysteresis the gate chops a single utterance into fragments and each gap
+# counts toward speech_end.
+VAD_NEAR_FIELD_RELEASE_DB = float(os.getenv("VAD_NEAR_FIELD_RELEASE_DB", "6"))
+# Backstop under the adaptive bar, for a room quiet enough that the ambient
+# estimate bottoms out: nothing this faint is someone addressing the microphone,
+# whatever the margin allows. Absolute dBFS, so it only means anything with
+# browser AGC off (see the getUserMedia constraints in static/index.html).
+VAD_MIN_LEVEL_DBFS = float(os.getenv("VAD_MIN_LEVEL_DBFS", "-55"))
+# Where the ambient estimate starts, before any audio has been heard. Set high
+# rather than low: it converges downward within a few hundred ms, and starting
+# high means the first moments of a session cannot be interrupted by the room,
+# whereas starting low would let everything through until it caught up.
+VAD_NOISE_FLOOR_INIT_DBFS = float(os.getenv("VAD_NOISE_FLOOR_INIT_DBFS", "-45"))
+
 # Seconds of microphone audio dropped before the VAD sees anything. Opening a
 # mic emits a start-up transient (device pop plus AGC winding down from full
 # gain) that clips full scale and reads as speech, producing an utterance nobody

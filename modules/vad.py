@@ -1,12 +1,20 @@
 """Turn detection: when has the user started talking, and when have they stopped.
 
-Silero answers only "is this chunk speech", which makes the end of a turn a
-guess about how long a silence has to last. modules/eou.py supplies the missing
-judgement — whether the sentence sounds finished — and this module combines the
-two, falling back to pure silence timing whenever that model is unavailable.
+Silero answers only "is this chunk speech", which is short of what turn-taking
+needs in two directions, and this module supplies both.
+
+Whether the speech is even addressed to us: in a shared room the next table is
+speech too, and Silero says so. The near-field gate below adds the dimension
+that separates them — level above the room's own ambient — so background
+conversation never reaches the buffer that barge-in and the ASR read.
+
+Whether a silence means the turn is over: modules/eou.py judges whether the
+sentence sounds finished, and _should_end_turn combines that with the silence
+clock, falling back to pure silence timing whenever that model is unavailable.
 """
 
 import logging
+import time
 
 import torch
 import numpy as np
@@ -15,6 +23,17 @@ import config
 from modules import eou
 
 logger = logging.getLogger(__name__)
+
+# How fast the ambient estimate follows the room, per 32ms chunk. Asymmetric on
+# purpose: it drops toward a new quiet almost immediately, so a lull is
+# recognised as the true floor, but climbs slowly (~6s to settle) so that one
+# passing voice — or the user's own, if the gate ever misjudges it — cannot
+# drag the bar up behind itself and deafen the detector.
+_FLOOR_FALL = 0.30
+_FLOOR_RISE = 0.005
+# Silence in int16 is exactly zero, and log(0) is not a number. This is ~-140dB,
+# far below anything a microphone produces.
+_EPS = 1e-7
 
 
 class VoiceActivityDetector:
@@ -26,6 +45,14 @@ class VoiceActivityDetector:
     ):
         self.threshold = threshold
         self.sample_rate = sample_rate
+        self.near_field_margin = config.VAD_NEAR_FIELD_MARGIN_DB
+        self.near_field_release = config.VAD_NEAR_FIELD_RELEASE_DB
+        self.min_level_db = config.VAD_MIN_LEVEL_DBFS
+        # Ambient level of the room. Lives on the detector, not on a turn: it
+        # describes where the session is sitting, so _reset() deliberately
+        # leaves it alone and the estimate carries across utterances.
+        self.noise_floor_db = config.VAD_NOISE_FLOOR_INIT_DBFS
+        self._gate_logged_at = 0.0
         # Fixed by Silero: it consumes exactly 512 samples per call, 32ms at
         # 16kHz. Every duration below is converted into a count of these.
         self.chunk_size = 512
@@ -97,6 +124,28 @@ class VoiceActivityDetector:
                     "END" if end else "hold")
         return end
 
+    @staticmethod
+    def _level_db(chunk: np.ndarray) -> float:
+        """Chunk level in dBFS, where 0 is full scale."""
+        rms = float(np.sqrt(np.mean(chunk * chunk)))
+        return 20.0 * np.log10(max(rms, _EPS))
+
+    def _track_ambient(self, level_db: float):
+        """Fold one non-speech chunk into the running estimate of the room."""
+        rate = _FLOOR_FALL if level_db < self.noise_floor_db else _FLOOR_RISE
+        self.noise_floor_db += rate * (level_db - self.noise_floor_db)
+
+    def _is_near_field(self, level_db: float) -> bool:
+        """Whether a voice-like chunk is close enough to be addressed to us.
+
+        The bar is the louder of two: a margin above the room's own level, which
+        is what actually separates the microphone's owner from the next table,
+        and an absolute minimum for a room so quiet the first bar sinks below
+        anything a person at the microphone could produce.
+        """
+        margin = self.near_field_release if self.is_speaking else self.near_field_margin
+        return level_db >= max(self.min_level_db, self.noise_floor_db + margin)
+
     def process_chunk(self, audio_chunk: np.ndarray):
         """Feed one chunk of microphone audio and report any turn boundary.
 
@@ -117,13 +166,30 @@ class VoiceActivityDetector:
         # chunk is split up and any remainder is zero-padded.
         for i in range(0, len(audio_f32), self.chunk_size):
             sub = audio_f32[i : i + self.chunk_size]
+            # Measured before padding: the zeros are not part of the room, and
+            # averaging them in would read a short trailing slice as quieter
+            # than it was.
+            level_db = self._level_db(sub)
             if len(sub) < self.chunk_size:
                 sub = np.pad(sub, (0, self.chunk_size - len(sub)))
 
             tensor = torch.from_numpy(sub)
             prob = self.model(tensor, self.sample_rate).item()
 
-            if prob >= self.threshold:
+            # Both questions, in order: voice-like, and near enough to be meant
+            # for us. A chunk that fails either one is silence as far as
+            # everything downstream is concerned, and it is also what the
+            # ambient estimate is built from — background conversation raises
+            # the floor it is measured against, which is what lets the gate
+            # stay shut for as long as the room stays noisy.
+            voice = prob >= self.threshold
+            if voice and self.near_field_margin > 0 and not self._is_near_field(level_db):
+                voice = False
+                self._log_gated(level_db, prob)
+            if not voice:
+                self._track_ambient(level_db)
+
+            if voice:
                 self.silent_chunks = 0
                 if not self.is_speaking:
                     self.is_speaking = True
@@ -145,6 +211,17 @@ class VoiceActivityDetector:
                 return ("speech_start", None)
 
         return (None, None)
+
+    def _log_gated(self, level_db: float, prob: float):
+        """Report gated speech at most once a second: it can fire 30x/s."""
+        now = time.monotonic()
+        if now - self._gate_logged_at < 1.0:
+            return
+        self._gate_logged_at = now
+        logger.info("[vad] far-field speech ignored: %.0fdBFS vs floor %.0f+%.0fdB "
+                    "(p=%.2f)", level_db, self.noise_floor_db,
+                    self.near_field_release if self.is_speaking else self.near_field_margin,
+                    prob)
 
     def pending_audio(self):
         """The utterance so far, or None if the user is not currently speaking.
