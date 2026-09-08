@@ -206,7 +206,10 @@ def fixed_segment(text: str, key: str) -> Segment | None:
     seg = Segment(text)
     for jpeg in clip.frames:
         seg.frames.put(jpeg)
-    seg.open(clipcache.url_for(clip.audio_token))
+    # A fresh blob per playback: the clip keeps the bytes, and the URL the
+    # browser is handed expires on its own without the cache having to
+    # track who is still playing what.
+    seg.open(clipcache.publish_url(clip.audio))
     seg.close()
     return seg
 
@@ -1069,10 +1072,7 @@ class Pipeline:
         render_into(seg, audio, abort=seg.cancelled.is_set, collect=frames)
         if (cache_key and not seg.cancelled.is_set() and not self._aborted(turn)
                 and (frames or not config.ENABLE_VIDEO_AVATAR)):
-            # Reuse the audio this segment is already playing from, instead of
-            # storing a second copy of identical bytes.
-            clipcache.put_clip(cache_key, clip_stamp(text), audio, frames,
-                               token=clipcache.token_from_url(seg.audio_url))
+            clipcache.put_clip(cache_key, clip_stamp(text), audio, frames)
         return seg
 
     def _deliver_step(self, user_text, step, turn, ack=""):
@@ -1132,12 +1132,13 @@ class Pipeline:
         if not self._aborted(turn):
             self.video_queue.put(None)
             self.state = "speaking"
-            if step.expect.kind == "end":
-                # The closing line is queued, so the session is finished. Without
-                # this the counselor says goodbye and then keeps listening, and
-                # every further remark costs a full turn to answer with "the
-                # session is already complete".
-                self.ended = True
+        if step.expect.kind == "end":
+            # Session state, not delivery state, so it is set even when a
+            # barge-in cut the closing line short: the protocol reached its
+            # end, and whether the goodbye finished playing does not change
+            # that. Skipping it on an aborted turn is what let somebody talk
+            # straight past a goodbye and keep the session alive forever.
+            self.ended = True
 
     def get_next_video(self):
         """Take the next segment for delivery, without blocking.

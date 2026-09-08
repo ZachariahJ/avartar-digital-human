@@ -1,11 +1,23 @@
 """Everything the browser plays, held in memory rather than on disk.
 
-Two kinds of entry:
+Two structures, answering two different questions:
 
   * blobs — bytes addressed by a token, which is what a ``/media/<token>`` URL
-    resolves to. Dynamic sentences publish here with a TTL.
-  * clips — one fully rendered fixed utterance under a stable key: its audio,
-    pinned, plus every JPEG frame in order.
+    resolves to. This is delivery, not caching: the browser can only take audio
+    through a URL, so every utterance about to play publishes one, and it is
+    swept once its TTL has passed. Nothing is ever reused from here.
+  * clips — the cache proper. One fully rendered fixed utterance under a stable
+    key: its audio and every JPEG frame in order, so that a line the protocol
+    speaks to every patient is rendered once per process rather than once per
+    patient.
+
+A clip holds its own bytes and publishes a fresh blob each time it is played.
+That keeps the dependency one-way — clips use blobs, blobs know nothing of
+clips — and it is why blobs need only one lifetime rule. An earlier design had
+the clip take ownership of the blob its first render published, to save a copy
+of the audio; that copy never existed (bytes are shared by reference, so a
+second publish costs one dict entry), and the ownership it introduced meant
+evicting a clip could delete audio a segment was still playing from.
 
 The reason for memory is latency. The previous on-disk cache lived on networked
 GPFS, where replaying one cached utterance meant roughly 300 sequential opens,
@@ -40,35 +52,34 @@ _MEDIA_EXT = ".mp3"
 
 
 class Blob:
-    """Bytes reachable by token.
-
-    An `expires_at` of None means pinned: some clip owns these bytes and only
-    that owner may release them, so the sweeper must leave them alone.
-    """
+    """Bytes reachable by token until `expires_at`, then swept."""
 
     __slots__ = ("data", "expires_at")
 
-    def __init__(self, data: bytes, expires_at: float | None):
+    def __init__(self, data: bytes, expires_at: float):
         self.data = data
         self.expires_at = expires_at
 
 
 class Clip:
-    """One fixed utterance, fully rendered: pinned audio plus frames in order.
+    """One fixed utterance, fully rendered: its audio plus frames in order.
 
     `stamp` describes everything the render depended on — the text, the avatar
     and the frame rate. Looking up with a different stamp misses rather than
     hitting, which is what stops edited wording or a swapped avatar from being
     replayed from a cache that is still warm.
+
+    The audio is held here as bytes, not as a blob token: a clip outlives any
+    single delivery, so it cannot depend on a blob that expires.
     """
 
-    __slots__ = ("key", "stamp", "audio_token", "frames", "nbytes")
+    __slots__ = ("key", "stamp", "audio", "frames", "nbytes")
 
-    def __init__(self, key: str, stamp: str, audio_token: str,
+    def __init__(self, key: str, stamp: str, audio: bytes,
                  frames: tuple[bytes, ...], nbytes: int):
         self.key = key
         self.stamp = stamp
-        self.audio_token = audio_token
+        self.audio = audio
         self.frames = frames
         self.nbytes = nbytes
 
@@ -80,24 +91,24 @@ _clips: "OrderedDict[str, Clip]" = OrderedDict()
 _clip_bytes = 0
 
 
-def publish(data: bytes, ttl: float | None = -1.0) -> str:
-    """Store bytes and return the token that addresses them.
+def publish(data: bytes, ttl: float | None = None) -> str:
+    """Store bytes for delivery and return the token that addresses them.
 
     Args:
-        data: the bytes to store.
-        ttl: seconds until expiry. The default sentinel means
-            config.MEDIA_BLOB_TTL_SEC; None pins the blob, and the caller then
-            owns it and must call release().
+        data: the bytes to store. They are referenced, not copied, so
+            publishing the same audio twice costs one dict entry.
+        ttl: seconds until expiry; None means config.MEDIA_BLOB_TTL_SEC. This
+            is the window in which the browser must fetch the URL, not a
+            retention policy — nothing is ever served from here twice.
 
     Tokens are random, so a URL built from one cannot be guessed or enumerated
     into somebody else's audio.
     """
-    if ttl == -1.0:
+    if ttl is None:
         ttl = config.MEDIA_BLOB_TTL_SEC
     token = secrets.token_urlsafe(12)
-    expires_at = None if ttl is None else time.monotonic() + ttl
     with _lock:
-        _blobs[token] = Blob(data, expires_at)
+        _blobs[token] = Blob(data, time.monotonic() + ttl)
     return token
 
 
@@ -106,7 +117,7 @@ def url_for(token: str) -> str:
     return f"/media/{token}{_MEDIA_EXT}"
 
 
-def publish_url(data: bytes, ttl: float | None = -1.0) -> str:
+def publish_url(data: bytes, ttl: float | None = None) -> str:
     """Store bytes and return their URL, for callers that never need the token."""
     return url_for(publish(data, ttl))
 
@@ -130,23 +141,17 @@ def fetch(token: str) -> bytes | None:
         blob = _blobs.get(token)
         if blob is None:
             return None
-        if blob.expires_at is not None and blob.expires_at <= time.monotonic():
+        if blob.expires_at <= time.monotonic():
             del _blobs[token]
             return None
         return blob.data
 
 
-def release(token: str) -> None:
-    with _lock:
-        _blobs.pop(token, None)
-
-
 def sweep() -> int:
-    """Drop every expired unpinned blob and return how many went."""
+    """Drop every expired blob and return how many went."""
     now = time.monotonic()
     with _lock:
-        dead = [t for t, b in _blobs.items()
-                if b.expires_at is not None and b.expires_at <= now]
+        dead = [t for t, b in _blobs.items() if b.expires_at <= now]
         for t in dead:
             del _blobs[t]
     return len(dead)
@@ -155,21 +160,17 @@ def sweep() -> int:
 def get_clip(key: str, stamp: str) -> Clip | None:
     """The cached clip for `key`, or None if absent or built from another stamp.
 
-    A stamp mismatch drops the stale entry rather than returning it. Its audio
-    is released after the lock is dropped: the blob is pinned, so nothing else
-    will ever reclaim it, and release() would deadlock on this same
-    non-reentrant lock.
+    A stamp mismatch drops the stale entry rather than returning it.
     """
-    stale = None
+    stale = False
     with _lock:
         clip = _clips.get(key)
         if clip is not None and clip.stamp != stamp:
-            stale = _drop_locked(key)
-            clip = None
+            _drop_locked(key)
+            clip, stale = None, True
         elif clip is not None:
             _clips.move_to_end(key)
-    if stale is not None:
-        release(stale)
+    if stale:
         logger.info("[clipcache] dropped %s: it was rendered from a different "
                     "stamp (text, avatar or fps changed)", key)
     return clip
@@ -179,34 +180,28 @@ def has_clip(key: str, stamp: str) -> bool:
     return get_clip(key, stamp) is not None
 
 
-def put_clip(key: str, stamp: str, audio: bytes, frames, token: str | None = None) -> Clip:
+def put_clip(key: str, stamp: str, audio: bytes, frames) -> Clip:
     """Cache one rendered fixed utterance, evicting as needed to stay under cap.
 
     Args:
         key: stable identifier for the utterance.
         stamp: what it was rendered from; see get_clip.
-        audio: the utterance's audio.
+        audio: the utterance's audio. Held by reference; a blob published from
+            the same bytes is unaffected by this clip's eviction.
         frames: JPEG frames in order. Empty in voice-only mode, where an
             audio-only clip is complete rather than half rendered.
-        token: an existing blob already holding this audio, typically the one
-            the segment just played from. Given it, the clip pins that blob
-            instead of storing a second copy.
 
     Returns:
         The cached Clip.
     """
     frames = tuple(frames or ())
     nbytes = len(audio) + sum(len(f) for f in frames)
-    if not (token and pin(token)):
-        token = publish(audio, ttl=None)   # pinned: the clip owns it
-    clip = Clip(key, stamp, token, frames, nbytes)
+    clip = Clip(key, stamp, audio, frames, nbytes)
     global _clip_bytes
-    evicted = []
     with _lock:
         old = _clips.get(key)
         if old is not None:
             _clip_bytes -= old.nbytes
-            evicted.append(old.audio_token)
             del _clips[key]
         _clips[key] = clip
         _clip_bytes += nbytes
@@ -214,29 +209,20 @@ def put_clip(key: str, stamp: str, audio: bytes, frames, token: str | None = Non
         while _clip_bytes > cap and len(_clips) > 1:
             _, victim = _clips.popitem(last=False)
             _clip_bytes -= victim.nbytes
-            evicted.append(victim.audio_token)
             logger.info("[clipcache] evicted %s (%.1f MB) to stay under %d MB",
                         victim.key, victim.nbytes / 1e6, config.CLIP_CACHE_MAX_MB)
         total, count = _clip_bytes, len(_clips)
-    for t in evicted:
-        release(t)
     logger.info("[clipcache] cached %s (%d frames, %.1f MB); %d clips, %.1f MB held",
                 key, len(frames), nbytes / 1e6, count, total / 1e6)
     return clip
 
 
-def _drop_locked(key: str) -> str | None:
-    """Remove one clip and return its audio token, or None if it was absent.
-
-    The caller must hold _lock, and must release the returned token only after
-    dropping it — release() takes the same non-reentrant lock.
-    """
+def _drop_locked(key: str) -> None:
+    """Remove one clip. The caller must hold _lock."""
     global _clip_bytes
     clip = _clips.pop(key, None)
-    if clip is None:
-        return None
-    _clip_bytes -= clip.nbytes
-    return clip.audio_token
+    if clip is not None:
+        _clip_bytes -= clip.nbytes
 
 
 def stats() -> dict:
