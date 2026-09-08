@@ -15,7 +15,7 @@ import edge_tts
 import config
 
 
-async def _synthesize(text: str, voice: str,
+async def _synthesize(text: str, voice: str, rate: str,
                       cancel_event: threading.Event | None = None) -> bytes | None:
     """Stream the synthesis into memory, abandoning it the moment `cancel_event` fires.
 
@@ -27,7 +27,7 @@ async def _synthesize(text: str, voice: str,
     Returns the complete mp3, or None if it was abandoned mid-stream (half an
     utterance is worse than none).
     """
-    communicate = edge_tts.Communicate(text, voice)
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
     buf = io.BytesIO()
     async for chunk in communicate.stream():
         if cancel_event is not None and cancel_event.is_set():
@@ -57,7 +57,8 @@ def synthesize(text: str,
     # edge-tts hits a remote Microsoft endpoint per sentence; a transient failure
     # must degrade to "skip this clip" (return None), never raise and freeze the turn.
     def _run():
-        return asyncio.run(_synthesize(text, config.TTS_VOICE, cancel_event))
+        return asyncio.run(_synthesize(text, config.TTS_VOICE, config.TTS_RATE,
+                                       cancel_event))
 
     try:
         if loop and loop.is_running():

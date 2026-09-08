@@ -89,6 +89,10 @@ SYSTEM_PROMPT = build_system_prompt()
 
 # TTS
 TTS_VOICE = "en-US-GuyNeural"
+# Speaking rate, as edge-tts wants it: a percentage offset from the voice's
+# natural pace. "-20%" is 0.8x. Slower speech only lengthens the audio; lip sync
+# follows it, because MuseTalk drives frames off these exact samples.
+TTS_RATE = "-10%"
 
 ASR_MODEL = "iic/SenseVoiceSmall"
 
