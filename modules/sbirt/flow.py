@@ -156,9 +156,7 @@ def close_unit(session) -> str:
 
 
 PROTOCOL: tuple = (
-    # The greeting clip already asked for consent, so the machine starts at the
-    # reply rather than by asking again.
-    Gate("consent.opening", on_no="declined", ask_included=True),
+    Gate("consent.opening", on_no="declined"),
 
     RunItems("prescreen"),
     Route(_after_prescreen),

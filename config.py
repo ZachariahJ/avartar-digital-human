@@ -4,7 +4,7 @@ import hashlib
 import threading
 from dotenv import load_dotenv
 
-from modules.sbirt import build_system_prompt
+from modules.sbirt import build_system_prompt, templates
 
 load_dotenv()
 
@@ -130,6 +130,10 @@ MUSETALK_JPEG_QUALITY = 82
 # lead. Whether that lead grows or shrinks over an utterance depends on how the
 # deployment's GPU compares with MUSETALK_FPS; measure before changing this.
 STREAM_PREBUFFER_FRAMES = 12
+# How far the wire may trail the audio clock before frames are dropped instead
+# of sent. The clock never waits, so a late frame is one nobody will ever draw:
+# sending it only spends the bandwidth the stream needs to catch back up.
+STREAM_DROP_LAG_FRAMES = 6
 
 VAD_THRESHOLD = 0.5
 VAD_SILENCE_DURATION = 0.35  # silence before speech_end; lower is snappier
@@ -206,6 +210,9 @@ TEMP_CLEAN_INTERVAL_SEC = 30
 # only has to outlive one browser fetch. Fixed clips pin their audio instead and
 # ignore this.
 MEDIA_BLOB_TTL_SEC = 300
+# Off while the counselor words its own replies: a cached clip can only replay
+# a line decided before the turn, so caching fights per-person phrasing.
+CLIP_CACHE = os.getenv("CLIP_CACHE", "0").lower() not in ("0", "false", "no")
 # Ceiling on the in-RAM fixed-clip cache. The full protocol is roughly 81
 # utterances at ~5MB of JPEG each, so the default holds all of them: this bounds
 # a runaway rather than forcing routine eviction.
@@ -274,18 +281,21 @@ def idle_media_path() -> str:
     """The clip the page loops when nobody is speaking, for the current mode."""
     return IDLE_VIDEO_PATH if ENABLE_VIDEO_AVATAR else IDLE_AUDIO_PATH
 
-# Study-verbatim consent wording. Identical every session, so it is rendered
-# once per process into the clip cache and replayed from there. Editing it
-# changes the cache stamp and forces a re-render; it is also hashed into the
-# consent audit record, so past records stop matching the current text. Only the
-# spoken half — the yes/no branch is handled by modules/sbirt/workflow.py.
-GREETING_TEXT = (
+# Study-verbatim consent wording, spoken as two utterances: this preamble, then
+# the question itself, which belongs to the protocol so that it can be re-asked
+# from the same place as every other question when no answer arrives.
+GREETING_PREAMBLE = (
     "Hello, I am an AI assistant designed to help understand some important factors "
     "that may impact your health. This information will be shared with your medical "
     "provider to help your provider better understand your current health issues. "
     "Your answers will be treated as confidential and as protected health information. "
-    "May I ask you some questions about your health?"
 )
+CONSENT_QUESTION = templates.FIXED["consent.opening"]
+# What the person actually hears before deciding, and therefore what the consent
+# audit hashes. Composed rather than written out so the two halves cannot drift
+# apart; the bytes are unchanged from when it was one string, so existing
+# records still match.
+GREETING_TEXT = GREETING_PREAMBLE + CONSENT_QUESTION
 GREETING_CLIP_KEY = "greeting"
 
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")

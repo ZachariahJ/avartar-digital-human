@@ -210,9 +210,6 @@ def _resolve_say(session: ClinicalSession, name: str) -> Say:
     if name == "@bi.why_not_higher":
         v = session.readiness[arm]
         return Say(f"bi.why_not_higher.{v}", templates.bi_why_not_higher(v))
-    if name == "@close":
-        key = close_unit(session)
-        return Say(key, templates.FIXED[key])
     raise ProtocolError(f"unknown resolver {name!r}")
 
 
@@ -239,6 +236,10 @@ def _points_instruction(session: ClinicalSession, unit: templates.Unit) -> str:
 
 def _tell_beats(session: ClinicalSession, unit: str) -> list:
     """The utterances for one Tell, and record that its content was delivered."""
+    if unit == "@close":
+        # Resolved here rather than in _resolve_say because the close it picks
+        # is worded by the model, and that resolver only returns fixed lines.
+        unit = close_unit(session)
     if unit.startswith("@"):
         say = _resolve_say(session, unit)
         session.covered.add(say.key)
@@ -287,6 +288,21 @@ def repeat_step(session: ClinicalSession) -> Step:
     if session.last_step is None:
         return start(session)
     return session.last_step
+
+
+def current_ask(session: ClinicalSession):
+    """The one utterance that posed the question now on the table, or None.
+
+    A step can speak several beats — a preamble, a piece of education — before
+    the question itself, and only the question may be repeated: re-reading the
+    preamble every time somebody asks what a word means would be unbearable.
+    The ask is always the last beat, because _run appends it immediately before
+    pausing.
+    """
+    step = session.last_step
+    if step is None or not step.utterances:
+        return None
+    return step.utterances[-1]
 
 
 def _ask_key(step: Ask) -> str:
@@ -394,14 +410,15 @@ def _run(session: ClinicalSession, beats: list) -> Step:
 
 
 def start(session: ClinicalSession) -> Step:
-    """Begin a session, waiting for the consent answer.
+    """Begin a session by asking for consent, then wait for the answer.
 
-    The greeting already asked the question, so the machine's first act is to
-    expect a reply rather than to speak.
+    The consent question is the protocol's own first utterance rather than the
+    tail of the greeting, which is what lets it be re-asked from the same place
+    as every other question. The greeting speaks only the preamble leading into
+    it.
     """
     session.pc = 0
-    return _pause(session, "consent", [],
-                  Expect("consent", ask_key="consent.opening"))
+    return _run(session, [])
 
 
 def enter_crisis(session: ClinicalSession) -> Step:

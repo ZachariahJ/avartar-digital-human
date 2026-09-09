@@ -55,7 +55,10 @@ class Session:
         # utterances in order on the wire while several render concurrently.
         self.active_seg = None
         self.seg_id = 0
-        self.seg_frames = 0     # frame index within active_seg, as sent
+        self.seg_frames = 0     # next frame index in active_seg, sent or dropped
+        # When the client is estimated to have started this segment's audio,
+        # which is the only clock against which a frame can be called late.
+        self.seg_play_t0 = 0.0
         # (role, content) of the chat as this session's clients last saw it, so
         # each tick sends only the changed tail instead of the whole history.
         self.sent_chat: list = []
@@ -453,6 +456,18 @@ async def broadcast_bytes(clients: set, payload: bytes):
 _MAX_FRAMES_PER_TICK = 24
 
 
+def _frames_late(session: Session, seg) -> float:
+    """How many frames the one about to be sent trails the client's audio clock.
+
+    Zero until the segment's audio has started, since nothing can be late
+    against a clock that is not running yet.
+    """
+    if not session.seg_play_t0:
+        return 0.0
+    elapsed = time.perf_counter() - session.seg_play_t0
+    return elapsed * seg.fps - session.seg_frames
+
+
 async def _pump_segments(session: Session):
     """Forward whatever audio and frames are ready, in strict utterance order.
 
@@ -480,6 +495,7 @@ async def _pump_segments(session: Session):
             seg = session.active_seg = item
             session.seg_id += 1
             session.seg_frames = 0
+            session.seg_play_t0 = 0.0
             if seg._t_enqueue:
                 logger.info("[latency] segment %d announced after %.2fs in queue",
                             session.seg_id, time.perf_counter() - seg._t_enqueue)
@@ -493,13 +509,16 @@ async def _pump_segments(session: Session):
                 "state": "speaking",
             })
 
-        for _ in range(_MAX_FRAMES_PER_TICK):
+        sent = 0
+        while True:
             if seg.cancelled.is_set():
                 # Ending this normally would let the client play out what it has
                 # already buffered. A flush tells it to throw that away.
                 await broadcast(clients, {"type": "flush", "id": session.seg_id})
                 session.active_seg = None
                 return
+            if sent >= _MAX_FRAMES_PER_TICK:
+                return                       # per-tick budget spent
             try:
                 frame = seg.frames.get_nowait()
             except queue.Empty:
@@ -509,6 +528,12 @@ async def _pump_segments(session: Session):
                                           "frames": session.seg_frames})
                 session.active_seg = None
                 break                        # utterance complete; take the next
+            if _frames_late(session, seg) > config.STREAM_DROP_LAG_FRAMES:
+                # Dropped, not sent, and the index still advances: the browser
+                # indexes frames by audio time, so a gap must stay a gap.
+                # Dropping is what lets the stream catch up to the clock at all.
+                session.seg_frames += 1
+                continue
             await broadcast_bytes(
                 clients,
                 session.seg_id.to_bytes(4, "big")
@@ -516,8 +541,11 @@ async def _pump_segments(session: Session):
                 + frame,
             )
             session.seg_frames += 1
-        else:
-            return                           # per-tick budget spent
+            sent += 1
+            if session.seg_frames == config.STREAM_PREBUFFER_FRAMES:
+                # The client starts its audio on this frame; everything after it
+                # is late or on time relative to here.
+                session.seg_play_t0 = time.perf_counter()
 
 
 async def _poll_session(session: Session):

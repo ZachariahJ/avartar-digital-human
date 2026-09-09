@@ -199,8 +199,10 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
       fps: msg.fps || SEG_FPS_FALLBACK,
       prebuffer: msg.prebuffer || 1,
       text: msg.subtitle || '',
-      frames: [],            // sparse: createImageBitmap resolves out of order
+      frames: [],            // sparse: createImageBitmap resolves out of order,
+                             // and the server drops frames it sent too late
       have: 0,
+      maxIdx: -1,            // highest index decoded so far
       done: false,           // server sent segment_end
       dropped: false,        // flushed; ignore anything still in flight
     };
@@ -236,6 +238,7 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
         if (seg.dropped) { try { bmp.close(); } catch (e) {} return; }
         if (!seg.frames[idx]) seg.have++;
         seg.frames[idx] = bmp;
+        if (idx > seg.maxIdx) seg.maxIdx = idx;
         maybeStart();
       })
       .catch(() => {});
@@ -272,12 +275,28 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
   // Audio that fails to load must not leave the avatar frozen mid-response.
   speech.addEventListener('error', () => { if (playing) finishSegment(); });
 
+  // Which frame to paint for an audio position the stream may not have reached.
+  // Painting only the exact frame is what froze the face for whole utterances:
+  // the audio clock never waits, so once the stream falls behind, every frame
+  // still arriving lands on an index the clock has already passed and nothing
+  // is ever drawn again. Falling back to the newest frame in hand costs lip
+  // sync while behind and re-aligns by itself once the stream catches up.
+  function pickFrame(seg, want) {
+    if (seg.maxIdx < 0) return -1;
+    if (want >= seg.maxIdx) return seg.maxIdx;
+    // Behind `want` the indices can have holes, from frames the server dropped
+    // as too late to be worth the bandwidth. Step back to the last one it kept.
+    let i = want;
+    while (i >= 0 && !seg.frames[i]) i--;
+    return i;
+  }
+
   function drawTick() {
     requestAnimationFrame(drawTick);
     if (!playing || !playing.frames.length) return;
-    const i = Math.floor(speech.currentTime * playing.fps);
-    // Hold the previous frame rather than blanking when the renderer falls
-    // momentarily behind: the audio keeps running and it catches up.
+    const want = Math.floor(speech.currentTime * playing.fps);
+    const i = pickFrame(playing, want);
+    if (i < 0) return;
     const bmp = playing.frames[i];
     if (!bmp || bmp === drawn) return;
     if (stage.width !== bmp.width || stage.height !== bmp.height) {

@@ -27,7 +27,7 @@ from .instruments import BY_KEY, PRE_SCREEN
 #
 #   answer       responds to the current ask, wholly or in part
 #   continuation adds to their previous answer rather than this question, so
-#                the addition is absorbed and nothing is re-asked
+#                the addition is absorbed and the current ask stands
 #   question     they are asking us something; answered from state, then the
 #                ask is re-posed
 #   tangent      an aside; acknowledged, then back to the ask
@@ -78,9 +78,9 @@ class TurnOut(BaseModel):
     per: str | None = None
     unit: str | None = None
     beverage: str | None = None
-    # What to say this turn. For an answer this is a short acknowledgment only,
-    # since the protocol's own utterances follow it; for everything else it is
-    # the whole response.
+    # What to say this turn, and the only thing the model speaks: the question
+    # itself always comes from the protocol immediately afterwards, so this
+    # never contains one.
     reply: str = ""
     # The utterance was the option's own wording, so there is nothing for a
     # read-back to confirm. Set by the deterministic pre-pass alone: llm.turn
@@ -104,8 +104,8 @@ def _unclear(out: TurnOut, why: str) -> TurnOut:
     """Strip everything but the reply and mark the turn unclear.
 
     The reply is kept deliberately: when the model could not code an answer it
-    has usually already written a sensible clarifying question, which is better
-    than the generic re-ask the engine would otherwise fall back to.
+    has usually already named what was missing, and that is worth saying before
+    the engine puts the question back.
     """
     return out.model_copy(update={"action": "unclear", "code": None,
                                   "item": None, "slots": {}, "text": None,

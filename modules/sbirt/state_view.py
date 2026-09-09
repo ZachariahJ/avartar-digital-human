@@ -32,12 +32,12 @@ _TITLE = {"audit": "AUDIT", "dast_10": "DAST-10"}
 
 _ROLE = (
     "[YOUR ROLE THIS TURN]\n"
-    "- Do: respond to what the person just said (answer their question from "
-    "this state, acknowledge feelings, handle tangents), then steer the "
-    "conversation back to the CURRENT GOAL above.\n"
-    "- Do NOT: pick the next question, compute or reveal scores/zones, "
-    "reword a verbatim question stem, or promise anything this map does not "
-    "show. The protocol engine decides all routing and scoring."
+    "- Do: respond to what the person just said — answer their question, "
+    "acknowledge feelings, handle tangents — and then stop.\n"
+    "- Do NOT: ask the next question or re-ask the current one (the engine "
+    "speaks it word for word right after you), pick which question comes "
+    "next, compute or reveal scores/zones, or promise anything this map does "
+    "not show. The protocol engine decides all routing and scoring."
 )
 
 
@@ -168,29 +168,28 @@ def _next_line(session: ClinicalSession) -> str:
 
 
 def _ask_text(session: ClinicalSession) -> tuple[str, str]:
-    """The pending question, and a note that it has already been spoken.
+    """The pending question, and a note about who says it.
 
-    The second half matters: these lines play from cached clips, so a model that
-    assumed it still had to ask would repeat the question the person just heard.
+    The second half matters: the engine speaks the question itself, both when
+    it first arrives and again after every reply, so a model that assumed it
+    still had to ask would put it in front of the person twice.
     """
     exp = session.expect
     if exp.kind == "option" and exp.instrument:
         item = (PRE_SCREEN[exp.item_index].item
                 if exp.instrument == "prescreen"
                 else BY_KEY[exp.instrument].items[exp.item_index])
-        return item.text, ("this stem was already spoken from a cached clip "
-                           "— do not read it out again unless asked")
+        return item.text, ("the engine speaks this stem verbatim, including "
+                           "right after your reply — never write it yourself")
     step = session.last_step
     if step is not None:
         for u in reversed(step.utterances):
             if isinstance(u, Say):
-                return u.text, ("this line was already spoken from a cached "
-                                "clip — do not read it out again unless asked")
+                return u.text, ("the engine speaks this line verbatim, "
+                                "including right after your reply — never "
+                                "write it yourself")
             if isinstance(u, Speak):
                 return u.text, "this read-back was already spoken this turn"
-    if exp.kind == "consent" and exp.ask_key == "consent.opening":
-        return ("(the opening greeting already asked for consent to a few "
-                "health questions)"), "already spoken"
     return ("(the ask was composed by the LLM in its own words this turn)",
             "already spoken")
 

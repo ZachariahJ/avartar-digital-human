@@ -196,10 +196,14 @@ def fixed_segment(text: str, key: str) -> Segment | None:
 
     A miss is ordinary, not an error: the cache is memory and is empty after
     every restart, so callers must fall back to rendering the line themselves.
+    With config.CLIP_CACHE off every call misses, which is how the whole cache
+    is disabled without removing it.
 
     The frames are loaded up front rather than streamed. There is no render to
     wait for, so withholding them would only delay playback.
     """
+    if not config.CLIP_CACHE:
+        return None
     clip = clipcache.get_clip(key, clip_stamp(text))
     if clip is None:
         return None
@@ -269,7 +273,10 @@ def _prewarm_abort() -> bool:
 
 def fixed_catalogue() -> list:
     """(key, text) for every fixed utterance the protocol can ever speak."""
-    items = [(config.GREETING_CLIP_KEY, config.GREETING_TEXT)]
+    # The preamble only: the consent question that used to end the greeting is
+    # now protocol text, and arrives with the rest of templates below.
+    items = [(protocol_clip_key(config.GREETING_CLIP_KEY),
+              config.GREETING_PREAMBLE)]
     items += [(protocol_clip_key(k), t)
               for k, t in templates.all_fixed_utterances().items()]
     return items
@@ -316,6 +323,9 @@ def prewarm_fixed_clips():
     Purely an optimisation. Any clip needed before this reaches it is rendered
     on demand by the turn that needs it, and cached the same way.
     """
+    if not config.CLIP_CACHE:
+        logger.info("[prewarm] disabled (CLIP_CACHE=0)")
+        return
     if not config.CLIP_PREWARM:
         logger.info("[prewarm] disabled (CLIP_PREWARM=0)")
         return
@@ -598,36 +608,25 @@ class Pipeline:
         self._processing_thread.start()
 
     def _process_greeting(self, turn):
-        """Speak the opening line and start the protocol at the consent question.
+        """Speak the preamble, then let the protocol ask for consent.
 
-        Normally costs nothing: the line is fixed, so it comes from the cache
-        rather than the LLM, TTS and renderer. Recording it as the assistant's
-        first turn is what makes the user's reply read as an answer to it.
+        Two utterances rather than one: the question belongs to the protocol,
+        which is what lets it be re-asked later from the same place as every
+        other question. The person hears the same words in the same order.
+
+        Recording them as the assistant's first turn is what makes the user's
+        reply read as an answer to it.
         """
         try:
             if self._aborted(turn):
                 self.state = "idle"
                 return
-            text = config.GREETING_TEXT
-            key = config.GREETING_CLIP_KEY
-            seg = fixed_segment(text, key)
-            self._history_set_assistant(text)
             # Greeting means a new run, so the machine restarts at consent.
             self.clinical = runtime.ClinicalSession()
-            runtime.start(self.clinical)
-            if seg and not self._aborted(turn):
-                self._enqueue(seg)
-                self.video_queue.put(None)
-            elif not self._aborted(turn):
-                # The pre-warm has not reached the greeting yet. Rendering it
-                # here also caches it for every later session, and frames still
-                # stream out as they are produced.
-                if self._speak_dynamic(text, turn, cache_key=key) is not None:
-                    self.video_queue.put(None)
-                else:
-                    # Even the render failed; the greeting is still on screen.
-                    self.state = "idle"
-            else:
+            step = runtime.start(self.clinical)
+            beats = (runtime.Say(config.GREETING_CLIP_KEY,
+                                 config.GREETING_PREAMBLE),) + step.utterances
+            if not self._speak_beats(beats, turn):
                 self.state = "idle"
         except Exception as e:
             logger.error(f"Greeting error: {e}", exc_info=True)
@@ -769,7 +768,7 @@ class Pipeline:
             for m in reversed(self.chat_history):
                 if m["role"] == "assistant" and m["content"].strip():
                     return m["content"]
-        return "May I ask you some questions about your health?"
+        return config.CONSENT_QUESTION
 
     def _turn_facts(self):
         """The only factual source the model may draw on when replying.
@@ -973,62 +972,57 @@ class Pipeline:
         """
         exp = self.clinical.expect
         if exp.kind == "option":
-            q, _ = self._current_question()
             instruction = (
                 "The person says they don't know or can't remember. In one "
                 "or two gentle sentences, help them estimate: suggest "
                 "thinking about the period in the past year when they were "
-                f"drinking or using the most, briefly re-ask the substance "
-                f"of {q!r} in fresh words, and mention that a rough guess "
-                "is fine — or we can skip it and move on.")
+                "drinking or using the most, and mention that a rough guess "
+                "is fine — or we can skip it and move on. Do NOT re-ask the "
+                "question; it is repeated for you straight afterwards.")
         elif exp.kind == "number":
             instruction = (
                 "The person says they don't know. In one gentle sentence, "
-                "say it doesn't have to be exact and ask for whatever "
-                "number from 0 to 10 feels closest — or offer to skip it.")
+                "say it doesn't have to be exact and that whatever number "
+                "feels closest is fine — or offer to skip it. Do NOT re-ask "
+                "the question; it is repeated for you straight afterwards.")
         else:
             # A gate or a read-back has nothing to estimate; just ask again.
             return self._deliver_step(
                 user_text, runtime.repeat_step(self.clinical), turn)
+        beats = [runtime.LLMSay(instruction)]
+        ask = runtime.current_ask(self.clinical)
+        if ask is not None:
+            beats.append(ask)
         return self._deliver_step(
             user_text,
-            runtime.Step(self.clinical.node,
-                         (runtime.LLMSay(instruction),), exp),
+            runtime.Step(self.clinical.node, tuple(beats), exp),
             turn)
 
     def _hold(self, user_text, reply, turn):
-        """Reply without moving the protocol.
+        """Say the model's reply, then put the same question back as authored.
 
-        Uses the model's reply when it produced one, and otherwise builds a
-        re-ask from the current expectation — so a failed model call still gets
-        a sensible question rather than silence.
+        The model answers the person; the protocol re-poses the ask. Splitting
+        it this way is what lets the reply be genuinely responsive — explaining
+        a word, answering a question, acknowledging an aside — without ever
+        putting a reworded version of a validated item in front of somebody.
+
+        A turn that produced no reply still re-poses the ask, so a failed model
+        call costs a repeat rather than silence.
         """
         exp = self.clinical.expect
+        beats = []
         if reply:
-            utterance = runtime.Speak(reply)
-        else:
-            question = self._last_question_text()
-            if exp.kind == "option":
-                q, options = self._current_question()
-                labels = "; ".join(o.label for o in options)
-                instruction = (
-                    "The person's answer didn't clearly match one of the "
-                    f"answer choices. In one or two short sentences, gently "
-                    f"re-ask the substance of {q!r} IN DIFFERENT WORDS than "
-                    f"before — you may briefly mention the choices "
-                    f"({labels}). Do not suggest which one to pick.")
-            elif exp.kind == "number":
-                instruction = ("In one short sentence, gently ask again for "
-                               "a single number from 0 to 10.")
-            else:
-                instruction = (f"The person's answer to {question!r} wasn't "
-                               "clear. In one short sentence, ask again in "
-                               "different words than the question was asked "
-                               "before.")
-            utterance = runtime.LLMSay(instruction)
+            beats.append(runtime.Speak(reply))
+        ask = runtime.current_ask(self.clinical)
+        if ask is not None:
+            beats.append(ask)
+        elif not beats:
+            beats.append(runtime.LLMSay(
+                "In one short sentence, gently ask again for an answer to "
+                f"{self._last_question_text()!r}."))
         self._deliver_step(
             user_text,
-            runtime.Step(self.clinical.node, (utterance,), exp),
+            runtime.Step(self.clinical.node, tuple(beats), exp),
             turn)
 
     def _speak_dynamic(self, text, turn, cache_key=None):
@@ -1040,6 +1034,8 @@ class Pipeline:
             cache_key: set when the text is a fixed line the caller found
                 missing from the cache. Its frames are then collected and
                 stored, so a fixed line costs at most one render per process.
+                It still marks the line as protocol rather than generation when
+                config.CLIP_CACHE is off; only the storing stops.
 
         Returns:
             The Segment, or None if synthesis failed or the turn was abandoned.
@@ -1059,45 +1055,36 @@ class Pipeline:
                         self.dynamic_renders)
         else:
             self.fixed_renders += 1
-            logger.info("[latency] fixed clip %s not cached; rendering it "
-                        "(#%d cold fixed render this session)",
-                        cache_key, self.fixed_renders)
+            logger.info("[latency] fixed line %s rendered live (#%d this "
+                        "session; cache %s)", cache_key, self.fixed_renders,
+                        "cold" if config.CLIP_CACHE else "off")
         seg = self._new_segment(text)
         audio = tts.synthesize(text, self.cancel_event)
         if audio is None or self._aborted(turn):
             seg.cancel()
             return None
         self._enqueue(seg)
-        frames = [] if cache_key else None
+        keep = bool(cache_key) and config.CLIP_CACHE
+        frames = [] if keep else None
         render_into(seg, audio, abort=seg.cancelled.is_set, collect=frames)
-        if (cache_key and not seg.cancelled.is_set() and not self._aborted(turn)
+        if (keep and not seg.cancelled.is_set() and not self._aborted(turn)
                 and (frames or not config.ENABLE_VIDEO_AVATAR)):
             clipcache.put_clip(cache_key, clip_stamp(text), audio, frames)
         return seg
 
-    def _deliver_step(self, user_text, step, turn, ack=""):
-        """Speak everything one machine step calls for, in order.
+    def _speak_beats(self, utterances, turn):
+        """Say a run of utterances in order, and return whether it finished.
 
-        A step is a sequence of utterances of three kinds: fixed protocol lines,
-        which come from the shared cache; text the turn already produced; and
-        instructions the model must word before they can be spoken.
-
-        Args:
-            user_text: what the person said, recorded before anything is spoken.
-            step: the step to deliver.
-            turn: the turn that owns this work.
-            ack: a brief acknowledgment, spoken first so the person hears they
-                were heard before the next question arrives.
+        Three kinds arrive here: fixed protocol lines, which come from the
+        shared cache when it holds them; text the turn already produced; and
+        instructions the model must word first. Shared by the greeting and by
+        every step, so the opening is delivered by the same code as the rest of
+        the conversation rather than a copy of it.
         """
-        self._history_begin(user_text)
-        self.state = "processing"
-        utterances = step.utterances
-        if ack:
-            utterances = (runtime.Speak(ack),) + tuple(utterances)
         spoken = []
         for utt in utterances:
             if self._aborted(turn):
-                return
+                return False
             # A fixed line arrives complete from the cache; everything else has
             # to be synthesized below, which `pending` marks.
             seg, pending, clip_key = None, False, None
@@ -1120,7 +1107,7 @@ class Pipeline:
                     continue          # skip it; the protocol still advances
                 pending = True
             if self._aborted(turn):
-                return
+                return False
             spoken.append(text)
             # Written before it is spoken, so a failed render still leaves the
             # words on screen.
@@ -1129,9 +1116,30 @@ class Pipeline:
                 self._enqueue(seg)
             elif pending:
                 self._speak_dynamic(text, turn, cache_key=clip_key)
-        if not self._aborted(turn):
-            self.video_queue.put(None)
-            self.state = "speaking"
+        if self._aborted(turn):
+            return False
+        self.video_queue.put(None)
+        self.state = "speaking"
+        return True
+
+    def _deliver_step(self, user_text, step, turn, ack=""):
+        """Speak everything one machine step calls for, in order.
+
+        Args:
+            user_text: what the person said, recorded before anything is spoken.
+            step: the step to deliver.
+            turn: the turn that owns this work.
+            ack: a brief acknowledgment, spoken first so the person hears they
+                were heard before the next question arrives.
+        """
+        self._history_begin(user_text)
+        self.state = "processing"
+        utterances = step.utterances
+        if ack:
+            utterances = (runtime.Speak(ack),) + tuple(utterances)
+        # Deliberately not short-circuited on an unfinished delivery: the end
+        # flag below is session state, not delivery state.
+        self._speak_beats(utterances, turn)
         if step.expect.kind == "end":
             # Session state, not delivery state, so it is set even when a
             # barge-in cut the closing line short: the protocol reached its

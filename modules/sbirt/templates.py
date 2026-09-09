@@ -29,6 +29,15 @@ _STOP_NOUN = {"alcohol": "alcohol", "drugs": "drugs"}
 
 
 FIXED: dict[str, str] = {
+    # The consent question, asked by the protocol like any other gate. The
+    # greeting speaks the preamble that leads into it; keeping the question
+    # here is what lets it be re-asked when no answer arrives. Study-verbatim:
+    # config.GREETING_TEXT appends it to build the wording consent is hashed
+    # against, so editing it changes that record.
+    "consent.opening": (
+        "May I ask you some questions about your health?"
+    ),
+
     "alcohol.edu.permission": (
         "May I provide you some more information about drinking alcohol?"
     ),
@@ -74,21 +83,6 @@ FIXED: dict[str, str] = {
         "about your drug use?"
     ),
 
-    # Spoken at the end of a completed session. Its "few more questions about
-    # your experiences" refers to the study's post-session survey, not to
-    # anything this conversation will ask.
-    "close": (
-        "Thank you for participating in this process. "
-        "Our staff will follow up with you about your experiences."
-    ),
-    # For a session that ends because a permission was declined. The close
-    # above promises more questions, which contradicts having just told the
-    # person it was their call. No source text exists for this path; this is a
-    # minimal goodbye that respects the refusal. Pending clinician review.
-    "close.declined": (
-        "Thank you for your time today. Your provider can pick any of this "
-        "up with you during your visit, whenever you're ready."
-    ),
     # When nothing screened positive. No source text; a neutral affirmation
     # before the standard close. Pending clinician review.
     "prescreen.all_negative": (
@@ -109,9 +103,10 @@ FIXED: dict[str, str] = {
         "and your provider can pick this up with you whenever you're ready."
     ),
     # For a refusal of the opening consent, which ends the session before any
-    # screening. Source text, quoted exactly as the study script gives it —
-    # distinct from close.declined above, which is for a session that ran and
-    # only declined a permission along the way.
+    # screening. Source text, quoted exactly as the study script gives it,
+    # which is why it stays verbatim while the ordinary closes are worded —
+    # distinct from close.declined in POINTS_UNITS, which is for a session that
+    # ran and only declined a permission along the way.
     "close.consent_declined": (
         "Thank you, and your provider will address these during your visit."
     ),
@@ -304,6 +299,25 @@ POINTS_UNITS: dict[str, Unit] = {
         Unit("bi.reflect", verbatim=False, points=(
             "In one brief sentence, reflect what the person just said about "
             "where this leaves them. No new questions.",
+        )),
+        # The two ordinary goodbyes. Worded for this person because a goodbye
+        # is the one line with nothing to score and everything to do with how
+        # the conversation felt. The crisis, abort and consent-refusal closes
+        # stay verbatim below: two carry safety content and one is source text.
+        Unit("close", verbatim=False, points=(
+            "Thank them for taking part in this process.",
+            "Tell them staff will follow up with them about their "
+            "experiences — this means the study's later survey, not more "
+            "questions from you now.",
+            "Two sentences at most. No new questions, no advice, no summary "
+            "of what they said.",
+        )),
+        Unit("close.declined", verbatim=False, points=(
+            "Thank them for their time today.",
+            "Tell them their provider can pick any of this up with them "
+            "during their visit, whenever they are ready.",
+            "Two sentences at most. Do not revisit what they declined, and "
+            "do not promise a follow-up survey — this session was cut short.",
         )),
     )
 }
