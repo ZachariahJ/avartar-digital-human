@@ -1,22 +1,3 @@
-"""The clinical content and machinery of the SBIRT screening, in one place.
-
-Screening, Brief Intervention and Referral to Treatment, encoded as plain Python
-data so that the clinical material can be reviewed and edited without touching
-any conversational code.
-
-Two layers, easily confused:
-
-  * The executable protocol — flow.py, runtime.py, instruments.py, coding.py,
-    templates.py, turn.py — decides what is asked, what an answer scores, and
-    where the session goes. It is deterministic, and the model cannot
-    influence it.
-  * The described protocol — workflow.py, intervention.py, referral.py,
-    rendered by prompt.py — is background the model is given so it can converse
-    competently. Nothing here decides anything.
-
-Editing the data updates the prompt automatically; there is no prompt to
-hand-maintain.
-"""
 
 from . import (instruments, intervention, referral, runtime, templates,
                workflow)

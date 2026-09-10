@@ -1,14 +1,3 @@
-"""A map of the SBIRT conversation, written for the model to read.
-
-Each node states its clinical goal, how to enter it and what moves the
-conversation on. Rendered into the system prompt by prompt.py, so that the model
-understands the shape of the interview it is taking part in.
-
-This is description, not control. The protocol that actually runs is flow.py,
-executed by runtime.py; the two are separate on purpose, because a model must
-never be in a position to decide a screening's route. Where the two disagree,
-flow.py is what happens.
-"""
 
 from __future__ import annotations
 
@@ -20,10 +9,9 @@ class Node:
     key: str
     goal: str
     on_enter: str
-    transitions: tuple[str, ...]   # "<condition> → <NODE>"
+    transitions: tuple[str, ...]
 
     def render(self) -> str:
-        """This node as prompt text."""
         lines = [f"[{self.key}] goal: {self.goal}",
                  f"  enter: {self.on_enter}",
                  "  transitions:"]
@@ -116,5 +104,4 @@ ENTRY_NODE = "GREETING"
 
 
 def render_machine() -> str:
-    """Every node as prompt text, for prompt.build_system_prompt()."""
     return "\n\n".join(n.render() for n in NODES)

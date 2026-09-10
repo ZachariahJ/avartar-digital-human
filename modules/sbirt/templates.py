@@ -1,39 +1,11 @@
-"""Everything the counselor says word for word, transcribed from the study script.
-
-Permissions, the standard-drink education, zone feedback, the brief-intervention
-lines and the closings. The engine speaks these exactly; nothing here is ever
-generated or paraphrased, because study fidelity depends on every participant
-hearing the same words. Being fixed is also what makes them cacheable as
-pre-rendered clips.
-
-Edits to these strings are clinical changes, not copy edits. Four departures
-from the source document were made deliberately and are recorded here:
-
-  * "How much you usually drink?" reads "How much do you usually drink?"
-  * "I recommended that you cut down" reads "I recommend that you cut down"
-  * the ruler's "10 meaning you ready" reads "you are ready"
-  * the dependent-alcohol feedback repeats a permission sentence that was
-    already asked a turn earlier; the repeat is dropped.
-
-Several entries below have no source text at all, because the study document
-does not cover the path. Each is marked, and all of them are pending clinician
-review.
-"""
 
 from __future__ import annotations
 
-# The source writes "alcohol/drug use", meaning whichever arm is running. The
-# two nouns differ because English does: "drug use" but "stop using drugs".
 _USE_NOUN = {"alcohol": "alcohol", "drugs": "drug"}
 _STOP_NOUN = {"alcohol": "alcohol", "drugs": "drugs"}
 
 
 FIXED: dict[str, str] = {
-    # The consent question, asked by the protocol like any other gate. The
-    # greeting speaks the preamble that leads into it; keeping the question
-    # here is what lets it be re-asked when no answer arrives. Study-verbatim:
-    # config.GREETING_TEXT appends it to build the wording consent is hashed
-    # against, so editing it changes that record.
     "consent.opening": (
         "May I ask you some questions about your health?"
     ),
@@ -61,9 +33,6 @@ FIXED: dict[str, str] = {
         "past year? In these questions a drink refers to the standard drink "
         "definition we just discussed."
     ),
-    # Replaces the line above when the education was declined, since that one
-    # refers back to a definition "we just discussed". The source line minus
-    # that reference; nothing else changed. Pending clinician review.
     "alcohol.screen.permission.no_defn": (
         "May I ask you a few more questions about your use of alcohol in the "
         "past year?"
@@ -83,38 +52,21 @@ FIXED: dict[str, str] = {
         "about your drug use?"
     ),
 
-    # When nothing screened positive. No source text; a neutral affirmation
-    # before the standard close. Pending clinician review.
     "prescreen.all_negative": (
         "Thank you for answering those questions. Based on your answers, your "
         "use is not likely to cause you any health problems."
     ),
-    # For declining a permission mid-protocol, where the session continues. No
-    # source text. Pending clinician review.
     "permission.declined": (
         "That's completely your call, and that's fine."
     ),
-    # For stopping the whole conversation. No source text. Deliberately makes
-    # no attempt to keep the person; answers already given still reach their
-    # provider. Pending clinician review.
     "close.aborted": (
         "Of course — we can stop here, and that's completely fine. Thank "
         "you for your time today. Anything you shared stays confidential, "
         "and your provider can pick this up with you whenever you're ready."
     ),
-    # For a refusal of the opening consent, which ends the session before any
-    # screening. Source text, quoted exactly as the study script gives it,
-    # which is why it stays verbatim while the ordinary closes are worded —
-    # distinct from close.declined in POINTS_UNITS, which is for a session that
-    # ran and only declined a permission along the way.
     "close.consent_declined": (
         "Thank you, and your provider will address these during your visit."
     ),
-    # For a crisis the model flagged. Gives the emergency numbers and closes:
-    # this system cannot keep anybody safe, so it hands off rather than staying
-    # in the conversation. The numbers are spelled as words because the
-    # synthesizer reads "911" as one number, which is useless to somebody
-    # trying to dial. No source text; pending clinician review.
     "close.crisis": (
         "Thank you for telling me that. Please get help right now: if you are "
         "in immediate danger, call nine one one. You can also call or text "
@@ -122,20 +74,12 @@ FIXED: dict[str, str] = {
         "I am going to stop here, and your medical provider will follow up "
         "with you."
     ),
-    # For an item the person still cannot answer after being offered a recall
-    # aid. The manual's guidance is to note uncertainty on the record rather
-    # than press (SBIRT_REF.pdf p.18). No source text; pending clinician review.
     "item.skipped": (
         "That's okay — we can set that one aside. I'll make a note of it "
         "for your provider."
     ),
     "bi.leaves_you": "So where does this leave you?",
 
-    # Spoken instead of pressing the question again, once somebody has twice
-    # answered something other than what was asked or said they feel unwell.
-    # Repeating a question at a person who is telling you something else is
-    # what makes the interview feel deaf; MI puts autonomy first, so the
-    # choice goes back to them. No source text; pending clinician review.
     "aside.offer_pause": (
         "We can stop here for today if you'd rather — your provider can pick "
         "this up with you whenever you're ready. Would you like to keep going?"
@@ -143,8 +87,6 @@ FIXED: dict[str, str] = {
 }
 
 
-# Keyed by instrument and zone; every combination the protocol can reach must
-# have an entry here.
 FEEDBACK: dict[tuple[str, str], str] = {
     ("audit", "healthy"): (
         "Based on your answers you are using alcohol within normal "
@@ -209,10 +151,6 @@ FEEDBACK: dict[tuple[str, str], str] = {
     ),
 }
 
-# Zones whose feedback already ends by asking permission for the intervention.
-# The flow uses this to avoid asking twice. The dependent-drug text is absent
-# because the source does not end it with that question, so that route asks
-# explicitly.
 FEEDBACK_ASKS_BI: frozenset[tuple[str, str]] = frozenset(
     k for k, v in FEEDBACK.items()
     if v.rstrip().endswith("May I ask you some more questions about this?")
@@ -220,40 +158,27 @@ FEEDBACK_ASKS_BI: frozenset[tuple[str, str]] = frozenset(
 
 
 def feedback_text(instrument_key: str, zone: str) -> str:
-    """The verbatim feedback for a completed screen.
-
-    A KeyError means the protocol reached a zone with no authored text, which
-    must surface as a bug — improvising feedback about somebody's screening
-    result is exactly what this module exists to prevent.
-    """
     return FEEDBACK[(instrument_key, zone)]
 
 
 def bi_permission(arm: str) -> str:
-    """Ask permission for the intervention, when the feedback did not already."""
     return f"May I ask you some more questions about your {_USE_NOUN[arm]} use?"
 
 
 def bi_likes(arm: str) -> str:
-    """Half of the decisional balance. Asked before the dislikes, deliberately:
-    leading with what someone values about their use is what makes the exercise
-    read as curiosity rather than as a set-up."""
     return f"What do you like about {_USE_NOUN[arm]} use?"
 
 
 def bi_dislikes(arm: str) -> str:
-    """The other half of the decisional balance."""
     return f"What do you dislike about {_USE_NOUN[arm]} use?"
 
 
 def bi_recommend(arm: str) -> str:
-    """The recommendation. Ends on readiness, which keeps the choice theirs."""
     return (f"Based on your answers I recommend that you cut down or stop "
             f"using {_STOP_NOUN[arm]}, but you have to be ready.")
 
 
 def bi_ruler(arm: str) -> str:
-    """The 0-10 readiness question, with both ends of the scale spelled out."""
     s = _STOP_NOUN[arm]
     return (f"Based on a scale from 0 to 10, with 0 meaning you are not at all "
             f"ready to cut down or stop using {s} and 10 meaning you are "
@@ -262,12 +187,10 @@ def bi_ruler(arm: str) -> str:
 
 
 def bi_why_not_lower(value: int) -> str:
-    """Asks them to argue upward from their own number, which evokes change talk."""
     return f"Why are you a {value} and not a 1 or 2?"
 
 
 def bi_why_not_higher(value: int) -> str:
-    """The counterpart, which surfaces what is holding them back."""
     return f"Why are you a {value} and not a 9 or 10?"
 
 
@@ -276,24 +199,13 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Unit:
-    """One thing the counselor delivers in a turn.
-
-    A verbatim unit is spoken exactly as written and can be pre-rendered as a
-    clip. A non-verbatim one instead lists the clinical content the turn must
-    convey, and is worded for this particular person — typically around
-    something they said. The model may rephrase those points; it may not drop,
-    extend or contradict them.
-    """
 
     id: str
     verbatim: bool
-    literal: str = ""             # for verbatim units
-    points: tuple[str, ...] = ()  # for non-verbatim ones
+    literal: str = ""
+    points: tuple[str, ...] = ()
 
 
-# The intervention's reflections and summaries, which have to be worded around
-# what this person actually said. The braced slots are filled by the engine from
-# captured state before the model ever sees them.
 POINTS_UNITS: dict[str, Unit] = {
     u.id: u for u in (
         Unit("bi.summary.balance", verbatim=False, points=(
@@ -310,10 +222,6 @@ POINTS_UNITS: dict[str, Unit] = {
             "In one brief sentence, reflect what the person just said about "
             "where this leaves them. No new questions.",
         )),
-        # The two ordinary goodbyes. Worded for this person because a goodbye
-        # is the one line with nothing to score and everything to do with how
-        # the conversation felt. The crisis, abort and consent-refusal closes
-        # stay verbatim below: two carry safety content and one is source text.
         Unit("close", verbatim=False, points=(
             "Thank them for taking part in this process.",
             "Tell them staff will follow up with them about their "
@@ -334,13 +242,7 @@ POINTS_UNITS: dict[str, Unit] = {
 
 
 def all_fixed_utterances() -> dict[str, str]:
-    """Every fixed utterance the protocol can speak, keyed as the runtime emits it.
-
-    The one source for both clip pre-warming and the tests that assert nothing
-    fixed is ever rendered mid-conversation. Parameterised lines are enumerated
-    across their whole domain, so a fixed line is never a cache miss.
-    """
-    from .instruments import BY_KEY, PRE_SCREEN  # imported here to break a cycle
+    from .instruments import BY_KEY, PRE_SCREEN
 
     out = dict(FIXED)
     for (ins_key, zone), text in FEEDBACK.items():
@@ -359,8 +261,6 @@ def all_fixed_utterances() -> dict[str, str]:
         out[f"bi.dislikes.{arm}"] = bi_dislikes(arm)
         out[f"bi.recommend.{arm}"] = bi_recommend(arm)
         out[f"bi.ruler.{arm}"] = bi_ruler(arm)
-    # Every possible ruler value, so both follow-ups are cacheable clips rather
-    # than a render at the moment they are needed.
     for v in range(11):
         out[f"bi.why_not_lower.{v}"] = bi_why_not_lower(v)
         out[f"bi.why_not_higher.{v}"] = bi_why_not_higher(v)

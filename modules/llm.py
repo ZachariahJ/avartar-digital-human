@@ -1,21 +1,3 @@
-"""Every call this project makes to a language model.
-
-Three distinct jobs, deliberately kept apart because they fail differently:
-
-  * turn() — the one constrained call per user utterance. It classifies what
-    the person said relative to the question on the table and codes it. Its
-    output is always gated by turn.validate, so a bad model response holds the
-    protocol in place rather than corrupting a screening.
-  * phrase_utterance() — wording for a single utterance the protocol has
-    already decided to deliver.
-  * extract_patient_facts() — background profile extraction, the only
-    open-ended generation left. Nothing here writes a whole reply any more:
-    the protocol decides what is said, and a crisis closes the session with
-    a fixed line.
-
-The clinical protocol lives in modules/sbirt/ and is decided by code. Nothing
-here chooses what to ask, what a score is, or where a session goes next.
-"""
 
 import json
 import logging
@@ -28,15 +10,11 @@ from modules.sbirt.turn import validate as validate_turn
 
 logger = logging.getLogger(__name__)
 
-# Built on first use, not at import: OpenAI("") raises, so a missing or
-# misconfigured API key would otherwise take the whole server down at startup
-# instead of failing the first request that needs a model.
 _client_obj = None
 _client_lock = threading.Lock()
 
 
 def _client() -> OpenAI:
-    """The shared API client, constructed on first use."""
     global _client_obj
     if _client_obj is None:
         with _client_lock:
@@ -61,12 +39,6 @@ _EXTRACT_SYSTEM = (
 
 
 def extract_patient_facts(history: list[dict]) -> dict:
-    """Pull whatever structured facts the recent conversation supports.
-
-    Returns {} on any failure, including a malformed response. This runs in the
-    background and its result only affects the next turn's prompt, so failing
-    quietly is correct — it must never be able to break a turn in progress.
-    """
     convo = "\n".join(f"{m['role']}: {m.get('content', '')}" for m in history[-8:])
     if not convo.strip():
         return {}
@@ -88,11 +60,6 @@ def extract_patient_facts(history: list[dict]) -> dict:
         return {}
 
 
-# Coding a screening answer must never involve a guess: a quantity or timeframe
-# the person did not actually state has to become a clarifying question, not a
-# code, or the resulting score is invalid. Unambiguous short answers are matched
-# deterministically here at no latency; everything else goes through one turn()
-# call whose output is validated before it can move the protocol.
 
 AMBIGUOUS = "AMBIGUOUS"
 
@@ -106,13 +73,6 @@ _WORD_NUMBERS = {
 _DIGIT_RE = re.compile(r"\b(10|[0-9])\b")
 
 def _prematch_option(options, text: str):
-    """Code an option answer without a model call, or None if it is not obvious.
-
-    Matches an option's label or alias exactly, plus yes/no shortcuts on binary
-    items. The length limit on those shortcuts matters: a longer reply that
-    merely starts with "yes" may carry a question or a caveat that the model
-    needs to see.
-    """
     t = " ".join(text.strip().lower().split())
     if not t:
         return None
@@ -129,13 +89,6 @@ def _prematch_option(options, text: str):
 
 
 def code_number(user_text: str, low: int = 0, high: int = 10) -> dict:
-    """Read a single number out of a spoken ruler answer.
-
-    Returns {"value": n} only when exactly one distinct in-range number was
-    said, otherwise {"status": AMBIGUOUS}. Deliberately has no model fallback:
-    two numbers in one sentence ("a four, maybe a seven") is a genuine ambiguity
-    that must be asked about rather than resolved by inference.
-    """
     t = user_text.lower()
     found = {int(m) for m in _DIGIT_RE.findall(t)}
     found |= {v for w, v in _WORD_NUMBERS.items()
@@ -146,9 +99,6 @@ def code_number(user_text: str, low: int = 0, high: int = 10) -> dict:
     return {"status": AMBIGUOUS}
 
 
-# Matched against the whole utterance, never as a prefix: "yes but what does
-# that mean" is a question, and treating it as consent would skip the answer the
-# person actually needs.
 _CONSENT_YES = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
                 "all right", "of course", "sure thing", "go ahead",
                 "yes please", "fine", "sounds good"}
@@ -296,13 +246,6 @@ substance use. Those are the engine's, not yours.
 
 
 def _expectation_text(expect) -> str:
-    """Describe, for the model, what a valid answer to the current ask looks like.
-
-    Extraction items are the subtle case: for those the model is told to report
-    raw fields and leave the option code null, because the bucketing is
-    deterministic and a model that picks the bucket itself can silently shift a
-    score across a threshold.
-    """
     kind = expect.kind
     if kind == "consent":
         return "A yes or no."
@@ -351,8 +294,6 @@ def _expectation_text(expect) -> str:
     return "The session has ended; no answer is expected."
 
 
-# Whole-utterance matches only, for the same reason as the consent sets: "i
-# don't know if that counts" carries content the model needs to see.
 _DONT_KNOW = {"i don't know", "i dont know", "don't know", "dont know",
               "dunno", "i dunno", "no idea", "i have no idea", "not sure",
               "i'm not sure", "im not sure", "i can't remember",
@@ -362,16 +303,9 @@ _DONT_KNOW = {"i don't know", "i dont know", "don't know", "dont know",
 
 
 def _prepass(user_text: str, expect) -> TurnOut | None:
-    """Answer without a model call when the utterance is unmistakable.
-
-    Returns None when anything is in doubt, leaving the decision to turn(). The
-    reply is left empty: no acknowledgment at all reads better than a canned one.
-    """
     t = " ".join(user_text.strip().lower().split()).rstrip(".!,")
     if t in _DONT_KNOW and expect.kind in ("consent", "confirm", "option",
                                            "number"):
-        # Distinct from "unclear": the pipeline offers one recall aid and then
-        # records the item as missing, so this can never become a re-ask loop.
         return TurnOut(action="dont_know")
     if expect.kind in ("consent", "confirm"):
         if t in _CONSENT_YES:
@@ -382,8 +316,6 @@ def _prepass(user_text: str, expect) -> TurnOut | None:
     if expect.kind == "option":
         code = _prematch_option(expected_item(expect).options, user_text)
         if code is not None:
-            # exact means the person said the option's own wording, so there is
-            # nothing for a read-back to confirm and the code commits directly.
             return TurnOut(action="answer", code=code, exact=True)
         return None
     if expect.kind == "number":
@@ -397,25 +329,6 @@ def _prepass(user_text: str, expect) -> TurnOut | None:
 def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
          patient: dict | None = None, facts: dict | None = None,
          interview_state: str = "") -> TurnOut:
-    """Classify, code and reply to one user utterance, in a single call.
-
-    Args:
-        user_text: what the person said.
-        expect: the current expectation from the protocol state machine.
-        ask_text: the question they are responding to.
-        history: recent conversation, for context.
-        patient: known patient facts, if any.
-        facts: what the machine knows deterministically — the only permitted
-            factual source for the reply.
-        interview_state: a rendering of the whole interview, so meta questions
-            ("how many are left") can be answered honestly.
-
-    Returns:
-        A TurnOut that has passed turn.validate. Anything illegal comes back as
-        "unclear", which holds the protocol in place. Repeated failure returns
-        unclear with an empty reply and the pipeline re-asks deterministically,
-        so a misbehaving model can stall a turn but never strand a session.
-    """
     pre = _prepass(user_text, expect)
     if pre is not None:
         return validate_turn(pre, expect, ask_text=ask_text)
@@ -428,9 +341,6 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
         expectation=_expectation_text(expect),
         facts=json.dumps(all_facts, ensure_ascii=False),
         interview_state=interview_state or "(not available this turn)")
-    # The whole window the pipeline keeps, not a short tail: this call now
-    # writes the person-facing reply, and a reply that cannot see what was
-    # already said repeats itself and re-explains what it just explained.
     messages = ([{"role": "system", "content": system}]
                 + list(history)
                 + [{"role": "user", "content": user_text}])
@@ -443,16 +353,10 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
             if start == -1 or end <= start:
                 raise ValueError("no JSON object in turn output")
             out = TurnOut.model_validate_json(raw[start:end + 1])
-            # These fields decide whether an answer is read back to the person
-            # for confirmation, and they are owned by the pre-pass and by
-            # validate(). Clearing them stops a model from asserting certainty
-            # it has not earned and skipping that confirmation.
             out = out.model_copy(update={"exact": False, "assumed": False,
                                          "boundary": False, "note": ""})
             return validate_turn(out, expect, ask_text=ask_text)
         except Exception as e:
-            # Type only. A pydantic or JSON error message embeds the raw model
-            # output, which can quote the patient verbatim into the log.
             logger.info("turn() attempt %d failed (%s)",
                         attempt + 1, type(e).__name__)
             messages.append({"role": "user", "content":
@@ -478,12 +382,6 @@ _UTTER_SYSTEM = (
 
 def phrase_utterance(instruction: str, history: list[dict],
                      patient: dict | None = None) -> str:
-    """Word one utterance the protocol has already decided to deliver.
-
-    Used for summaries, reflections and clarifications, where the content is
-    fixed but the phrasing should suit the person. Returns "" on failure; the
-    caller skips that utterance and the protocol continues rather than stalling.
-    """
     system = _UTTER_SYSTEM
     if patient:
         system += "\nKnown patient facts: " + json.dumps(patient, ensure_ascii=False)

@@ -1,12 +1,3 @@
-"""How to talk to someone at moderate risk: the motivational interviewing toolkit.
-
-The stance, the micro-skills, the brief-intervention model, the stages of change
-with a strategy matched to each, the readiness rulers and the change-talk cues
-that predict someone actually changing.
-
-Plain data, rendered into the system prompt. This is what the counselor knows
-about conducting a conversation, not what it is required to do.
-"""
 
 from __future__ import annotations
 
@@ -20,15 +11,12 @@ class Technique:
     example: str = ""
 
     def render(self) -> str:
-        """This technique as prompt text, with its example when it has one."""
         line = f"  • {self.name}: {self.detail}"
         if self.example:
             line += f'  e.g. "{self.example}"'
         return line
 
 
-# The underlying stance. Everything below is technique; this is what stops the
-# technique reading as manipulation.
 MI_SPIRIT = (
     Technique("Partnership", "Collaborate; the user is the expert on their own life, not a passive patient."),
     Technique("Acceptance", "Absolute worth, accurate empathy, autonomy support, affirmation."),
@@ -36,8 +24,6 @@ MI_SPIRIT = (
     Technique("Evocation", "Draw motivation OUT of the user rather than installing it from outside."),
 )
 
-# The core micro-skills. One per turn: stacking them turns a conversation into
-# an interrogation.
 OARS = (
     Technique("Open questions", "Invite elaboration, not yes/no.",
               "What worries you most about your drinking?"),
@@ -49,7 +35,6 @@ OARS = (
               "Let me pull that together — you've noticed X, you're worried about Y..."),
 )
 
-# The evidence-based checklist for a brief intervention.
 FRAMES = (
     Technique("Feedback", "Give personal, non-judgmental feedback tied to the screen result."),
     Technique("Responsibility", "Emphasize the choice to change is theirs alone."),
@@ -63,15 +48,13 @@ FRAMES = (
 @dataclass(frozen=True)
 class Stage:
     name: str
-    marker: str        # how the user sounds in this stage
-    strategy: str      # what the counselor does next
+    marker: str
+    strategy: str
 
     def render(self) -> str:
         return f"  • {self.name} — sounds like: {self.marker}\n      do: {self.strategy}"
 
 
-# Where somebody is determines what helps: advice aimed at the wrong stage
-# reliably produces resistance rather than progress.
 STAGES_OF_CHANGE = (
     Stage("Pre-contemplation", "No problem; not considering change.",
           "Raise awareness gently, offer info with permission, avoid pushing. Plant a seed."),
@@ -85,8 +68,6 @@ STAGES_OF_CHANGE = (
           "Support relapse prevention, celebrate wins, plan for high-risk situations."),
 )
 
-# The follow-up is the point of the ruler, not the number: asking why they are
-# not lower makes the person argue for their own change.
 READINESS_RULERS = (
     Technique("Importance ruler", "On 0–10, how important is changing this?",
               "You said 6 — why a 6 and not a 3?"),
@@ -96,8 +77,6 @@ READINESS_RULERS = (
               "What would need to be true for that number to climb?"),
 )
 
-# These predict actual change, so they are worth reinforcing wherever they
-# appear.
 CHANGE_TALK = (
     Technique("Desire", "Wanting change.", "I wish I didn't need it to sleep."),
     Technique("Ability", "Confidence in changing.", "I quit once before, so I could again."),
@@ -108,15 +87,12 @@ CHANGE_TALK = (
     Technique("Taking steps", "Already acting.", "I poured them out this morning."),
 )
 
-# How to give information without it landing as a lecture.
 ELICIT_PROVIDE_ELICIT = (
     "ASK permission and what they already know",
     "PROVIDE one small piece of neutral information",
     "ASK what they make of it",
 )
 
-# Arguing back entrenches the position being argued for, so pushback is met
-# rather than contradicted.
 ROLL_WITH_RESISTANCE = (
     "Do NOT argue for change — arguing hardens the other side.",
     "Reflect the resistance (simple, amplified, or double-sided reflection).",

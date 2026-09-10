@@ -1,22 +1,3 @@
-"""Shows the model the whole interview, not just the question in front of it.
-
-A model that can only see the current item cannot answer "how many are left",
-"what is this for" or "didn't I already tell you that" — and a model that cannot
-answer those will invent an answer. This renders the entire session as one
-compact block, included in every turn, so those questions are answered from
-state.
-
-The contract this must keep:
-
-  * Pure. The same session renders the same string, with no I/O and no
-    mutation.
-  * Re-rendered in full every turn. Nothing here is incremental or cached, so
-    the session remains the only source of truth and this cannot go stale.
-  * No patient content. Answered items appear as their code and official option
-    label; open captures appear only as having been captured. Nothing the
-    person said in their own words is ever rendered.
-  * Bounded by MAX_CHARS, since this is prepended to every single turn.
-"""
 
 from __future__ import annotations
 
@@ -24,8 +5,6 @@ from .flow import ARM_INSTRUMENT, ARM_ORDER
 from .instruments import BY_KEY, PRE_SCREEN, _skipped_items
 from .runtime import ClinicalSession, OPEN_TARGETS, Say, Speak
 
-# Roughly a few hundred tokens, paid on every turn. The tests assert that every
-# reachable protocol state renders within it.
 MAX_CHARS = 3000
 
 _TITLE = {"audit": "AUDIT", "dast_10": "DAST-10"}
@@ -42,12 +21,10 @@ _ROLE = (
 
 
 def _prescreen_done(session: ClinicalSession) -> bool:
-    """Whether every pre-screen question has been answered."""
     return all(q.key in session.prescreen for q in PRE_SCREEN)
 
 
 def _prescreen_line(session: ClinicalSession) -> str:
-    """The pre-screen results, including which question is being asked now."""
     exp = session.expect
     missing = session.missing.get("prescreen", {})
     parts = []
@@ -65,7 +42,6 @@ def _prescreen_line(session: ClinicalSession) -> str:
 
 
 def _arm_lines(session: ClinicalSession) -> list[str]:
-    """Each arm and where it stands: skipped, active, queued, scored or declined."""
     lines = []
     for arm in ARM_ORDER:
         ins_key = ARM_INSTRUMENT[arm]
@@ -83,8 +59,6 @@ def _arm_lines(session: ClinicalSession) -> list[str]:
         else:
             status = "ended (permission declined)"
         lines.append(f"  {arm} → {name}: {status}")
-    # Tobacco is screened for but has no arm, so say so explicitly — otherwise
-    # a positive answer looks like something the interview forgot about.
     if session.prescreen.get("tobacco", 0) > 0:
         lines.append("  tobacco: POSITIVE flag noted for the provider "
                      "(this protocol has no tobacco question arm)")
@@ -92,11 +66,6 @@ def _arm_lines(session: ClinicalSession) -> list[str]:
 
 
 def _item_lines(session: ClinicalSession, ins_key: str) -> list[str]:
-    """One line per item of the active instrument.
-
-    Runs of items sharing a status are collapsed into a range, which is what
-    keeps a ten-item instrument inside the character budget.
-    """
     ins = BY_KEY[ins_key]
     responses = session.responses.get(ins_key, {})
     missing = session.missing.get(ins_key, {})
@@ -151,7 +120,6 @@ def _item_lines(session: ClinicalSession, ins_key: str) -> list[str]:
 
 
 def _next_line(session: ClinicalSession) -> str:
-    """What remains after the current point, so "how much is left" is answerable."""
     rest = ", ".join(f"{a} → {_TITLE[ARM_INSTRUMENT[a]]}"
                      for a in session.arms)
     tail = f" → then {rest}" if rest else ""
@@ -168,12 +136,6 @@ def _next_line(session: ClinicalSession) -> str:
 
 
 def _ask_text(session: ClinicalSession) -> tuple[str, str]:
-    """The pending question, and a note about who says it.
-
-    The second half matters: the engine speaks the question itself, both when
-    it first arrives and again after every reply, so a model that assumed it
-    still had to ask would put it in front of the person twice.
-    """
     exp = session.expect
     if exp.kind == "option" and exp.instrument:
         item = (PRE_SCREEN[exp.item_index].item
@@ -195,7 +157,6 @@ def _ask_text(session: ClinicalSession) -> tuple[str, str]:
 
 
 def _answer_shape(session: ClinicalSession) -> str:
-    """What a valid answer to the pending question looks like."""
     exp = session.expect
     kind = exp.kind
     if kind == "consent":
@@ -228,7 +189,6 @@ def _answer_shape(session: ClinicalSession) -> str:
 
 
 def _goal_lines(session: ClinicalSession) -> list[str]:
-    """What this turn is for: the pending ask, or why there is not one."""
     if session.crisis:
         return ["A crisis was flagged and the session is closed — the "
                 "emergency numbers were given and their provider will follow "
@@ -247,11 +207,6 @@ def _goal_lines(session: ClinicalSession) -> list[str]:
 
 
 def _target_key_lines(session: ClinicalSession) -> list[str]:
-    """The spelling of every question that can currently be harvested.
-
-    Without this the model has no vocabulary for a fact about a question that
-    is not the one on the table, and the fact is lost.
-    """
     lines = [f"  pre-screen: {', '.join('prescreen.' + q.key for q in PRE_SCREEN)}"]
     for arm in ARM_ORDER:
         ins_key = ARM_INSTRUMENT[arm]
@@ -265,11 +220,6 @@ def _target_key_lines(session: ClinicalSession) -> list[str]:
 
 
 def _candidate_lines(session: ClinicalSession) -> list[str]:
-    """What has been volunteered but not yet put to the person for a yes.
-
-    Shown so the model does not harvest the same fact twice, and so it knows
-    the engine is about to read these back rather than ask them.
-    """
     if not session.candidates:
         return ["  (nothing yet)"]
     return [f"  {t}: {c.get('code') if c.get('code') is not None else c.get('text')}"
@@ -278,7 +228,6 @@ def _candidate_lines(session: ClinicalSession) -> list[str]:
 
 
 def _phase_lines(session: ClinicalSession) -> list[str]:
-    """Where the session is overall, and who owns the decisions that follow."""
     if session.crisis:
         stage = "CRISIS — closed after a crisis was flagged"
     elif session.aborted:
@@ -300,11 +249,6 @@ def _phase_lines(session: ClinicalSession) -> list[str]:
 
 
 def render_interview_state(session: ClinicalSession) -> str:
-    """The whole interview as one block, for inclusion in this turn's context.
-
-    A pure read of the session; see the module docstring for what this is
-    required to guarantee.
-    """
     out = ["=== INTERVIEW STATE (program-owned; re-rendered every turn) ==="]
 
     out.append("[MAP]")

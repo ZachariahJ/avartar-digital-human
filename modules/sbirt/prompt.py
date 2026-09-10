@@ -1,10 +1,3 @@
-"""Renders the structured clinical data into the model's system prompt.
-
-Nothing clinical is written here. Every instrument, technique, referral pathway
-and crisis rule is rendered from its own module, which is what guarantees the
-prompt cannot drift from the framework the rest of the code executes — and means
-the way to change what the counselor knows is to edit the data.
-"""
 
 from __future__ import annotations
 
@@ -12,12 +5,10 @@ from . import instruments, intervention, referral, workflow
 
 
 def _bullets(items) -> str:
-    """Render plain strings as a bulleted block."""
     return "\n".join(f"  • {x}" for x in items)
 
 
 def _techniques(items) -> str:
-    """Render objects that know how to render themselves."""
     return "\n".join(t.render() for t in items)
 
 
@@ -55,7 +46,6 @@ questionnaire, and never re-ask anything already in KNOWN PATIENT."""
 
 
 def build_system_prompt() -> str:
-    """The counselor's complete system prompt. Built once, at import."""
     parts = [
         PERSONA,
         "",

@@ -9,11 +9,6 @@ _model_lock = threading.Lock()
 
 
 def get_model():
-    """The ASR model, loaded on first use and shared afterwards.
-
-    Double-checked locking, because the startup pre-warm and a first user
-    request race here and loading twice would put two copies on the GPU.
-    """
     global _model
     if _model is None:
         with _model_lock:
@@ -27,18 +22,11 @@ def get_model():
 
 
 def _clean_text(text: str) -> str:
-    """Strip SenseVoice's inline markup, e.g. <|en|><|EMO_UNKNOWN|><|Speech|>.
-
-    These tags carry language and emotion labels this pipeline does not use, and
-    they would otherwise reach the LLM and the on-screen transcript verbatim.
-    """
     return re.sub(r"<\|[^|]*\|>", "", text).strip()
 
 
 def transcribe_array(audio_array: np.ndarray, sample_rate: int = 16000) -> str:
-    """Transcribe one utterance. Returns "" when the model recognised nothing."""
     model = get_model()
-    # ITN 开启：量表答案含数字，"seven" 须转成 7
     result = model.generate(
         input=audio_array,
         fs=sample_rate,
@@ -51,7 +39,6 @@ def transcribe_array(audio_array: np.ndarray, sample_rate: int = 16000) -> str:
 
 
 if __name__ == "__main__":
-    # Smoke test: check the model loads at all, without a server or a GPU pool.
     print("ASR module loaded. Call transcribe_array(audio) to use.")
     model = get_model()
     print("Model loaded successfully.")

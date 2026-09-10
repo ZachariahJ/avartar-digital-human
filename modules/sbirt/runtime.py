@@ -1,34 +1,3 @@
-"""Executes the protocol in flow.py. One interpreter, no per-question code.
-
-Walks the program step by step, gathering what to say until it reaches
-something that needs an answer, then stops. Exactly one validated answer moves
-it on. The pointer, the scores, the zones, the skip rules and every branch are
-computed here from data; a model's understanding of an utterance enters only as
-a validated TurnOut, and can reach nothing else.
-
-What the pipeline may call:
-
-  advance(session, out)   consume one validated answer and return the next
-                          step: what to say, and what to expect after it. The
-                          answer must already have passed turn.validate.
-  absorb(session, out)    fold a continuation into the most recent open
-                          capture without moving the machine, for an answer
-                          given in two breaths.
-  correct(session, out)   overwrite an earlier answer and re-derive from it.
-  enter_crisis(session)   close the session on a crisis the model flagged:
-                          speak the emergency numbers and stop. There is
-                          deliberately no counseling loop and no resume —
-                          deciding somebody is safe is not a decision this
-                          code, or a model, should make, so it hands off.
-  enter_abort(session)    close early, keeping what was coded.
-  repeat_step(session)    re-emit the current pause.
-
-Questions, asides and unclear turns never reach this module at all — the
-pipeline replies and the machine holds where it is.
-
-Pure Python over the protocol data, with no model and no I/O, so every branch
-can be tested directly against the study's case cards.
-"""
 
 from __future__ import annotations
 
@@ -47,45 +16,33 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Say:
-    """Verbatim script. Identical every session, so it can be a cached clip."""
-    key: str    # stable content key, e.g. "audit.item.3" (cache identity)
+    key: str
     text: str
 
 
 @dataclass(frozen=True)
 class LLMSay:
-    """An utterance the model words, from an instruction the protocol wrote.
-
-    It chooses phrasing and nothing else; the instruction fixes the content and
-    the protocol has already decided what comes after.
-    """
     instruction: str
 
 
 @dataclass(frozen=True)
 class Speak:
-    """Text already produced this turn, such as an acknowledgment.
-
-    Never cached: it exists because of what the person just said.
-    """
     text: str
 
 
 @dataclass(frozen=True)
 class Expect:
-    """What kind of answer the machine is waiting for, and to what."""
 
-    kind: str                        # consent | option | number | open | end
-    instrument: str | None = None    # which instrument, or "prescreen"
-    item_index: int | None = None    # which of its items
-    ask_key: str | None = None       # the gate or ask this pause belongs to
-    slots: tuple[str, ...] = ()      # all slots this ask declares
-    missing: tuple[str, ...] = ()    # those still unfilled; one is asked at a time
+    kind: str
+    instrument: str | None = None
+    item_index: int | None = None
+    ask_key: str | None = None
+    slots: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Step:
-    """One turn's output: where the protocol is, what to say, what to expect."""
 
     node: str
     utterances: tuple
@@ -93,77 +50,45 @@ class Step:
 
 
 class ProtocolError(RuntimeError):
-    """An event reached the machine that does not fit what it was expecting.
-
-    Always a wiring bug. An ambiguous or unexpected user reply cannot cause this
-    — those are downgraded before they get here, and hold the protocol in place.
-    """
+    pass
 
 
 @dataclass
 class ClinicalSession:
-    """All the clinical state for one conversation. Owned by the Pipeline."""
 
-    pc: int = 0                                # index of the paused step
+    pc: int = 0
     node: str = "consent"
     expect: Expect = field(default_factory=lambda: Expect("consent"))
-    consent: str | None = None                 # "yes" | "no"
-    prescreen: dict[str, int] = field(default_factory=dict)   # key -> code
-    arms: list[str] = field(default_factory=list)             # pending arms
-    arm: str | None = None                                    # active arm
+    consent: str | None = None
+    prescreen: dict[str, int] = field(default_factory=dict)
+    arms: list[str] = field(default_factory=list)
+    arm: str | None = None
     responses: dict[str, dict[int, int]] = field(default_factory=dict)
     assessments: dict[str, Assessment] = field(default_factory=dict)
-    readiness: dict[str, int] = field(default_factory=dict)   # arm -> 0..10
-    declined: list[str] = field(default_factory=list)         # declined permission keys (audit)
-    corrections: list[dict] = field(default_factory=list)     # old and new codes
-    covered: set[str] = field(default_factory=set)            # what has been said
-    answers: dict[str, str] = field(default_factory=dict)     # open captures (in-memory only)
-    slots: dict[str, dict[str, str]] = field(default_factory=dict)  # slot captures
-    last_ask_key: str | None = None            # target for continuation absorption
-    # A coded answer waiting to be confirmed by the person. Held rather than
-    # written, so an answer that turns out to be wrong never enters the score.
+    readiness: dict[str, int] = field(default_factory=dict)
+    declined: list[str] = field(default_factory=list)
+    corrections: list[dict] = field(default_factory=list)
+    covered: set[str] = field(default_factory=set)
+    answers: dict[str, str] = field(default_factory=dict)
+    slots: dict[str, dict[str, str]] = field(default_factory=dict)
+    last_ask_key: str | None = None
     pending_confirm: dict | None = None
-    # Answers the person volunteered before their question came up, by target
-    # key. Never committed from here: the protocol reads one back when it
-    # reaches that question, and their yes is what writes it.
     candidates: dict[str, dict] = field(default_factory=dict)
-    # Targets whose candidate the person rejected, so a wrong guess is offered
-    # once and then the question is asked properly.
     refused_candidates: set = field(default_factory=set)
-    # Items the person could not or would not answer, by itemset. They score
-    # zero, which makes the total a lower bound, and they mark the assessment
-    # incomplete — so the provider sees what is unanswered rather than a result
-    # that merely looks whole.
     missing: dict[str, dict] = field(default_factory=dict)
-    # Consecutive failed turns at the current question. Reset by any successful
-    # answer; at the limit the question is abandoned rather than asked again.
     stalls: int = 0
-    # Consecutive turns spent on something other than the question. Counted
-    # apart from stalls because they mean opposite things: a stall is about
-    # this item, an aside is about whether to go on at all.
     asides: int = 0
-    # Contradictions found between answers, recorded as codes only. The fired
-    # set bounds it to one read-back per rule, so nobody is challenged twice
-    # about the same inconsistency.
     inconsistencies: list[dict] = field(default_factory=list)
     fired_rules: set[str] = field(default_factory=set)
-    # Targets that were filled from a volunteered answer rather than by asking.
     volunteered: set = field(default_factory=set)
     crisis: bool = False
-    aborted: bool = False                      # the person stopped the session
+    aborted: bool = False
     last_step: Step | None = None
 
     def instrument(self):
-        """The instrument for the arm currently running."""
         return BY_KEY[ARM_INSTRUMENT[self.arm]]
 
     def to_audit_dict(self) -> dict:
-        """The session as a record for the provider, with no patient words in it.
-
-        Codes, scores and zones only. Open answers appear as the keys that were
-        answered, never as what was said, so the record can be kept without
-        keeping a transcript.
-        """
         return {
             "node": self.node,
             "consent": self.consent,
@@ -181,8 +106,6 @@ class ClinicalSession:
             "inconsistencies": [dict(c) for c in self.inconsistencies],
             "covered": sorted(self.covered),
             "answered": sorted(self.answers),
-            # Which answers were volunteered rather than asked for, so a
-            # reviewer can see what the person was never directly asked.
             "volunteered": sorted(self.volunteered),
             "slots_filled": {k: sorted(v) for k, v in self.slots.items()},
             "crisis": self.crisis,
@@ -191,16 +114,8 @@ class ClinicalSession:
 
 
 def _resolve_say(session: ClinicalSession, name: str) -> Say:
-    """Turn an "@name" from the protocol into the fixed line it means here.
-
-    The valid names are fixed and covered by the flow contract test, so a new
-    "@name" in the protocol without an arm below fails a test rather than a
-    conversation.
-    """
     arm = session.arm
     if name == "@alcohol.screen.permission":
-        # Only refer back to the standard-drink definition if the education was
-        # actually delivered; the permission before it can decline.
         key = ("alcohol.screen.permission"
                if "alcohol.edu.standard_drink" in session.covered
                else "alcohol.screen.permission.no_defn")
@@ -230,12 +145,6 @@ def _resolve_say(session: ClinicalSession, name: str) -> Say:
 
 
 def _points_instruction(session: ClinicalSession, unit: templates.Unit) -> str:
-    """Build the instruction for a unit the model has to word.
-
-    The points come from the reviewable data; the grounding is what this person
-    actually said, quoted from captured state. Without it the model has nothing
-    to reflect back except its own invention.
-    """
     ground = []
     a = session.answers
     if unit.id == "bi.summary.balance":
@@ -251,10 +160,7 @@ def _points_instruction(session: ClinicalSession, unit: templates.Unit) -> str:
 
 
 def _tell_beats(session: ClinicalSession, unit: str) -> list:
-    """The utterances for one Tell, and record that its content was delivered."""
     if unit == "@close":
-        # Resolved here rather than in _resolve_say because the close it picks
-        # is worded by the model, and that resolver only returns fixed lines.
         unit = close_unit(session)
     if unit.startswith("@"):
         say = _resolve_say(session, unit)
@@ -270,15 +176,12 @@ def _tell_beats(session: ClinicalSession, unit: str) -> list:
 
 def _ask_beats(session: ClinicalSession, step: Ask,
                missing: tuple[str, ...]) -> list:
-    """The utterance that poses an Ask, or nothing if it was already spoken."""
     if step.ask == "included":
         return []
     if step.ask == "fixed":
         if step.key.startswith("@"):
             return [_resolve_say(session, step.key)]
         return [Say(step.key, templates.FIXED[step.key])]
-    # Composed by the model. A slot ask covers exactly one missing slot, so the
-    # person is never handed several questions at once.
     if step.slots:
         point = dict(step.slot_points)[missing[0]]
         return [LLMSay("Ask the person, in one short natural question, "
@@ -289,12 +192,6 @@ def _ask_beats(session: ClinicalSession, step: Ask,
 
 
 def _resume_with(session: ClinicalSession, beats: list, target: str) -> Step:
-    """Read a volunteered answer back instead of asking its question cold.
-
-    Always confirmed, never committed straight: it was not given in answer to
-    this question, so nothing but the person's own yes should put it on record.
-    The pointer does not move, so a "no" simply falls through to asking.
-    """
     c = session.candidates[target]
     session.pending_confirm = {"target": target, "source": "volunteered", **c}
     logger.info("[clinical] reading back a volunteered answer for %s", target)
@@ -305,7 +202,6 @@ def _resume_with(session: ClinicalSession, beats: list, target: str) -> Step:
 
 def _pause(session: ClinicalSession, node: str, beats: list,
            expect: Expect) -> Step:
-    """Stop and wait for an answer, recording where and for what."""
     session.node = node
     session.expect = expect
     step = Step(node, tuple(beats), expect)
@@ -315,21 +211,12 @@ def _pause(session: ClinicalSession, node: str, beats: list,
 
 
 def repeat_step(session: ClinicalSession) -> Step:
-    """Re-emit the current pause, so an ask can be re-posed without moving."""
     if session.last_step is None:
         return start(session)
     return session.last_step
 
 
 def current_ask(session: ClinicalSession):
-    """The one utterance that posed the question now on the table, or None.
-
-    A step can speak several beats — a preamble, a piece of education — before
-    the question itself, and only the question may be repeated: re-reading the
-    preamble every time somebody asks what a word means would be unbearable.
-    The ask is always the last beat, because _run appends it immediately before
-    pausing.
-    """
     step = session.last_step
     if step is None or not step.utterances:
         return None
@@ -337,26 +224,15 @@ def current_ask(session: ClinicalSession):
 
 
 def _ask_key(step: Ask) -> str:
-    """The key an Ask's answer is stored under.
-
-    The "@" prefix says how the question's wording is resolved, which has
-    nothing to do with where the answer goes, so it is stripped here.
-    """
     return step.key.lstrip("@")
 
 
 def _ask_missing(session: ClinicalSession, step: Ask) -> tuple[str, ...]:
-    """Which of an Ask's slots are still unfilled, in declared order."""
     filled = session.slots.get(_ask_key(step), {})
     return tuple(s for s in step.slots if s not in filled)
 
 
 def _run(session: ClinicalSession, beats: list) -> Step:
-    """Run the protocol from where it stands until it needs an answer or ends.
-
-    Collects everything to say along the way, so one turn can span several
-    steps.
-    """
     while True:
         step = PROTOCOL[session.pc]
 
@@ -385,10 +261,6 @@ def _run(session: ClinicalSession, beats: list) -> Step:
 
         elif isinstance(step, Ask):
             if _ask_key(step) in session.answers:
-                # Already answered — by a read-back of something volunteered,
-                # or by a confirm resolved without moving the pointer. Items
-                # get this from next_item_index; an Ask needs it spelled out,
-                # or the protocol asks again for what it just recorded.
                 session.pc += 1
                 continue
             target = (_candidate_for(session, _ask_key(step))
@@ -453,30 +325,16 @@ def _run(session: ClinicalSession, beats: list) -> Step:
                 beats.extend(_tell_beats(session, step.close))
             return _pause(session, step.node, beats, Expect("end"))
 
-        else:  # pragma: no cover — program integrity tests prevent this
+        else:
             raise ProtocolError(f"unknown step type at pc={session.pc}")
 
 
 def start(session: ClinicalSession) -> Step:
-    """Begin a session by asking for consent, then wait for the answer.
-
-    The consent question is the protocol's own first utterance rather than the
-    tail of the greeting, which is what lets it be re-asked from the same place
-    as every other question. The greeting speaks only the preamble leading into
-    it.
-    """
     session.pc = 0
     return _run(session, [])
 
 
 def enter_crisis(session: ClinicalSession) -> Step:
-    """Close the session because the model flagged a crisis.
-
-    Terminal, like enter_abort. The fixed line hands over the emergency numbers
-    and says their provider will follow up; nothing further is spoken and the
-    screening does not resume. What was coded so far stays, and the crisis
-    itself is recorded.
-    """
     session.crisis = True
     key = "close.crisis"
     session.covered.add(key)
@@ -486,12 +344,6 @@ def enter_crisis(session: ClinicalSession) -> Step:
 
 
 def enter_abort(session: ClinicalSession) -> Step:
-    """Close the session early because the person asked to stop.
-
-    Works from any node, and makes no attempt to keep them. What was coded so
-    far stays: partial data is still useful to their provider, and the stop
-    itself is recorded.
-    """
     session.aborted = True
     key = "close.aborted"
     session.covered.add(key)
@@ -501,12 +353,8 @@ def enter_abort(session: ClinicalSession) -> Step:
 
 
 def _consume(session: ClinicalSession, out: TurnOut) -> None:
-    """Apply ONE validated answer to the paused step and move the pointer.
-    Raises ProtocolError when the payload doesn't fit the pause — that is
-    always pipeline wiring gone wrong, never user ambiguity (turn.validate
-    already downgraded anything ambiguous)."""
-    session.stalls = 0                     # progress: the stall streak ends
-    session.asides = 0                     # and they are back on the question
+    session.stalls = 0
+    session.asides = 0
     step = PROTOCOL[session.pc]
 
     if isinstance(step, Gate):
@@ -535,16 +383,13 @@ def _consume(session: ClinicalSession, out: TurnOut) -> None:
             return
         if step.slots:
             if not out.slots:
-                # Validation maps a bare answer onto the slot being asked, so
-                # arriving with none means this input never went through it.
-                # Failing loudly beats holding this question forever.
                 raise ProtocolError(
                     f"slot ask {key!r} got no slots — unvalidated input?")
             store = session.slots.setdefault(key, {})
             store.update(out.slots)
             session.last_ask_key = key
             if _ask_missing(session, step):
-                return                    # more slots to fill; ask the next
+                return
             session.answers[key] = "; ".join(
                 f"{s}: {store[s]}" for s in step.slots)
             session.pc += 1
@@ -568,10 +413,8 @@ def _consume(session: ClinicalSession, out: TurnOut) -> None:
             if not 0 <= code < len(q.item.options):
                 raise ProtocolError(f"prescreen {q.key}: invalid code {code}")
             session.prescreen[q.key] = code
-            return                        # the step re-runs for the next item
+            return
         instrument = BY_KEY[exp.instrument]
-        # Called for its validation, not its result: an out-of-range code
-        # raises here rather than quietly mis-scoring the instrument.
         option_score(instrument, exp.item_index, code)
         session.responses[exp.instrument][exp.item_index] = code
         return
@@ -581,11 +424,6 @@ def _consume(session: ClinicalSession, out: TurnOut) -> None:
 
 
 def advance(session: ClinicalSession, out: TurnOut) -> Step:
-    """Consume one validated answer and return the next step.
-
-    The answer must already have passed turn.validate; anything else is a
-    wiring bug and raises rather than advancing the protocol.
-    """
     if session.expect.kind == "end":
         raise ProtocolError("session already ended; nothing advances")
     if out.action != "answer":
@@ -596,20 +434,12 @@ def advance(session: ClinicalSession, out: TurnOut) -> Step:
 
 
 def _conflict(session: ClinicalSession, out: TurnOut) -> tuple[str, str] | None:
-    """Whether this answer contradicts one already given.
-
-    Returns the rule that fired and the prior answer phrased for speaking, or
-    None. Each rule triggers at most one read-back per session, so nobody is
-    challenged repeatedly — but every detection is recorded either way, so the
-    provider sees the contradiction even if the person stands by both answers.
-    """
     exp = session.expect
     if exp.instrument != "audit" or not isinstance(out.code, int):
         return None
     items = BY_KEY["audit"].items
     responses = session.responses.get("audit", {})
 
-    # More heavy-drinking occasions than drinking occasions, which cannot be.
     if (exp.item_index == 2 and 0 in responses
             and coding.Q3_MIN_PER_WEEK[out.code]
             > coding.Q1_MAX_PER_WEEK[responses[0]]):
@@ -623,7 +453,6 @@ def _conflict(session: ClinicalSession, out: TurnOut) -> tuple[str, str] | None:
         q1 = items[0].options[responses[0]].label.lower()
         return rule, f"you drink about {q1}"
 
-    # A coded frequency well below what they described conversationally.
     if exp.item_index == 0:
         qf = session.slots.get("alcohol.qf", {}).get("frequency", "")
         rate = coding.parse_freq_text(qf)
@@ -642,22 +471,6 @@ def _conflict(session: ClinicalSession, out: TurnOut) -> tuple[str, str] | None:
 
 
 def confirm_reason(session: ClinicalSession, out: TurnOut) -> dict | None:
-    """Whether this answer should be read back before it is committed, and why.
-
-    Returns None to commit directly, or a payload describing the reason.
-
-    Reading answers back is the exception rather than the rule, because a
-    screening that confirms everything is tedious enough that people start
-    agreeing to move it along. So it happens only where being wrong would move
-    a score and nothing else vouches for the code: a unit conversion was
-    assumed and the person deserves to hear it, the value sits near a bucket
-    edge, the answer contradicts an earlier one, or the item has no
-    deterministic derivation and the code came from semantic mapping alone.
-
-    Exact-wording answers and cleanly computed codes commit without asking.
-    Narrowing this from confirming every item is a clinical decision — pending
-    clinician review.
-    """
     exp = session.expect
     if (exp.kind != "option" or not exp.instrument
             or exp.instrument == "prescreen"
@@ -682,12 +495,6 @@ def confirm_reason(session: ClinicalSession, out: TurnOut) -> dict | None:
 
 def write_target(session: ClinicalSession, target: str,
                  code: int | None, text: str | None) -> None:
-    """Write one answer to wherever that target lives.
-
-    The one place that knows which of the three answer stores a target key maps
-    onto, so a coded answer and a volunteered one commit through identical
-    code and cannot diverge.
-    """
     head, _, tail = target.rpartition(".")
     if head == "prescreen":
         session.prescreen[tail] = code
@@ -698,16 +505,9 @@ def write_target(session: ClinicalSession, target: str,
 
 
 def _confirm_text(p: dict) -> str:
-    """The read-back for whatever is being held, in the person's own terms.
-
-    A volunteered answer is quoted back to them before anything else, because
-    they were not asked it — without the quote they cannot tell what is being
-    confirmed.
-    """
     item = target_item(p["target"])
     said = f"Earlier you mentioned {p['quote']}" if p.get("quote") else ""
     if item is None:
-        # An open capture: their own words are the answer, so read those.
         value = p.get("text") or ""
         if said:
             return f"{said} — should I put that down as your answer?"
@@ -724,12 +524,6 @@ def _confirm_text(p: dict) -> str:
 
 
 def _confirm_pause(session: ClinicalSession) -> Step:
-    """Ask the person to verify the answer being held.
-
-    The wording is built here rather than by the model, and always states the
-    coded option label. Confirming a paraphrase of what they said would confirm
-    the wrong thing: what needs checking is the code about to be committed.
-    """
     p = session.pending_confirm
     return _pause(session, f"confirm.{p['target']}",
                   [Speak(_confirm_text(p))],
@@ -738,11 +532,6 @@ def _confirm_pause(session: ClinicalSession) -> Step:
 
 def request_confirm(session: ClinicalSession, out: TurnOut,
                     reason: dict | None = None) -> Step:
-    """Hold this answer uncommitted and ask the person to verify it.
-
-    The point is to surface a mis-coding while it can still be corrected, so
-    nothing reaches the score until they agree.
-    """
     session.pending_confirm = {"target": expect_target(session.expect),
                                "code": out.code, "text": out.text,
                                "source": "asked", **(reason or {})}
@@ -750,12 +539,6 @@ def request_confirm(session: ClinicalSession, out: TurnOut,
 
 
 def resolve_confirm(session: ClinicalSession, yes: bool) -> Step:
-    """Act on their verdict: commit the held answer, or discard it and re-ask.
-
-    Either way the next question is recomputed rather than assumed, so a
-    rejected answer simply leaves its item unanswered — and a rejected guess
-    at what they volunteered means the question gets asked properly.
-    """
     p = session.pending_confirm
     session.pending_confirm = None
     if p is None:
@@ -770,27 +553,17 @@ def resolve_confirm(session: ClinicalSession, yes: bool) -> Step:
         logger.info("[clinical] confirm accepted: %s (%s)", target, p["source"])
     else:
         if p["source"] == "volunteered":
-            # Offered once. The question now gets asked the ordinary way.
             session.refused_candidates.add(target)
         logger.info("[clinical] confirm DENIED: %s re-collected", target)
     return _run(session, [])
 
 
-# The open questions this protocol asks, so a volunteered answer can only name
-# one that exists. Derived from the program rather than listed, so adding an
-# Ask cannot leave this behind.
 OPEN_TARGETS = frozenset(
     step.key.lstrip("@") for step in PROTOCOL
     if isinstance(step, Ask) and step.kind == "open")
 
 
 def record_harvest(session: ClinicalSession, out: TurnOut) -> list[str]:
-    """Keep the volunteered facts that are still worth anything, and say which.
-
-    Dropped here rather than in validate because only the session knows what is
-    already answered, already refused, or not a question this protocol asks.
-    A later mention overwrites an earlier one: people correct themselves.
-    """
     kept = []
     for h in out.harvest:
         target = h.target
@@ -807,7 +580,6 @@ def record_harvest(session: ClinicalSession, out: TurnOut) -> list[str]:
 
 
 def _target_answered(session: ClinicalSession, target: str) -> bool:
-    """Whether this target already holds an answer, however it got there."""
     head, _, tail = target.rpartition(".")
     if head == "prescreen":
         return tail in session.prescreen
@@ -817,19 +589,12 @@ def _target_answered(session: ClinicalSession, target: str) -> bool:
 
 
 def _candidate_for(session: ClinicalSession, target: str) -> str | None:
-    """The target key to read back here, or None to ask the question normally."""
     if target in session.candidates and target not in session.refused_candidates:
         return target
     return None
 
 
 def offer_pause(session: ClinicalSession) -> Step:
-    """Stop pressing the question and hand the choice back to the person.
-
-    Asked as an ordinary yes/no so it codes through the same path as every
-    other gate. The pointer does not move, so agreeing to go on re-poses
-    whatever was already on the table.
-    """
     session.asides = 0
     logger.info("[clinical] offering to pause at node %s", session.node)
     return _pause(session, "pause.offer",
@@ -838,11 +603,6 @@ def offer_pause(session: ClinicalSession) -> Step:
 
 
 def resolve_pause(session: ClinicalSession, keep_going: bool) -> Step:
-    """Carry on with the question that was already pending, or stop here.
-
-    Stopping is the ordinary abort: what was coded so far still reaches the
-    provider, and nothing tries to talk them back into it.
-    """
     if not keep_going:
         return enter_abort(session)
     session.stalls = 0
@@ -850,18 +610,6 @@ def resolve_pause(session: ClinicalSession, keep_going: bool) -> Step:
 
 
 def correct(session: ClinicalSession, out: TurnOut) -> Step | None:
-    """Overwrite an earlier answer with a corrected one.
-
-    Returns the re-emitted pause, or None when the target is not an answered
-    item of the active instrument — the pipeline then asks which question they
-    meant rather than changing anything.
-
-    Consequences are re-derived rather than patched. Skip rules are re-read, so
-    a corrected answer can newly skip later items or bring skipped ones back,
-    and the score is only ever computed at completion from whatever the codes
-    then are. Patching the total instead would leave it disagreeing with the
-    answers it supposedly came from.
-    """
     exp = session.expect
     if (exp.kind != "option" or not exp.instrument
             or exp.instrument == "prescreen"):
@@ -870,12 +618,10 @@ def correct(session: ClinicalSession, out: TurnOut) -> Step | None:
     if out.item not in responses or not isinstance(out.code, int):
         return None
     instrument = BY_KEY[exp.instrument]
-    # Called for its validation, not its result, as when the answer was first
-    # recorded.
     option_score(instrument, out.item, out.code)
     old = responses[out.item]
     if old == out.code:
-        return repeat_step(session)          # they corrected it to itself
+        return repeat_step(session)
     session.stalls = 0
     responses[out.item] = out.code
     session.corrections.append({"instrument": exp.instrument,
@@ -886,52 +632,28 @@ def correct(session: ClinicalSession, out: TurnOut) -> Step | None:
     return _run(session, [])
 
 
-# Consecutive failed turns one question tolerates before it is abandoned rather
-# than asked again. "I don't know" gets one recall aid before the exit; an
-# unclear answer gets one further attempt at clarifying.
 DONT_KNOW_LIMIT = 2
 UNCLEAR_LIMIT = 3
-# Consecutive asides tolerated before the choice goes back to the person.
-# Distress says so on the first turn and does not wait for this.
 ASIDE_LIMIT = 2
 
 
 def note_aside(session: ClinicalSession) -> int:
-    """Record one turn spent away from the question and return the streak."""
     session.asides += 1
     return session.asides
 
 
 def note_stall(session: ClinicalSession) -> int:
-    """Record one failed turn at the current question and return the streak.
-
-    Reset by any successful answer, so only consecutive failures count.
-    """
     session.stalls += 1
     return session.stalls
 
 
 def mark_missing(session: ClinicalSession, reason: str = "no_answer") -> Step:
-    """Give up on the current question, record why, and move on.
-
-    This is what makes every clarification loop finite: whatever the question,
-    there is always a way out that is not another attempt at asking it.
-
-    Nothing is ever guessed. An instrument item scores zero and is flagged, so
-    the total is a lower bound the provider can see is incomplete. A permission
-    gate takes its refusal path, which is the safe direction — nothing gets
-    screened without a clear yes. An open or numeric question is simply
-    recorded as unanswered.
-    """
     session.stalls = 0
     exp = session.expect
     step = PROTOCOL[session.pc]
     skip_line = Say("item.skipped", templates.FIXED["item.skipped"])
 
     if exp.kind == "confirm":
-        # The held code was never verified, and it was held precisely because
-        # something about it was doubtful. Committing it now would commit the
-        # answer nobody could confirm.
         p = session.pending_confirm
         session.pending_confirm = None
         if p is not None:
@@ -946,9 +668,6 @@ def mark_missing(session: ClinicalSession, reason: str = "no_answer") -> Step:
     if exp.kind == "option" and exp.instrument:
         if exp.instrument == "prescreen":
             q = PRE_SCREEN[exp.item_index]
-            # Routed as negative so the session can continue, but recorded as
-            # unanswered — the arm was skipped for want of an answer, not
-            # because there was nothing there.
             session.prescreen[q.key] = 0
             session.missing.setdefault(
                 "prescreen", {})[exp.item_index] = reason
@@ -974,19 +693,14 @@ def mark_missing(session: ClinicalSession, reason: str = "no_answer") -> Step:
         session.missing.setdefault("asks", {})[key] = reason
         if step.kind != "number":
             session.answers.setdefault(key, "(not answered)")
-        # A missing readiness ruler leaves session.readiness unset; the
-        # protocol's _after_ruler route skips the ruler follow-ups.
         logger.info("[clinical] ask unanswerable (%s): %s", reason, key)
         session.pc += 1
         return _run(session, [skip_line])
 
-    return repeat_step(session)            # end/unknown: nothing to skip
+    return repeat_step(session)
 
 
 def absorb(session: ClinicalSession, out: TurnOut) -> None:
-    """Fold a `continuation` into the most recent open capture WITHOUT
-    moving the machine — the two-breath answer lands where it belongs
-    instead of being coded against the wrong expectation."""
     key = session.last_ask_key
     if key is None:
         return
