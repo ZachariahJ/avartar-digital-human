@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import pickle
+import queue
 import shutil
 import sys
 import threading
@@ -26,9 +27,11 @@ import time
 from types import SimpleNamespace
 
 import cv2
+import librosa
 import numpy as np
 
 import config
+from modules import blend
 
 # MuseTalk is a sibling checkout rather than an installed package, and the
 # import below reaches into it, so this must precede it.
@@ -46,6 +49,9 @@ _mt_lock = threading.Lock()
 
 # What MuseTalk returns as a bounding box when it found no face.
 _NO_FACE = (0.0, 0.0, 0.0, 0.0)
+
+# Queued after the last frame so the post-processing thread knows to stop.
+_DONE = object()
 
 
 @contextlib.contextmanager
@@ -79,9 +85,7 @@ def _musetalk():
                 with _cwd(config.MUSETALK_DIR):
                     from musetalk.utils.utils import load_all_model, datagen
                     from musetalk.utils.preprocessing import get_landmark_and_bbox
-                    from musetalk.utils.blending import (
-                        get_image_blending, get_image_prepare_material,
-                    )
+                    from musetalk.utils.blending import get_image_prepare_material
                     from musetalk.utils.face_parsing import FaceParsing
                     from musetalk.utils.audio_processor import AudioProcessor
                     from transformers import WhisperModel
@@ -89,7 +93,6 @@ def _musetalk():
                     load_all_model=load_all_model,
                     datagen=datagen,
                     get_landmark_and_bbox=get_landmark_and_bbox,
-                    get_image_blending=get_image_blending,
                     get_image_prepare_material=get_image_prepare_material,
                     FaceParsing=FaceParsing,
                     AudioProcessor=AudioProcessor,
@@ -327,6 +330,28 @@ class _Worker:
         self.whisper = whisper.to(device=self.device, dtype=self.weight_dtype).eval()
         self.whisper.requires_grad_(False)
 
+    def _mel_features(self, audio_path: str):
+        """Whisper mel features for one utterance, computed on this worker's GPU.
+
+        Upstream's AudioProcessor.get_audio_feature runs the STFT through
+        WhisperFeatureExtractor's numpy path: a Python loop over frames costing
+        ~380ms whatever the utterance's length, because every segment is padded
+        out to whisper's full 30s window. That was the whole time-to-first-frame,
+        and it fell hardest on the short replies a conversation is mostly made
+        of. The same extractor has a torch path behind its `device` argument —
+        same filterbank, ~26ms. The two differ by 3e-05, and the result is cast
+        to fp16 here, whose resolution is 30x coarser than that.
+        """
+        speech, sr = librosa.load(audio_path, sr=16000)
+        window = 30 * sr
+        extract = self.audio_processor.feature_extractor
+        features = [
+            extract(speech[i:i + window], return_tensors="pt", sampling_rate=sr,
+                    device=str(self.device)).input_features.to(dtype=self.weight_dtype)
+            for i in range(0, len(speech), window)
+        ]
+        return features, len(speech)
+
     @torch.no_grad()
     def stream(self, audio_path: str, on_frame, abort=None) -> int:
         """Render one utterance, emitting each frame as soon as it is blended.
@@ -335,24 +360,83 @@ class _Worker:
             audio_path: the utterance's audio. A path, not bytes, because the
                 whisper feature extractor takes a filename.
             on_frame: called as on_frame(index, jpeg_bytes) once per frame, in
-                order, while the render is still running.
-            abort: polled per batch and per frame; when it returns true the
-                render stops where it is.
+                order, while the render is still running. Invoked from the
+                post-processing thread, never from the caller's.
+            abort: polled per batch and per frame, from both threads, so it
+                must be thread-safe; when it returns true the render stops
+                where it is.
 
         Returns:
             How many frames were emitted, which is short of the full count if
             the render was aborted.
+
+        Blending and JPEG encoding run on a second thread rather than inline.
+        They cost ~13ms a frame against the GPU's ~33ms, so inline they simply
+        added up — 200ms of UNet then 76ms of idle GPU, per batch of six, which
+        is what held the renderer below the 24fps the browser plays at. Both
+        stages now run at once and the GPU alone sets the pace. cv2 releases
+        the GIL, so the two threads genuinely overlap.
         """
         mt = _musetalk()
         m = self.material
         fps = config.MUSETALK_FPS
         jpeg_opts = [int(cv2.IMWRITE_JPEG_QUALITY), config.MUSETALK_JPEG_QUALITY]
 
-        def _stop():
-            return config.SHUTTING_DOWN.is_set() or (abort is not None and abort())
+        halt = threading.Event()    # 消费端出错，生产端停手
+        done = threading.Event()    # 生产端结束，消费端可退
+        # Holds the 256x256 decoded faces, not the 1.5MB composited frames, so
+        # two batches in flight is a couple of megabytes. Sized for jitter, not
+        # throughput: the consumer outruns the GPU, so it is normally empty.
+        q = queue.Queue(maxsize=2 * config.MUSETALK_BATCH_SIZE)
+        state = SimpleNamespace(emitted=0, error=None, high_water=0)
 
-        features, librosa_length = self.audio_processor.get_audio_feature(
-            audio_path, weight_dtype=self.weight_dtype)
+        def _stop():
+            return (halt.is_set() or config.SHUTTING_DOWN.is_set()
+                    or (abort is not None and abort()))
+
+        def _consume():
+            try:
+                while True:
+                    try:
+                        item = q.get(timeout=0.05)
+                    except queue.Empty:
+                        if done.is_set():
+                            return              # 生产端已死，不再等
+                        continue
+                    if item is _DONE or _stop():
+                        return
+                    idx, res_frame = item
+                    i = idx % len(m)
+                    x1, y1, x2, y2 = m.coords[i]
+                    face = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                    # Copy first: this frame is shared with every future render,
+                    # so blending in place would permanently deface the material.
+                    combined = m.frames[i].copy()
+                    blend.paste_face(combined, face, (x1, y1, x2, y2),
+                                     m.masks[i], m.mask_coords[i])
+                    ok, buf = cv2.imencode(".jpg", combined, jpeg_opts)
+                    # 静默丢帧会让浏览器索引持续错位
+                    if not ok:
+                        raise RuntimeError(f"JPEG encode failed on frame {idx}")
+                    on_frame(state.emitted, buf.tobytes())
+                    state.emitted += 1
+            except BaseException as exc:
+                state.error = exc
+            finally:
+                halt.set()          # 生产端别再往满队列里塞
+
+        def _offer(item) -> bool:
+            """Hand one frame to the consumer; false means stop rendering."""
+            while not _stop():
+                try:
+                    q.put(item, timeout=0.05)
+                    state.high_water = max(state.high_water, q.qsize())
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        features, librosa_length = self._mel_features(audio_path)
         # The audio cannot be streamed in, only the output out: chunking trims
         # and pads against the total length, so the whole utterance must exist
         # before any of it can be processed.
@@ -363,44 +447,45 @@ class _Worker:
             audio_padding_length_right=config.MUSETALK_AUDIO_PAD_RIGHT,
         )
 
+        worker = threading.Thread(target=_consume, name="musetalk-post", daemon=True)
+        worker.start()
         idx = 0
-        # Passing device explicitly: upstream's final partial batch calls .to()
-        # with a cuda:0 default, so without this every worker in a multi-GPU
-        # pool reaches onto GPU 0.
-        for whisper_batch, latent_batch in mt.datagen(
-                chunks, m.latents, config.MUSETALK_BATCH_SIZE,
-                device=str(self.device)):
-            if _stop():
-                break
-            audio_feature_batch = self.pe(whisper_batch.to(self.device))
-            latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
-            pred_latents = self.unet.model(
-                latent_batch, self.timesteps,
-                encoder_hidden_states=audio_feature_batch).sample
-            pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
-            for res_frame in self.vae.decode_latents(pred_latents):
+        try:
+            # Passing device explicitly: upstream's final partial batch calls
+            # .to() with a cuda:0 default, so without this every worker in a
+            # multi-GPU pool reaches onto GPU 0.
+            for whisper_batch, latent_batch in mt.datagen(
+                    chunks, m.latents, config.MUSETALK_BATCH_SIZE,
+                    device=str(self.device)):
                 if _stop():
-                    return idx
-                i = idx % len(m)
-                x1, y1, x2, y2 = m.coords[i]
-                try:
-                    face = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-                except cv2.error:
+                    break
+                audio_feature_batch = self.pe(whisper_batch.to(self.device))
+                latent_batch = latent_batch.to(device=self.device, dtype=self.unet.model.dtype)
+                pred_latents = self.unet.model(
+                    latent_batch, self.timesteps,
+                    encoder_hidden_states=audio_feature_batch).sample
+                pred_latents = pred_latents.to(device=self.device, dtype=self.vae.vae.dtype)
+                for res_frame in self.vae.decode_latents(pred_latents):
+                    if not _offer((idx, res_frame)):
+                        break
+                    idx += 1
+                else:
                     continue
-                # Copy first: this frame is shared with every future render, so
-                # blending in place would permanently deface the material.
-                combined = mt.get_image_blending(
-                    m.frames[i].copy(), face, [x1, y1, x2, y2],
-                    m.masks[i], m.mask_coords[i])
-                ok, buf = cv2.imencode(".jpg", combined, jpeg_opts)
-                if not ok:
-                    continue
-                on_frame(idx, buf.tobytes())
-                idx += 1
+                break
+        finally:
+            done.set()
+            # 消费端可能已死，队列满时塞不进去
+            with contextlib.suppress(queue.Full):
+                q.put_nowait(_DONE)
+            worker.join()
 
-        if idx == 0:
+        # A producer exception has already propagated past here; this is the
+        # consumer's, re-raised on the caller's thread so the first failure wins.
+        if state.error is not None:
+            raise state.error
+        if state.emitted == 0:
             logger.warning("MuseTalk produced no frames for %s", audio_path)
-        return idx
+        return state.emitted
 
 
 class MuseTalkGPUPool:

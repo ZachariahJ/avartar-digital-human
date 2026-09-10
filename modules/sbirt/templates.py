@@ -130,6 +130,16 @@ FIXED: dict[str, str] = {
         "for your provider."
     ),
     "bi.leaves_you": "So where does this leave you?",
+
+    # Spoken instead of pressing the question again, once somebody has twice
+    # answered something other than what was asked or said they feel unwell.
+    # Repeating a question at a person who is telling you something else is
+    # what makes the interview feel deaf; MI puts autonomy first, so the
+    # choice goes back to them. No source text; pending clinician review.
+    "aside.offer_pause": (
+        "We can stop here for today if you'd rather — your provider can pick "
+        "this up with you whenever you're ready. Would you like to keep going?"
+    ),
 }
 
 

@@ -811,9 +811,10 @@ class Pipeline:
 
         A single model call decides what the utterance is relative to the
         question on the table — an answer, a continuation, a question, an aside,
-        a correction, a refusal, a crisis, or unclear — and codes it if it is an
-        answer. Only a validated answer moves the machine; every other outcome
-        holds position and re-poses the ask.
+        discomfort, a correction, a refusal, a crisis, or unclear — and codes it
+        if it is an answer. Only a validated answer moves the machine; every
+        other outcome holds position and re-poses the ask, except discomfort or
+        a second aside, which offer to stop instead.
 
         Serialized, so that a superseded turn cannot advance the machine after
         its replacement already has.
@@ -853,6 +854,11 @@ class Pipeline:
             # Past this point the words have been acted on, so anything new is a
             # separate turn rather than the rest of this sentence.
             self._consume_utterance(turn)
+
+            # Before any branch: what they volunteered is true regardless of
+            # what this turn is classified as, and a crisis or an aside must
+            # not throw it away.
+            runtime.record_harvest(clinical, out)
 
             if out.action == "crisis":
                 # Hand off and stop. The fixed close gives the emergency
@@ -895,6 +901,13 @@ class Pipeline:
                     # that has to be recorded outside the session.
                     privacy.record_consent(
                         self.audit_key, "yes" if out.code == 1 else "no")
+                if exp.ask_key == "pause.offer":
+                    # Not a protocol gate, so it never reaches runtime.advance:
+                    # either the pending question comes back or the session ends.
+                    step = runtime.resolve_pause(
+                        clinical, keep_going=(out.code == 1))
+                    return self._deliver_step(user_text, step, turn,
+                                              ack=out.reply)
                 if exp.kind == "confirm":
                     # Their verdict on a read-back: yes commits the held code,
                     # no re-asks the same item.
@@ -947,10 +960,26 @@ class Pipeline:
                 # limit the item is recorded unanswered and the protocol moves on.
                 if runtime.note_stall(clinical) >= runtime.UNCLEAR_LIMIT:
                     return self._deliver_missing(user_text, "no_answer", turn)
+                return self._hold(user_text, out.reply, turn,
+                                  repose=not out.reply)
+
+            if out.action == "discomfort":
+                # Somebody who feels unwell should not have to say it twice
+                # before the interview stops pressing.
+                return self._deliver_step(
+                    user_text, runtime.offer_pause(clinical), turn,
+                    ack=out.reply)
+
+            if out.action == "tangent":
+                # Once is an aside; twice running means the question is not
+                # what they want to talk about, so the choice goes back to them.
+                if runtime.note_aside(clinical) >= runtime.ASIDE_LIMIT:
+                    return self._deliver_step(
+                        user_text, runtime.offer_pause(clinical), turn,
+                        ack=out.reply)
                 return self._hold(user_text, out.reply, turn)
 
-            # Questions and asides: answer or acknowledge, then re-pose the
-            # current ask without moving.
+            # Questions: answered from state, then the ask is re-posed.
             return self._hold(user_text, out.reply, turn)
 
     def _deliver_missing(self, user_text, reason, turn):
@@ -998,13 +1027,18 @@ class Pipeline:
             runtime.Step(self.clinical.node, tuple(beats), exp),
             turn)
 
-    def _hold(self, user_text, reply, turn):
+    def _hold(self, user_text, reply, turn, repose=True):
         """Say the model's reply, then put the same question back as authored.
 
         The model answers the person; the protocol re-poses the ask. Splitting
         it this way is what lets the reply be genuinely responsive — explaining
         a word, answering a question, acknowledging an aside — without ever
         putting a reworded version of a validated item in front of somebody.
+
+        Args:
+            repose: False when the reply is itself a question about the item —
+                a clarification. Re-reading the whole item after "did you mean
+                five or seven?" is the same question twice in one breath.
 
         A turn that produced no reply still re-poses the ask, so a failed model
         call costs a repeat rather than silence.
@@ -1013,7 +1047,7 @@ class Pipeline:
         beats = []
         if reply:
             beats.append(runtime.Speak(reply))
-        ask = runtime.current_ask(self.clinical)
+        ask = runtime.current_ask(self.clinical) if repose else None
         if ask is not None:
             beats.append(ask)
         elif not beats:
@@ -1134,9 +1168,19 @@ class Pipeline:
         """
         self._history_begin(user_text)
         self.state = "processing"
-        utterances = step.utterances
+        utterances = tuple(step.utterances)
         if ack:
-            utterances = (runtime.Speak(ack),) + tuple(utterances)
+            if utterances and isinstance(utterances[0], runtime.LLMSay):
+                # One utterance, one author. Left as two beats, the second
+                # model call restates the acknowledgment it can see in the
+                # history and the person hears the same sentence twice.
+                utterances = (runtime.LLMSay(
+                    f"First acknowledge what the person just said, using these "
+                    f"words or very close to them: {ack!r}. Then, in the same "
+                    f"breath and without repeating yourself, {utterances[0].instruction}"),
+                ) + utterances[1:]
+            else:
+                utterances = (runtime.Speak(ack),) + utterances
         # Deliberately not short-circuited on an unfinished delivery: the end
         # flag below is session state, not delivery state.
         self._speak_beats(utterances, turn)

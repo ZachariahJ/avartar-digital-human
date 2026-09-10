@@ -15,6 +15,7 @@ be tested directly.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -31,6 +32,10 @@ from .instruments import BY_KEY, PRE_SCREEN
 #   question     they are asking us something; answered from state, then the
 #                ask is re-posed
 #   tangent      an aside; acknowledged, then back to the ask
+#   discomfort   they are unwell, worn out, or say they cannot face this now.
+#                Not a crisis and not an abort: the engine offers to stop and
+#                lets them choose, because pressing the question again is what
+#                makes an interview feel deaf.
 #   crisis       distress or danger. Ends the session: the engine speaks
 #                the emergency numbers and closes, and does not counsel on.
 #   abort        they want to stop entirely. Distinct from declining the
@@ -43,8 +48,30 @@ from .instruments import BY_KEY, PRE_SCREEN
 #                handling: unclear re-asks, this one offers a recall aid once
 #                and then records the item missing and moves on.
 #   unclear      nothing above can be safely assumed
-Action = Literal["answer", "continuation", "question", "tangent", "crisis",
-                 "abort", "correction", "dont_know", "unclear"]
+Action = Literal["answer", "continuation", "question", "tangent", "discomfort",
+                 "crisis", "abort", "correction", "dont_know", "unclear"]
+
+
+class Harvest(BaseModel):
+    """One fact the person stated about a question that is NOT on the table.
+
+    Carried alongside the answer rather than instead of it, because people
+    answer in paragraphs: "no cigarettes" arrives while a different question is
+    pending, and "fentanyl, every day" answers three questions at once. Without
+    somewhere to put those, the engine asks again for what it was just told.
+
+    Nothing here is ever committed on the model's say-so — a candidate is read
+    back to the person and only their yes writes it. `quote` is what makes that
+    read-back possible: it is their own words, so they can recognise what is
+    being confirmed.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    target: str            # a target key, as listed in the interview state
+    code: int | None = None    # option and pre-screen targets
+    text: str | None = None    # open targets
+    quote: str = ""            # their words, for the read-back
 
 
 class TurnOut(BaseModel):
@@ -67,6 +94,11 @@ class TurnOut(BaseModel):
     # Open asks with declared slots: whichever ones this utterance filled.
     # validate() discards names that were not declared.
     slots: dict[str, str] = Field(default_factory=dict)
+    # Answers to OTHER questions that this utterance happened to contain. Kept
+    # through every action, including the ones that clear the payload: somebody
+    # can volunteer a fact while asking a question or changing the subject, and
+    # that is exactly when the old code threw it away.
+    harvest: list[Harvest] = Field(default_factory=list)
     # Open asks without slots: the captured answer.
     text: str | None = None
     # Raw extraction for frequency and quantity items. The model reports what
@@ -112,6 +144,8 @@ def _unclear(out: TurnOut, why: str) -> TurnOut:
                                   "value": None, "per": None, "unit": None,
                                   "beverage": None, "assumed": False,
                                   "boundary": False, "note": ""})
+    # harvest is deliberately absent from that update: what they volunteered is
+    # still true even when what they answered could not be coded.
 
 
 def expected_item(expect):
@@ -121,12 +155,99 @@ def expected_item(expect):
     return BY_KEY[expect.instrument].items[expect.item_index]
 
 
-def validate(out: TurnOut, expect) -> TurnOut:
+# A target key names one answerable thing, in the one spelling that the state
+# view shows the model, validate() checks, and the engine writes through. Three
+# shapes, because there are three places an answer can land:
+#   prescreen.<key>      -> session.prescreen[key]
+#   <instrument>.<index> -> session.responses[instrument][index]
+#   <ask key>            -> session.answers[ask key]
+
+
+def target_item(target: str):
+    """The Item a target names, or None when it does not name a coded one."""
+    head, _, tail = target.rpartition(".")
+    if head == "prescreen":
+        return next((q.item for q in PRE_SCREEN if q.key == tail), None)
+    if head in BY_KEY and tail.isdigit():
+        items = BY_KEY[head].items
+        idx = int(tail)
+        return items[idx] if idx < len(items) else None
+    return None
+
+
+def expect_target(expect) -> str | None:
+    """The target key for the question currently on the table, if it has one."""
+    if expect.kind == "option" and expect.instrument is not None:
+        if expect.instrument == "prescreen":
+            return f"prescreen.{PRE_SCREEN[expect.item_index].key}"
+        return f"{expect.instrument}.{expect.item_index}"
+    if expect.kind in ("open", "number"):
+        return expect.ask_key
+    return None
+
+
+def validate_harvest(out: TurnOut, expect) -> list[Harvest]:
+    """Keep only the volunteered facts that name something real.
+
+    Shape only — whether a target is already answered needs the session, so
+    runtime.record_harvest decides that. A bad entry is dropped on its own and
+    never costs the answer it arrived with.
+    """
+    here = expect_target(expect)
+    kept = []
+    for h in out.harvest:
+        if not h.target or h.target == here:
+            continue          # the answer to the current ask is not a harvest
+        item = target_item(h.target)
+        if item is not None:
+            if isinstance(h.code, int) and 0 <= h.code < len(item.options):
+                kept.append(h)
+            continue
+        # An open target: it must carry words, and we cannot check its key
+        # here — record_harvest drops keys the protocol does not know.
+        if h.text:
+            kept.append(h)
+    return kept
+
+
+_WORD = re.compile(r"[a-z0-9']+")
+# A run this long shared with the pending question is a quotation, not a
+# coincidence — six words of overlap happens, thirteen does not.
+_ECHO_RUN = 7
+
+
+def scrub_reply(reply: str, ask_text: str) -> str:
+    """Drop any sentence of the reply that reads back the pending question.
+
+    The engine speaks the question itself, so a reply that also contains it
+    makes the person hear it twice. Enforced here rather than asked for in the
+    prompt, because the prompt already asks and the model still does it.
+    """
+    if not reply or not ask_text:
+        return reply
+    ask = _WORD.findall(ask_text.lower())
+    if len(ask) < _ECHO_RUN:
+        return reply
+    runs = {tuple(ask[i:i + _ECHO_RUN])
+            for i in range(len(ask) - _ECHO_RUN + 1)}
+    kept = []
+    for sentence in re.split(r"(?<=[.!?])\s+", reply):
+        words = _WORD.findall(sentence.lower())
+        echo = any(tuple(words[i:i + _ECHO_RUN]) in runs
+                   for i in range(len(words) - _ECHO_RUN + 1))
+        if not echo:
+            kept.append(sentence)
+    return " ".join(kept).strip() or ""
+
+
+def validate(out: TurnOut, expect, ask_text: str = "") -> TurnOut:
     """Downgrade anything that is not provably a legal answer to `expect`.
 
     Args:
         out: what the model produced.
         expect: the engine's current expectation.
+        ask_text: the question on the table, so a reply that quotes it back can
+            be stripped before anybody hears it twice.
 
     Returns:
         The same TurnOut when it is legal, otherwise one marked "unclear" with
@@ -136,6 +257,10 @@ def validate(out: TurnOut, expect) -> TurnOut:
     The model's claim to have answered something is never sufficient on its own;
     only what this function admits can move the protocol.
     """
+    out = out.model_copy(update={
+        "reply": scrub_reply(out.reply, ask_text),
+        "harvest": validate_harvest(out, expect),
+    })
     if out.action == "correction":
         # Only the shape can be checked here: the instrument is active and not
         # the pre-screen, the item exists, is not the one being asked right now,

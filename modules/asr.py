@@ -38,7 +38,13 @@ def _clean_text(text: str) -> str:
 def transcribe_array(audio_array: np.ndarray, sample_rate: int = 16000) -> str:
     """Transcribe one utterance. Returns "" when the model recognised nothing."""
     model = get_model()
-    result = model.generate(input=audio_array, fs=sample_rate, language="en")
+    # ITN 开启：量表答案含数字，"seven" 须转成 7
+    result = model.generate(
+        input=audio_array,
+        fs=sample_rate,
+        language="en",
+        use_itn=True,
+    )
     if result and len(result) > 0:
         return _clean_text(result[0]["text"])
     return ""

@@ -219,8 +219,8 @@ requires-dist = [
     { name = "gdown", specifier = ">=5,<6" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.34,<3" },
     { name = "librosa", specifier = "==0.11.0" },
-    { name = "mmcv", url = "https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/mmcv-2.0.1-cp310-cp310-manylinux1_x86_64.whl" },
-    { name = "mmdet", specifier = "==3.1.0" },
+    { name = "mmcv", url = "https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/mmcv-2.1.0-cp310-cp310-manylinux1_x86_64.whl" },
+    { name = "mmdet", specifier = "==3.3.0" },
     { name = "mmengine", specifier = ">=0.10,<0.11" },
     { name = "mmpose", specifier = "==1.1.0" },
     { name = "omegaconf", specifier = ">=2.3,<2.4" },
@@ -233,9 +233,9 @@ requires-dist = [
     { name = "setuptools", specifier = ">=68,<81" },
     { name = "soundfile", specifier = "==0.12.1" },
     { name = "starlette", specifier = ">=0.49.3" },
-    { name = "torch", specifier = "==2.0.1+cu118", index = "https://download.pytorch.org/whl/cu118" },
-    { name = "torchaudio", specifier = "==2.0.2+cu118", index = "https://download.pytorch.org/whl/cu118" },
-    { name = "torchvision", specifier = "==0.15.2+cu118", index = "https://download.pytorch.org/whl/cu118" },
+    { name = "torch", specifier = "==2.1.0+cu121", index = "https://download.pytorch.org/whl/cu121" },
+    { name = "torchaudio", specifier = "==2.1.0+cu121", index = "https://download.pytorch.org/whl/cu121" },
+    { name = "torchvision", specifier = "==0.16.0+cu121", index = "https://download.pytorch.org/whl/cu121" },
     { name = "transformers", specifier = ">=4.40,<4.41" },
     { name = "uvicorn", specifier = ">=0.39.0" },
 ]
@@ -352,16 +352,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/27/fb/576f067976d320f5f0114a8d9fa1215425441bb35627b1993e5afd8111e5/cloudpickle-3.1.2.tar.gz", hash = "sha256:7fda9eb655c9c230dab534f1983763de5835249750e85fbcef43aaa30a9a2414", size = 22330, upload-time = "2025-11-03T09:25:26.604Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/88/39/799be3f2f0f38cc727ee3b4f1445fe6d5e4133064ec2e4115069418a5bb6/cloudpickle-3.1.2-py3-none-any.whl", hash = "sha256:9acb47f6afd73f60dc1df93bb801b472f05ff42fa6c84167d25cb206be1fbf4a", size = 22228, upload-time = "2025-11-03T09:25:25.534Z" },
-]
-
-[[package]]
-name = "cmake"
-version = "4.4.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/02/65/6cd38c1ee4292d4e91a7700ef827afdad365f981589db1750a2b74c84685/cmake-4.4.3.tar.gz", hash = "sha256:b0c2703ec0a624649dd184c0ac5ee4c7f5fe5ef35eb82f9da44f5a0903adb2b6", size = 34936, upload-time = "2026-08-30T12:26:40.394Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/d0/18fe62f0bddc8b9bb71ba55762ee48a224f8344101c34350d969f6e0d327/cmake-4.4.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:bae3c4954623ec4d62e62c70443f0da7988b733111c2871fcc6a31ead5137e20", size = 30231983, upload-time = "2026-08-30T12:26:01.104Z" },
-    { url = "https://files.pythonhosted.org/packages/10/0e/b194362df8e331cc17f39d532e9baa778554cbf87eb9b18fc5c51136cb15/cmake-4.4.3-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:ad3b88073f215841ef3eb45e7c7bab4ee3e7f33b7001e1d1b5454ed3f4eb9c9c", size = 39448030, upload-time = "2026-08-30T12:26:28.222Z" },
 ]
 
 [[package]]
@@ -1013,15 +1003,6 @@ wheels = [
 ]
 
 [[package]]
-name = "lit"
-version = "23.1.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f3/37/be14bf2cabacc40557a03cf4789d9a3335bf515b0ec3a655fdc84cae4779/lit-23.1.0.tar.gz", hash = "sha256:6fd50e0ca6fac61f4a672e9f30154edcab3d17c98aeb8202ac709bc353fe331f", size = 199907, upload-time = "2026-08-25T19:24:32.805Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3e/67/27b6051432c4cc016e50d4b5acb82116b608dd0132de1dd1d6967263588e/lit-23.1.0-py3-none-any.whl", hash = "sha256:6361af7f311092f23f874a45d2db001f3f07dcbf438275809c2fc29d1c1196cc", size = 111215, upload-time = "2026-08-25T19:24:31.022Z" },
-]
-
-[[package]]
 name = "llvmlite"
 version = "0.49.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1103,8 +1084,8 @@ wheels = [
 
 [[package]]
 name = "mmcv"
-version = "2.0.1"
-source = { url = "https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/mmcv-2.0.1-cp310-cp310-manylinux1_x86_64.whl" }
+version = "2.1.0"
+source = { url = "https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/mmcv-2.1.0-cp310-cp310-manylinux1_x86_64.whl" }
 dependencies = [
     { name = "addict" },
     { name = "mmengine" },
@@ -1117,7 +1098,7 @@ dependencies = [
     { name = "yapf" },
 ]
 wheels = [
-    { url = "https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/mmcv-2.0.1-cp310-cp310-manylinux1_x86_64.whl", hash = "sha256:ce17dfab6fce623b4d4e379ef60a8f0196b9c5ded9e0b770623340badea8ee1a" },
+    { url = "https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/mmcv-2.1.0-cp310-cp310-manylinux1_x86_64.whl", hash = "sha256:a95a64e12fa88c568d4384e6d5f42230e9e407e2b052f0b8da2ef859dc079b53" },
 ]
 
 [package.metadata]
@@ -1168,7 +1149,7 @@ provides-extras = ["all", "build", "optional", "tests"]
 
 [[package]]
 name = "mmdet"
-version = "3.1.0"
+version = "3.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "matplotlib" },
@@ -1178,10 +1159,11 @@ dependencies = [
     { name = "shapely" },
     { name = "six" },
     { name = "terminaltables" },
+    { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ed/7f/8a07df0d2848862af78d2378997533267117c6bd131d4c1efb479d9be0bb/mmdet-3.1.0.tar.gz", hash = "sha256:858673319cfdf2e98461862f97b668e6c2e5f68160dab31a8d501fda9a58373c", size = 1117725, upload-time = "2023-06-30T07:43:26.07Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/9e/c897d2fe3c3aa40fd83ea04c6103412cf0bd4db4bb20db4248f5c09673e7/mmdet-3.3.0.tar.gz", hash = "sha256:fe8cc2685d60a2a4f2530a4e92aa6269fe45af93265303a31bf4ea463eb3164f", size = 1249318, upload-time = "2024-01-05T06:25:32.637Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c5/ba/5e9726a4a1c5dd4df1ee8cbdabc9b255215cf94581cd1b5670c8d6c42af5/mmdet-3.1.0-py3-none-any.whl", hash = "sha256:fc3263852331698970d2b23533862806953d0cf8362bcb46cfa6e55982dfd3c5", size = 1987665, upload-time = "2023-06-30T07:43:23.69Z" },
+    { url = "https://files.pythonhosted.org/packages/02/c7/c2d91161c9b3e1c237ea00e9cefb7f4bfe2854769f56025db415b734aedb/mmdet-3.3.0-py3-none-any.whl", hash = "sha256:2e23e291281ac57e7dccf8678e957da45fbe560ce78a1f5ded6afeccd3730f17", size = 2231444, upload-time = "2024-01-05T06:25:30.116Z" },
 ]
 
 [[package]]
@@ -2152,19 +2134,20 @@ wheels = [
 
 [[package]]
 name = "torch"
-version = "2.0.1+cu118"
-source = { registry = "https://download.pytorch.org/whl/cu118" }
+version = "2.1.0+cu121"
+source = { registry = "https://download.pytorch.org/whl/cu121" }
 dependencies = [
     { name = "filelock" },
+    { name = "fsspec" },
     { name = "jinja2" },
     { name = "networkx" },
     { name = "sympy" },
-    { name = "triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "triton" },
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.0.1%2Bcu118-cp310-cp310-linux_x86_64.whl", hash = "sha256:a7a49d459bf4862f64f7bc1a68beccf8881c2fa9f3e0569608e16ba6f85ebf7b", upload-time = "2023-10-06T20:56:06Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torch-2.0.1%2Bcu118-cp310-cp310-win_amd64.whl", hash = "sha256:f58d75619bc96e4322343c030b893613701caa2d6db8017155da226c14171335", upload-time = "2023-10-06T20:57:23Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torch-2.1.0%2Bcu121-cp310-cp310-linux_x86_64.whl", hash = "sha256:0d4e8c52a1fcf5ed6cfc256d9a370fcf4360958fc79d0b08a51d55e70914df46", upload-time = "2023-10-09T03:47:11Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torch-2.1.0%2Bcu121-cp310-cp310-win_amd64.whl", hash = "sha256:6ee083ba804e863af059ea284c1678c1b0628699fb0014c8e043ceed7d4ce930", upload-time = "2023-10-09T03:48:34Z" },
 ]
 
 [[package]]
@@ -2182,20 +2165,20 @@ wheels = [
 
 [[package]]
 name = "torchaudio"
-version = "2.0.2+cu118"
-source = { registry = "https://download.pytorch.org/whl/cu118" }
+version = "2.1.0+cu121"
+source = { registry = "https://download.pytorch.org/whl/cu121" }
 dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.0.2%2Bcu118-cp310-cp310-linux_x86_64.whl", hash = "sha256:26692645ea061a005c57ec581a2d0425210ac6ba9f923edf11cc9b0ef3a111e9", upload-time = "2023-10-06T21:35:03Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchaudio-2.0.2%2Bcu118-cp310-cp310-win_amd64.whl", hash = "sha256:8ad0e93e39ce594a5cc53d46d972fde20b499e69d1e7f765adb33de13cfbab86", upload-time = "2023-10-06T21:35:03Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torchaudio-2.1.0%2Bcu121-cp310-cp310-linux_x86_64.whl", hash = "sha256:676bda4042734eda99bc59b2d7f761f345d3cde0cad492ad34e3aefde688c6d8", upload-time = "2023-10-09T03:59:56Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torchaudio-2.1.0%2Bcu121-cp310-cp310-win_amd64.whl", hash = "sha256:7e4a9a2f899dcd87c9f069a00658e5720bfb45cfe2e8cc944cb4d45104bbf91a", upload-time = "2023-10-09T03:59:56Z" },
 ]
 
 [[package]]
 name = "torchvision"
-version = "0.15.2+cu118"
-source = { registry = "https://download.pytorch.org/whl/cu118" }
+version = "0.16.0+cu121"
+source = { registry = "https://download.pytorch.org/whl/cu121" }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },
@@ -2203,8 +2186,8 @@ dependencies = [
     { name = "torch" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.15.2%2Bcu118-cp310-cp310-linux_x86_64.whl", hash = "sha256:19ca4ab5d6179bbe53cff79df1a855ee6533c2861ddc7389f68349d8b9f8302a", upload-time = "2023-10-06T21:35:27Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu118/torchvision-0.15.2%2Bcu118-cp310-cp310-win_amd64.whl", hash = "sha256:bfd2435d681418bea8dacde2b2cb6e5dd40a0e0243d3631e2b71c10bf9831f39", upload-time = "2023-10-06T21:35:28Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torchvision-0.16.0%2Bcu121-cp310-cp310-linux_x86_64.whl", hash = "sha256:e76e78d0ad43636c9884b3084ffaea8a8b61f21129fbfa456a5fe734f0affea9", upload-time = "2023-10-09T04:00:02Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu121/torchvision-0.16.0%2Bcu121-cp310-cp310-win_amd64.whl", hash = "sha256:7bb32e2c163766045693e557b61f278eb54960e7cab7c5d6037b89847605e26c", upload-time = "2023-10-09T04:00:03Z" },
 ]
 
 [[package]]
@@ -2242,16 +2225,13 @@ wheels = [
 
 [[package]]
 name = "triton"
-version = "2.0.0"
+version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cmake" },
     { name = "filelock" },
-    { name = "lit" },
-    { name = "torch" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ca/31/ff6be541195daf77aa5c72303b2354661a69e717967d44d91eb4f3fdce32/triton-2.0.0-1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:38806ee9663f4b0f7cd64790e96c579374089e58f49aac4a6608121aa55e2505", size = 63268585, upload-time = "2023-03-20T17:32:17.169Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/22/91a8af421c8a8902dde76e6ef3db01b258af16c53d81e8c0d0dc13900a9e/triton-2.1.0-0-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:66439923a30d5d48399b08a9eae10370f6c261a5ec864a64983bae63152d39d7", size = 89215103, upload-time = "2023-09-01T07:26:13.625Z" },
 ]
 
 [[package]]

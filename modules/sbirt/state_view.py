@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from .flow import ARM_INSTRUMENT, ARM_ORDER
 from .instruments import BY_KEY, PRE_SCREEN, _skipped_items
-from .runtime import ClinicalSession, Say, Speak
+from .runtime import ClinicalSession, OPEN_TARGETS, Say, Speak
 
 # Roughly a few hundred tokens, paid on every turn. The tests assert that every
 # reachable protocol state renders within it.
@@ -246,6 +246,37 @@ def _goal_lines(session: ClinicalSession) -> list[str]:
             f"Delivery note: {delivery}."]
 
 
+def _target_key_lines(session: ClinicalSession) -> list[str]:
+    """The spelling of every question that can currently be harvested.
+
+    Without this the model has no vocabulary for a fact about a question that
+    is not the one on the table, and the fact is lost.
+    """
+    lines = [f"  pre-screen: {', '.join('prescreen.' + q.key for q in PRE_SCREEN)}"]
+    for arm in ARM_ORDER:
+        ins_key = ARM_INSTRUMENT[arm]
+        if session.prescreen.get(arm, 0) == 0 and ins_key not in session.responses:
+            continue
+        n = len(BY_KEY[ins_key].items)
+        lines.append(f"  {_TITLE[ins_key]} items: {ins_key}.0 … {ins_key}.{n - 1} "
+                     f"(Q1 is {ins_key}.0)")
+    lines.append("  open questions: " + ", ".join(sorted(OPEN_TARGETS)))
+    return lines
+
+
+def _candidate_lines(session: ClinicalSession) -> list[str]:
+    """What has been volunteered but not yet put to the person for a yes.
+
+    Shown so the model does not harvest the same fact twice, and so it knows
+    the engine is about to read these back rather than ask them.
+    """
+    if not session.candidates:
+        return ["  (nothing yet)"]
+    return [f"  {t}: {c.get('code') if c.get('code') is not None else c.get('text')}"
+            f" — from \"{c.get('quote', '')}\""
+            for t, c in sorted(session.candidates.items())]
+
+
 def _phase_lines(session: ClinicalSession) -> list[str]:
     """Where the session is overall, and who owns the decisions that follow."""
     if session.crisis:
@@ -290,9 +321,11 @@ def render_interview_state(session: ClinicalSession) -> str:
     out.append("[CURRENT GOAL]")
     out.extend(_goal_lines(session))
 
-    # Placeholder for answers volunteered before their question is reached.
-    out.append("[HARVESTED CANDIDATES]")
-    out.append("(none yet — early-answer harvesting lands in a later task)")
+    out.append("[TARGET KEYS — how to name a question you were told about]")
+    out.extend(_target_key_lines(session))
+
+    out.append("[VOLUNTEERED, AWAITING READ-BACK]")
+    out.extend(_candidate_lines(session))
 
     out.append("[PHASE]")
     out.extend(_phase_lines(session))

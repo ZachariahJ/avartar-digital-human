@@ -178,13 +178,32 @@ shows as answered:
 {interview_state}
 
 Read the user's utterance and output ONLY a compact JSON object:
-{{"action": "...", "code": null, "item": null, "slots": {{}}, "text": null, "value": null, "per": null, "unit": null, "beverage": null, "reply": "..."}}
+{{"action": "...", "code": null, "item": null, "slots": {{}}, "text": null, "value": null, "per": null, "unit": null, "beverage": null, "harvest": [], "reply": "..."}}
+
+"harvest" — facts they stated about questions OTHER than the one on the table.
+People answer in paragraphs, and anything you leave out here is lost: the
+engine will ask them for it again as if they had never said it. So whenever
+the utterance settles a question listed under TARGET KEYS above, add an entry:
+  {{"target": "<a key from TARGET KEYS>", "code": <option number>,
+    "text": "<for open questions only>", "quote": "<their own words>"}}
+- Use "code" for pre-screen and instrument items, "text" for open questions.
+- "quote" is what they actually said, short — the engine reads it back to
+  them before it records anything, so it must be recognisably theirs.
+- NEVER harvest the question currently on the table; that is what the fields
+  above are for. Never harvest a question the state shows as answered.
+- Same certainty bar as coding: if it fits more than one option, leave it out.
+- Nothing here is committed on your say-so. Every entry is read back to the
+  person for a yes first, so a harvest is a proposal, not a recording.
 
 action — exactly one of:
   "answer"       it answers the current ask (even partially for slots)
   "continuation" it adds to / completes their PREVIOUS answer instead
   "question"     they are asking YOU something
   "tangent"      an off-topic aside or small talk
+  "discomfort"   they say they are unwell, exhausted, in pain, or that they
+                 cannot face this right now ("i'm not feeling well", "i'm
+                 sick today", "i'm too tired for this") — physical or
+                 emotional, but NOT danger and NOT a request to stop
   "crisis"       ANY sign of self-harm, overdose, danger, acute distress
   "abort"        they clearly want to stop the WHOLE conversation ("stop",
                  "i'm done", "i don't want to do this anymore") — NOT a
@@ -249,6 +268,10 @@ What to put there, by action:
   a standard drink"), just explain it plainly, the way a nurse would.
   If you genuinely do not know, say so in one sentence.
 - tangent: one warm sentence acknowledging what they said, and stop.
+- discomfort: one short sentence naming what they actually said — the
+  specific thing, not the category — and stop. The engine offers to stop
+  for today straight after you, so do not offer it yourself and do not
+  reassure them that it will be quick.
 - continuation: acknowledge the added detail in a few words, and stop.
 - correction: say the new answer back in a few words to confirm it.
 - unclear: name in ONE short sentence exactly what you still need. If their
@@ -395,7 +418,7 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
     """
     pre = _prepass(user_text, expect)
     if pre is not None:
-        return validate_turn(pre, expect)
+        return validate_turn(pre, expect, ask_text=ask_text)
 
     all_facts = dict(facts or {})
     if patient:
@@ -426,7 +449,7 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
             # it has not earned and skipping that confirmation.
             out = out.model_copy(update={"exact": False, "assumed": False,
                                          "boundary": False, "note": ""})
-            return validate_turn(out, expect)
+            return validate_turn(out, expect, ask_text=ask_text)
         except Exception as e:
             # Type only. A pydantic or JSON error message embeds the raw model
             # output, which can quote the patient verbatim into the log.
@@ -445,6 +468,10 @@ _UTTER_SYSTEM = (
     "utterance the INSTRUCTION asks for: one or two sentences, warm, "
     "plain-spoken, conversational, no clinical jargon, no scores or zone "
     "names, no new questions unless the instruction says to ask one. "
+    "Say nothing the conversation above has already said this turn: do not "
+    "restate what the person just told you and do not repeat an "
+    "acknowledgment that has already been given — the last assistant message "
+    "may be the first half of the very utterance you are finishing. "
     "Output only the utterance text."
 )
 

@@ -102,8 +102,8 @@ ASR_MODEL = "iic/SenseVoiceSmall"
 # separate clip cache keys, so neither ever serves the other's cached output.
 ENABLE_VIDEO_AVATAR = 1
 
-MUSETALK_GPUS = [0]
-ASR_GPU = 0
+MUSETALK_GPUS = [1]
+ASR_GPU = 1
 
 # Must match AVATAR_VIDEO's own frame rate. Lip sync survives any value — audio
 # and browser both index by this number — but one driving frame is consumed per
@@ -130,12 +130,8 @@ MUSETALK_JPEG_QUALITY = 82
 # lead. Whether that lead grows or shrinks over an utterance depends on how the
 # deployment's GPU compares with MUSETALK_FPS; measure before changing this.
 STREAM_PREBUFFER_FRAMES = 12
-# How far the wire may trail the audio clock before frames are dropped instead
-# of sent. The clock never waits, so a late frame is one nobody will ever draw:
-# sending it only spends the bandwidth the stream needs to catch back up.
-STREAM_DROP_LAG_FRAMES = 6
 
-VAD_THRESHOLD = 0.5
+VAD_THRESHOLD = 0.65
 VAD_SILENCE_DURATION = 0.35  # silence before speech_end; lower is snappier
 
 # Near-field gate. Silero answers "is this speech", which is not the question
@@ -194,7 +190,7 @@ BARGE_IN_VAD = os.getenv("BARGE_IN_VAD", "1").lower() not in ("0", "false", "no"
 # Continuous voice required before firing. Below ~0.12s this catches lip smacks
 # and chair creaks that survive echo cancellation; above ~0.25s the user hears
 # themselves talking over the avatar.
-BARGE_IN_VAD_SUSTAIN = 0.18
+BARGE_IN_VAD_SUSTAIN = 0.4
 
 STATE_POLL_INTERVAL = 0.1   # how often finished video is pushed to the browser
 
