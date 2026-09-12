@@ -532,33 +532,21 @@ if __name__ == "__main__":
     import uvicorn
 
     try:
-        ssl_kwargs = {}
-        have_certs = os.path.exists(config.SSL_CERT_FILE) and os.path.exists(config.SSL_KEY_FILE)
-        if config.ENABLE_HTTPS and have_certs:
-            ssl_kwargs = {
-                "ssl_certfile": config.SSL_CERT_FILE,
-                "ssl_keyfile": config.SSL_KEY_FILE,
-            }
-            scheme = "https"
-        else:
-            scheme = "http"
-            if config.ENABLE_HTTPS and not have_certs:
-                logger.warning(
-                    "ENABLE_HTTPS is set but certs not found at %s / %s — serving plain HTTP. "
-                    "Microphone will only work via localhost.",
-                    config.SSL_CERT_FILE, config.SSL_KEY_FILE,
-                )
+        for path in (config.SSL_CERT_FILE, config.SSL_KEY_FILE):
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"SSL cert/key not found: {path}")
 
         logger.info(
-            "Serving on %s://%s:%d  (open %s://<your-host>:%d/ from the public internet)",
-            scheme, config.SERVER_HOST, config.SERVER_PORT, scheme, config.SERVER_PORT,
+            "Serving on https://%s:%d  (open https://<your-host>:%d/ from the public internet)",
+            config.SERVER_HOST, config.SERVER_PORT, config.SERVER_PORT,
         )
         uvicorn.run(
             app,
             host=config.SERVER_HOST,
             port=config.SERVER_PORT,
             log_level="info",
-            **ssl_kwargs,
+            ssl_certfile=config.SSL_CERT_FILE,
+            ssl_keyfile=config.SSL_KEY_FILE,
         )
     except KeyboardInterrupt:
         config.SHUTTING_DOWN.set()
