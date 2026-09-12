@@ -198,8 +198,6 @@ async def ws_audio(websocket: WebSocket):
     logger.info("Audio WebSocket client connected")
     session.speech_started_notified = False
     _chunk_count = 0
-    _warmup_needed = int(config.MIC_WARMUP_DISCARD * 16000)
-    _warmup_samples = 0
 
     try:
         while True:
@@ -215,13 +213,6 @@ async def ws_audio(websocket: WebSocket):
                 logger.info(f"[AudioDebug] chunk #{_chunk_count}: len={len(audio_chunk)}, "
                            f"max={np.max(np.abs(audio_chunk))}, "
                            f"rms={np.sqrt(np.mean(audio_chunk.astype(np.float32)**2)):.1f}")
-
-            if _warmup_samples < _warmup_needed:
-                _warmup_samples += len(audio_chunk)
-                if _warmup_samples >= _warmup_needed:
-                    logger.info("[AudioDebug] mic warm-up: discarded %.2fs (%d chunks)",
-                                _warmup_samples / 16000, _chunk_count)
-                continue
 
             event, audio_data = await asyncio.get_running_loop().run_in_executor(
                 None, session.vad.process_chunk, audio_chunk

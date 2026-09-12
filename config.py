@@ -84,8 +84,6 @@ VAD_NEAR_FIELD_RELEASE_DB = float(os.getenv("VAD_NEAR_FIELD_RELEASE_DB", "6"))
 VAD_MIN_LEVEL_DBFS = float(os.getenv("VAD_MIN_LEVEL_DBFS", "-55"))
 VAD_NOISE_FLOOR_INIT_DBFS = float(os.getenv("VAD_NOISE_FLOOR_INIT_DBFS", "-45"))
 
-MIC_WARMUP_DISCARD = float(os.getenv("MIC_WARMUP_DISCARD", "0.5"))
-
 BARGE_IN_VAD = os.getenv("BARGE_IN_VAD", "1").lower() not in ("0", "false", "no")
 BARGE_IN_VAD_SUSTAIN = 0.4
 
