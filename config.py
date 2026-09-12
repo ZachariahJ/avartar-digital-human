@@ -134,15 +134,6 @@ EOU_RECHECK_DURATION = 0.15
 EOU_MAX_SILENCE = 2.0
 EOU_ONNX_THREADS = 2
 
-IDLE_VIDEO_PATH = AVATAR_VIDEO
-
-IDLE_AUDIO_PATH = os.path.join(ASSETS_DIR, "idle_silence.mp3")
-IDLE_AUDIO_DURATION = 2.0
-
-
-def idle_media_path() -> str:
-    return IDLE_VIDEO_PATH if ENABLE_VIDEO_AVATAR else IDLE_AUDIO_PATH
-
 GREETING_PREAMBLE = (
     "Hello, I am an AI assistant designed to help understand some important factors "
     "that may impact your health. This information will be shared with your medical "

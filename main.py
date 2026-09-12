@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import subprocess
 import json
 import asyncio
 import logging
@@ -85,10 +84,9 @@ async def open_session(scope) -> Session:
 
 
 def _app_config() -> dict:
-    idle_name = os.path.basename(config.idle_media_path())
     return {
         "videoAvatar": config.ENABLE_VIDEO_AVATAR,
-        "idleUrl": "/video/assets/" + idle_name,
+        "idleUrl": "/video/assets/" + os.path.basename(config.AVATAR_VIDEO),
         "portraitUrl": "/video/assets/" + os.path.basename(config.AVATAR_IMAGE),
     }
 
@@ -465,27 +463,6 @@ def _warmup_models():
         logger.warning("Model pre-warm failed (will lazy-load on demand): %s", e)
 
 
-def _ensure_idle_media():
-    if config.ENABLE_VIDEO_AVATAR:
-        return
-    if os.path.exists(config.IDLE_AUDIO_PATH):
-        return
-    logger.info("Generating idle silence clip...")
-    os.makedirs(os.path.dirname(config.IDLE_AUDIO_PATH), exist_ok=True)
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "lavfi",
-             "-i", "anullsrc=r=24000:cl=mono",
-             "-t", str(config.IDLE_AUDIO_DURATION),
-             "-c:a", "libmp3lame", "-b:a", "48k",
-             config.IDLE_AUDIO_PATH],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        logger.info("Idle silence saved to %s", config.IDLE_AUDIO_PATH)
-    except (OSError, subprocess.CalledProcessError) as e:
-        logger.warning("Could not generate idle silence: %s", e)
-
-
 def _temp_janitor():
     ttl = config.TEMP_FILE_TTL_SEC
     interval = config.TEMP_CLEAN_INTERVAL_SEC
@@ -555,8 +532,6 @@ if __name__ == "__main__":
     import uvicorn
 
     try:
-        _ensure_idle_media()
-
         ssl_kwargs = {}
         have_certs = os.path.exists(config.SSL_CERT_FILE) and os.path.exists(config.SSL_KEY_FILE)
         if config.ENABLE_HTTPS and have_certs:
