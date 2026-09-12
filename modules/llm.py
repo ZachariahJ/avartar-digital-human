@@ -1,7 +1,6 @@
 
 import json
 import logging
-import re
 import threading
 from openai import OpenAI
 import config
@@ -60,50 +59,6 @@ def extract_patient_facts(history: list[dict]) -> dict:
         return {}
 
 
-
-AMBIGUOUS = "AMBIGUOUS"
-
-_YES_RE = re.compile(r"^\s*(yes|yeah|yep|yup|sure|correct|i do|i have)\b", re.I)
-_NO_RE = re.compile(r"^\s*(no|nope|nah|never|not really|i don'?t|i do not|i haven'?t)\b", re.I)
-
-_WORD_NUMBERS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-}
-_DIGIT_RE = re.compile(r"\b(10|[0-9])\b")
-
-def _prematch_option(options, text: str):
-    t = " ".join(text.strip().lower().split())
-    if not t:
-        return None
-    for i, opt in enumerate(options):
-        if t == opt.label.lower() or t in (a.lower() for a in opt.aliases):
-            return i
-    labels = [o.label for o in options]
-    if labels == ["No", "Yes"] and len(t.split()) <= 3:
-        if _YES_RE.match(t):
-            return 1
-        if _NO_RE.match(t):
-            return 0
-    return None
-
-
-def code_number(user_text: str, low: int = 0, high: int = 10) -> dict:
-    t = user_text.lower()
-    found = {int(m) for m in _DIGIT_RE.findall(t)}
-    found |= {v for w, v in _WORD_NUMBERS.items()
-              if re.search(rf"\b{w}\b", t)}
-    found = {n for n in found if low <= n <= high}
-    if len(found) == 1:
-        return {"value": found.pop()}
-    return {"status": AMBIGUOUS}
-
-
-_CONSENT_YES = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "alright",
-                "all right", "of course", "sure thing", "go ahead",
-                "yes please", "fine", "sounds good"}
-_CONSENT_NO = {"no", "nope", "nah", "no thanks", "no thank you", "not now",
-               "not really", "i'd rather not", "id rather not"}
 
 _TURN_SYSTEM = """You are the natural-language understanding AND the voice of one turn of a
 structured SBIRT health-screening avatar (a VOICE conversation). The clinical
@@ -218,9 +173,11 @@ What to put there, by action:
   a standard drink"), just explain it plainly, the way a nurse would.
   If you genuinely do not know, say so in one sentence.
 - tangent: one warm sentence acknowledging what they said, and stop.
-- discomfort: one short sentence naming what they actually said — the
-  specific thing, not the category — and stop. The engine offers to stop
-  for today straight after you, so do not offer it yourself and do not
+- discomfort: name what they actually said — the specific thing, not the
+  category — and show you care that they feel it: one or two short
+  sentences, warm and plainly human, the way a nurse would. A bare
+  restatement of their words is not enough. Then stop. The engine offers to
+  stop for today straight after you, so do not offer it yourself and do not
   reassure them that it will be quick.
 - continuation: acknowledge the added detail in a few words, and stop.
 - correction: say the new answer back in a few words to confirm it.
@@ -248,7 +205,7 @@ substance use. Those are the engine's, not yours.
 def _expectation_text(expect) -> str:
     kind = expect.kind
     if kind == "consent":
-        return "A yes or no."
+        return ("A yes or no: \"code\" 1 = they agree, 0 = they decline.")
     if kind == "confirm":
         return ("A yes or no: you just read their previous answer back and "
                 "asked if you understood it right. 1 = confirmed, 0 = they "
@@ -294,45 +251,9 @@ def _expectation_text(expect) -> str:
     return "The session has ended; no answer is expected."
 
 
-_DONT_KNOW = {"i don't know", "i dont know", "don't know", "dont know",
-              "dunno", "i dunno", "no idea", "i have no idea", "not sure",
-              "i'm not sure", "im not sure", "i can't remember",
-              "i cant remember", "can't remember", "cant remember",
-              "i don't remember", "i dont remember", "no clue",
-              "i'd rather not say", "id rather not say", "rather not say"}
-
-
-def _prepass(user_text: str, expect) -> TurnOut | None:
-    t = " ".join(user_text.strip().lower().split()).rstrip(".!,")
-    if t in _DONT_KNOW and expect.kind in ("consent", "confirm", "option",
-                                           "number"):
-        return TurnOut(action="dont_know")
-    if expect.kind in ("consent", "confirm"):
-        if t in _CONSENT_YES:
-            return TurnOut(action="answer", code=1, exact=True)
-        if t in _CONSENT_NO:
-            return TurnOut(action="answer", code=0, exact=True)
-        return None
-    if expect.kind == "option":
-        code = _prematch_option(expected_item(expect).options, user_text)
-        if code is not None:
-            return TurnOut(action="answer", code=code, exact=True)
-        return None
-    if expect.kind == "number":
-        got = code_number(user_text)
-        if "value" in got:
-            return TurnOut(action="answer", code=got["value"], exact=True)
-        return None
-    return None
-
-
 def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
          patient: dict | None = None, facts: dict | None = None,
          interview_state: str = "") -> TurnOut:
-    pre = _prepass(user_text, expect)
-    if pre is not None:
-        return validate_turn(pre, expect, ask_text=ask_text)
-
     all_facts = dict(facts or {})
     if patient:
         all_facts["patient"] = patient
@@ -354,7 +275,8 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
                 raise ValueError("no JSON object in turn output")
             out = TurnOut.model_validate_json(raw[start:end + 1])
             out = out.model_copy(update={"exact": False, "assumed": False,
-                                         "boundary": False, "note": ""})
+                                         "boundary": False, "note": "",
+                                         "unusable": False})
             return validate_turn(out, expect, ask_text=ask_text)
         except Exception as e:
             logger.info("turn() attempt %d failed (%s)",
@@ -362,7 +284,9 @@ def turn(user_text: str, expect, *, ask_text: str, history: list[dict],
             messages.append({"role": "user", "content":
                              "Your last output was invalid. Output ONLY the "
                              "JSON object described, nothing else."})
-    return TurnOut(action="unclear", reply="")
+    # Two bad outputs in a row is the engine failing to read them, not the
+    # person failing to answer.
+    return TurnOut(action="unclear", reply="", unusable=True)
 
 
 _UTTER_SYSTEM = (

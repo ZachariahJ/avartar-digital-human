@@ -4,7 +4,7 @@ import hashlib
 import threading
 from dotenv import load_dotenv
 
-from modules.sbirt import build_system_prompt, templates
+from modules.sbirt import templates
 
 load_dotenv()
 
@@ -52,7 +52,6 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL = "google/gemini-2.5-flash"
 
-SYSTEM_PROMPT = build_system_prompt()
 
 TTS_VOICE = "en-US-GuyNeural"
 TTS_RATE = "-10%"
@@ -87,16 +86,20 @@ VAD_NOISE_FLOOR_INIT_DBFS = float(os.getenv("VAD_NOISE_FLOOR_INIT_DBFS", "-45"))
 
 MIC_WARMUP_DISCARD = float(os.getenv("MIC_WARMUP_DISCARD", "0.5"))
 
-BARGE_IN_ASR = os.getenv("BARGE_IN_ASR", "1").lower() not in ("0", "false", "no")
-BARGE_IN_MIN_SPEECH = 0.30
-BARGE_IN_RECHECK = 0.20
-
 BARGE_IN_VAD = os.getenv("BARGE_IN_VAD", "1").lower() not in ("0", "false", "no")
 BARGE_IN_VAD_SUSTAIN = 0.4
 
 STATE_POLL_INTERVAL = 0.1
 
 LLM_HISTORY_MAX_MESSAGES = 20
+
+DIALOG_TICK_SEC = 0.1
+
+# How long the runner waits for a floor hand-off that may never complete: a
+# speech_start the near-field gate rejects yields no speech_end, and a dead ASR
+# or NLU thread yields no turn. Generous enough never to cut a real speaker off.
+FLOOR_USER_MAX_SEC = 30.0
+FLOOR_PENDING_MAX_SEC = 20.0
 
 TEMP_FILE_TTL_SEC = 180
 TEMP_CLEAN_INTERVAL_SEC = 30
@@ -131,8 +134,6 @@ EOU_RECHECK_DURATION = 0.15
 EOU_MAX_SILENCE = 2.0
 EOU_ONNX_THREADS = 2
 
-SESSION_IDLE_TTL_SEC = 600
-
 IDLE_VIDEO_PATH = AVATAR_VIDEO
 
 IDLE_AUDIO_PATH = os.path.join(ASSETS_DIR, "idle_silence.mp3")
@@ -148,13 +149,11 @@ GREETING_PREAMBLE = (
     "provider to help your provider better understand your current health issues. "
     "Your answers will be treated as confidential and as protected health information. "
 )
-CONSENT_QUESTION = templates.FIXED["consent.opening"]
-GREETING_TEXT = GREETING_PREAMBLE + CONSENT_QUESTION
+GREETING_TEXT = GREETING_PREAMBLE + templates.FIXED["consent.opening"]
 GREETING_CLIP_KEY = "greeting"
 
 SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.getenv("SERVER_PORT", "17861"))
-WS_PORT = int(os.getenv("WS_PORT", "17862"))
 
 SSL_CERT_FILE = os.getenv("SSL_CERT_FILE", os.path.join(CERTS_DIR, "cert.pem"))
 SSL_KEY_FILE = os.getenv("SSL_KEY_FILE", os.path.join(CERTS_DIR, "key.pem"))

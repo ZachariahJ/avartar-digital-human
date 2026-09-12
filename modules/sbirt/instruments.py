@@ -64,25 +64,6 @@ class Instrument:
     preamble: str = ""
     skip_rules: tuple[SkipRule, ...] = ()
 
-    def render(self) -> str:
-        lines = [f"### {self.name}  ({self.domain}, {len(self.items)} items)",
-                 f"When to use: {self.when_to_use}",
-                 f"Response scale: {self.response_scale}",
-                 "Items:"]
-        for i, item in enumerate(self.items, 1):
-            if isinstance(item, str):
-                lines.append(f"  {i}. {item}")
-            else:
-                opts = " / ".join(f"{o.score}={o.label}" for o in item.options)
-                line = f"  {i}. {item.text}  [{opts}]"
-                if item.note:
-                    line += f"  ({item.note})"
-                lines.append(line)
-        lines.append(f"Scoring: {self.scoring}")
-        lines.append("Risk bands → action:")
-        lines += [f"  • {b.low}–{b.high}: {b.label} → {b.action}" for b in self.bands]
-        return "\n".join(lines)
-
 
 def risk_band_for(instrument: Instrument, score: int) -> RiskBand | None:
     for band in instrument.bands:
@@ -131,44 +112,6 @@ PRE_SCREEN: tuple[PreScreenQuestion, ...] = (
     )),
 )
 
-
-NIDA_QUICK_SCREEN = Instrument(
-    key="nida_quick",
-    name="NIDA Quick Screen (pre-screen)",
-    domain="combined",
-    when_to_use="Reference only — this app administers the study's own 3-question pre-screen.",
-    items=(
-        "In the PAST YEAR, how often have you had 5+ (men) / 4+ (women) drinks in a day?",
-        "In the past year, how often have you used tobacco products?",
-        "In the past year, how often have you used prescription drugs for non-medical reasons?",
-        "In the past year, how often have you used an illegal drug?",
-    ),
-    response_scale="Never / Once or twice / Monthly / Weekly / Daily-or-almost-daily",
-    scoring="Any answer above 'Never' is a positive pre-screen for that substance class.",
-    bands=(
-        RiskBand("No use reported", 0, 0, "Affirm, brief education, close screen"),
-        RiskBand("Any use reported", 1, 1, "Open the matching full instrument below"),
-    ),
-)
-
-AUDIT_C = Instrument(
-    key="audit_c",
-    name="AUDIT-C (alcohol, brief)",
-    domain="alcohol",
-    when_to_use="Positive alcohol pre-screen; fast alcohol risk triage.",
-    items=(
-        "How often did you have a drink containing alcohol in the past year? (0–4)",
-        "How many standard drinks on a typical drinking day? (0–4)",
-        "How often did you have 6+ drinks on one occasion? (0–4)",
-    ),
-    response_scale="Each item 0–4",
-    scoring="Sum items (0–12).",
-    bands=(
-        RiskBand("Low risk", 0, 2, "Positive feedback, done"),
-        RiskBand("Positive screen (≥3 women / ≥4 men)", 3, 7, "Give full AUDIT or brief intervention"),
-        RiskBand("Strong positive", 8, 12, "Brief intervention + consider referral"),
-    ),
-)
 
 AUDIT = Instrument(
     key="audit",
@@ -282,80 +225,9 @@ DAST_10 = Instrument(
     ),
 )
 
-CAGE_AID = Instrument(
-    key="cage_aid",
-    name="CAGE-AID (alcohol + drugs, ultra-brief)",
-    domain="combined",
-    when_to_use="Very fast lifetime dependence flag when time is short.",
-    items=(
-        "Felt you ought to CUT down on drinking/drug use?",
-        "Have people ANNOYED you by criticizing your drinking/drug use?",
-        "Felt bad or GUILTY about your drinking/drug use?",
-        "Ever had a drink/used drugs first thing (EYE-opener) to steady nerves?",
-    ),
-    response_scale="Yes/No",
-    scoring="Count 'Yes' (0–4).",
-    bands=(
-        RiskBand("Negative", 0, 1, "Continue routine screening"),
-        RiskBand("Clinically significant", 2, 4, "Full assessment + brief intervention/referral"),
-    ),
-)
 
-TAPS = Instrument(
-    key="taps",
-    name="TAPS (Tobacco, Alcohol, Prescription, Substance)",
-    domain="combined",
-    when_to_use="One brief pass across all four substance classes in primary care.",
-    items=(
-        "Past-12-month use frequency: Tobacco",
-        "Past-12-month use frequency: Alcohol",
-        "Past-12-month use frequency: illicit/street drugs",
-        "Past-12-month use frequency: prescription meds used non-medically",
-    ),
-    response_scale="Daily / Weekly / Monthly / Less-than-monthly / Never",
-    scoring="Any 'Monthly or more' triggers substance-specific follow-up items.",
-    bands=(
-        RiskBand("No problem use", 0, 0, "Affirm"),
-        RiskBand("Problem use / higher risk", 1, 1, "Brief intervention or referral by substance"),
-    ),
-)
+BY_KEY = {ins.key: ins for ins in (AUDIT, DAST_10)}
 
-CRAFFT = Instrument(
-    key="crafft",
-    name="CRAFFT 2.1 (adolescents ≤21)",
-    domain="adolescent",
-    when_to_use="Screen users aged 12–21. Use INSTEAD of adult tools.",
-    items=(
-        "Ridden in a CAR driven by someone (incl. self) who was high/using?",
-        "Use substances to RELAX, feel better, or fit in?",
-        "Use substances while by yourself, ALONE?",
-        "FORGET things you did while using?",
-        "FAMILY/friends tell you to cut down?",
-        "Gotten into TROUBLE while using?",
-    ),
-    response_scale="Yes/No",
-    scoring="Count 'Yes' (0–6).",
-    bands=(
-        RiskBand("Low risk", 0, 1, "Praise, encouragement"),
-        RiskBand("Positive – higher risk", 2, 6, "Brief intervention + consider referral"),
-    ),
-)
-
-ALL_INSTRUMENTS: tuple[Instrument, ...] = (
-    NIDA_QUICK_SCREEN,
-    AUDIT_C,
-    AUDIT,
-    DAST_10,
-    CAGE_AID,
-    TAPS,
-    CRAFFT,
-)
-
-BY_KEY = {ins.key: ins for ins in ALL_INSTRUMENTS}
-
-
-def render_catalog() -> str:
-    return "\n\n".join(ins.render() for ins in ALL_INSTRUMENTS)
 
 
 

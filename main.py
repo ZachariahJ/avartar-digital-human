@@ -1,6 +1,5 @@
 import os
 import sys
-import re
 import time
 import subprocess
 import json
@@ -27,7 +26,7 @@ from starlette.staticfiles import StaticFiles
 
 from modules.pipeline import Pipeline
 from modules.vad import VoiceActivityDetector
-from modules import asr, clipcache, privacy
+from modules import asr, clipcache
 
 BASE_DIR = config.BASE_DIR
 
@@ -35,19 +34,18 @@ BASE_DIR = config.BASE_DIR
 class Session:
 
     def __init__(self, sid: str = "default"):
+        self.sid = sid
         self.pipeline = Pipeline(audit_key=sid)
         self.vad = VoiceActivityDetector()
         self.mic_enabled = False
         self.speech_started_notified = False
         self.barge_done = False
-        self.barge_last_n = 0
         self.state_clients: set[WebSocket] = set()
         self.last_state = None
         self.active_seg = None
         self.seg_id = 0
         self.seg_frames = 0
         self.sent_chat: list = []
-        self.empty_since = None
 
 
 sessions: dict[str, Session] = {}
@@ -64,7 +62,24 @@ def get_or_create_session(sid: str) -> Session:
         return s
 
 
-async def session_for(scope) -> Session:
+def _drop_session(session: Session) -> None:
+    # Dropped on disconnect: a reload or a closed tab starts a new
+    # conversation rather than inheriting a stale one.
+    session.mic_enabled = False
+    session.pipeline.close()
+    with _sessions_lock:
+        if sessions.get(session.sid) is session:
+            del sessions[session.sid]
+    logger.info("Dropped session %s (total sessions: %d)", session.sid, len(sessions))
+
+
+async def session_for(scope) -> Session | None:
+    # Look up, never create: only pressing Start may open a session.
+    with _sessions_lock:
+        return sessions.get(scope.query_params.get("sid") or "default")
+
+
+async def open_session(scope) -> Session:
     sid = scope.query_params.get("sid") or "default"
     return await asyncio.get_running_loop().run_in_executor(None, get_or_create_session, sid)
 
@@ -116,16 +131,27 @@ async def serve_media(request: Request):
 
 async def api_toggle(request: Request):
     session = await session_for(request)
+    if session is None:
+        session = await open_session(request)
+        session.mic_enabled = True
+        logger.info("Mic toggled: on (session %s opened)", session.sid)
+        return JSONResponse({"mic": "on"})
     session.mic_enabled = not session.mic_enabled
     status = "on" if session.mic_enabled else "off"
     if not session.mic_enabled:
         session.pipeline.cancel_response()
+        # A refused microphone leaves no state socket to close, so the
+        # session would otherwise be held forever.
+        if not session.state_clients:
+            _drop_session(session)
     logger.info(f"Mic toggled: {status}")
     return JSONResponse({"mic": status})
 
 
 async def api_greet(request: Request):
     session = await session_for(request)
+    if session is None:
+        return JSONResponse({"error": "no session"}, status_code=409)
     p = session.pipeline
     if session.mic_enabled and not p.chat_history:
         p.start_greeting()
@@ -133,11 +159,11 @@ async def api_greet(request: Request):
 
 
 async def api_reset(request: Request):
+    # Clear behaves like a reload: the whole session goes, so nothing is
+    # shared between the old one and the next.
     session = await session_for(request)
-    await asyncio.get_running_loop().run_in_executor(None, session.pipeline.reset)
-    session.mic_enabled = False
-    session.sent_chat = []
-    await broadcast(session.state_clients, {"type": "reset"})
+    if session is not None:
+        _drop_session(session)
     return JSONResponse({"status": "ok", "mic": "off"})
 
 
@@ -148,23 +174,11 @@ async def api_text(request: Request):
         return JSONResponse({"error": "empty"}, status_code=400)
 
     session = await session_for(request)
+    if session is None:
+        return JSONResponse({"error": "no session"}, status_code=409)
     session.pipeline.on_speech_start()
     threading.Thread(target=session.pipeline.on_speech_end_text, args=(text,), daemon=True).start()
     return JSONResponse({"status": "processing"})
-
-
-def _looks_like_echo(text: str, pipeline) -> bool:
-    def norm(s):
-        return " ".join(_word_re.sub(" ", s.lower()).split())
-    u = norm(text)
-    if not u:
-        return True
-    resp = ""
-    for m in reversed(pipeline.chat_history):
-        if m.get("role") == "assistant":
-            resp = m.get("content", "")
-            break
-    return u in norm(resp)
 
 
 async def _barge_in(session: Session, reason: str):
@@ -180,6 +194,9 @@ async def ws_audio(websocket: WebSocket):
         await websocket.close()
         return
     session = await session_for(websocket)
+    if session is None:
+        await websocket.close()
+        return
     logger.info("Audio WebSocket client connected")
     session.speech_started_notified = False
     _chunk_count = 0
@@ -214,39 +231,19 @@ async def ws_audio(websocket: WebSocket):
 
             speaking = session.pipeline.state in ("processing", "speaking")
 
-            if config.BARGE_IN_VAD and speaking and not session.barge_done:
+            if config.BARGE_IN_VAD and speaking:
                 pending = session.vad.pending_audio()
-                if pending is not None and \
+                if pending is None:
+                    session.barge_done = False
+                elif not session.barge_done and \
                         len(pending) >= int(config.BARGE_IN_VAD_SUSTAIN * 16000):
                     session.barge_done = True
                     session.speech_started_notified = True
                     await _barge_in(session, "%.0fms sustained voice"
                                     % (config.BARGE_IN_VAD_SUSTAIN * 1000))
                     continue
-
-            if config.BARGE_IN_ASR and speaking:
-                pending = session.vad.pending_audio()
-                if pending is None:
-                    session.barge_done = False
-                    session.barge_last_n = 0
-                elif not session.barge_done:
-                    n = len(pending)
-                    first = int(config.BARGE_IN_MIN_SPEECH * 16000)
-                    step = int(config.BARGE_IN_RECHECK * 16000)
-                    due = (n >= first) if session.barge_last_n == 0 \
-                        else (n >= session.barge_last_n + step)
-                    if due:
-                        session.barge_last_n = n
-                        text = await asyncio.get_running_loop().run_in_executor(
-                            None, asr.transcribe_array, pending)
-                        if text.strip() and not _looks_like_echo(text, session.pipeline):
-                            session.barge_done = True
-                            session.speech_started_notified = True
-                            await _barge_in(session, "ASR confirmed: %s"
-                                            % privacy.phi(text))
             else:
                 session.barge_done = False
-                session.barge_last_n = 0
 
             if event == "speech_start" and not session.speech_started_notified:
                 session.speech_started_notified = True
@@ -255,7 +252,6 @@ async def ws_audio(websocket: WebSocket):
             elif event == "speech_end":
                 session.speech_started_notified = False
                 session.barge_done = False
-                session.barge_last_n = 0
                 duration = len(audio_data) / 16000
                 rms = np.sqrt(np.mean(audio_data**2))
                 logger.info(f"[AudioDebug] speech_end: duration={duration:.2f}s, "
@@ -272,8 +268,10 @@ async def ws_state(websocket: WebSocket):
         await websocket.close()
         return
     session = await session_for(websocket)
+    if session is None:
+        await websocket.close()
+        return
     session.state_clients.add(websocket)
-    session.empty_since = None
     logger.info(f"State WebSocket client connected (session clients: {len(session.state_clients)})")
     try:
         chat = session.pipeline.get_chat_history()
@@ -290,9 +288,9 @@ async def ws_state(websocket: WebSocket):
         pass
     finally:
         session.state_clients.discard(websocket)
-        if not session.state_clients:
-            session.empty_since = time.time()
         logger.info(f"State WebSocket client disconnected (session clients: {len(session.state_clients)})")
+        if not session.state_clients:
+            _drop_session(session)
 
 
 async def broadcast(clients: set, msg: dict):
@@ -364,6 +362,7 @@ async def _pump_segments(session: Session):
             if frame is None:
                 await broadcast(clients, {"type": "segment_end", "id": session.seg_id,
                                           "frames": session.seg_frames})
+                seg.delivered.set()
                 session.active_seg = None
                 break
             await broadcast_bytes(
@@ -466,21 +465,6 @@ def _warmup_models():
         logger.warning("Model pre-warm failed (will lazy-load on demand): %s", e)
 
 
-def _reap_idle_sessions():
-    grace = config.SESSION_IDLE_TTL_SEC
-    now = time.time()
-    with _sessions_lock:
-        for sid in list(sessions.keys()):
-            if sid == "default":
-                continue
-            s = sessions[sid]
-            if (not s.state_clients
-                    and s.empty_since and now - s.empty_since > grace):
-                s.pipeline.cancel_response()
-                del sessions[sid]
-                logger.info("Reaped idle session %s (total sessions: %d)", sid, len(sessions))
-
-
 def _ensure_idle_media():
     if config.ENABLE_VIDEO_AVATAR:
         return
@@ -530,7 +514,6 @@ def _temp_janitor():
             if expired:
                 logger.info("[janitor] expired %d media blobs; %s",
                             expired, clipcache.stats())
-            _reap_idle_sessions()
         except Exception:
             logger.exception("temp janitor iteration failed; continuing")
         config.SHUTTING_DOWN.wait(interval)

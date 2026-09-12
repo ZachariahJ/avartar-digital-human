@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Literal
 
@@ -8,6 +9,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import coding
 from .instruments import BY_KEY, PRE_SCREEN
+
+logger = logging.getLogger(__name__)
 
 Action = Literal["answer", "continuation", "question", "tangent", "discomfort",
                  "crisis", "abort", "correction", "dont_know", "unclear"]
@@ -42,6 +45,7 @@ class TurnOut(BaseModel):
     assumed: bool = False
     boundary: bool = False
     note: str = ""
+    unusable: bool = False
 
     @field_validator("reply", "text", mode="before")
     @classmethod
@@ -50,11 +54,20 @@ class TurnOut(BaseModel):
 
 
 def _unclear(out: TurnOut, why: str) -> TurnOut:
+    """Downgrade an answer whose payload does not fit the field.
+
+    Every caller is a shape the engine cannot use, never the model judging the
+    person to be vague — that judgement arrives as action "unclear" and never
+    reaches here. So this is our failure, and `unusable` says so: it must not
+    be charged to the person's budget for answering.
+    """
+    logger.info("[turn] unusable output: %s", why)
     return out.model_copy(update={"action": "unclear", "code": None,
                                   "item": None, "slots": {}, "text": None,
                                   "value": None, "per": None, "unit": None,
                                   "beverage": None, "assumed": False,
-                                  "boundary": False, "note": ""})
+                                  "boundary": False, "note": "",
+                                  "unusable": True})
 
 
 def expected_item(expect):

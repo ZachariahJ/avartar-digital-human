@@ -1,9 +1,21 @@
+"""Shows the model the whole interview, not just the question in front of it.
+
+A model that can only see the current item cannot answer "how many are left",
+"what is this for" or "didn't I already tell you that" — and a model that cannot
+answer those invents an answer. Everything here is a pure read of the session,
+re-rendered in full every turn, so it cannot go stale.
+
+No patient content: answered items appear as their code and official option
+label, open captures only as having been captured.
+"""
 
 from __future__ import annotations
 
-from .flow import ARM_INSTRUMENT, ARM_ORDER
+from . import voice
+from .form import ARM_INSTRUMENT, ARM_ORDER, arm_finished
 from .instruments import BY_KEY, PRE_SCREEN, _skipped_items
-from .runtime import ClinicalSession, OPEN_TARGETS, Say, Speak
+from .runtime import ClinicalSession, OPEN_TARGETS
+from .select import answerable
 
 MAX_CHARS = 3000
 
@@ -50,7 +62,7 @@ def _arm_lines(session: ClinicalSession) -> list[str]:
             status = "skipped (pre-screen negative)"
         elif arm == session.arm:
             status = "ACTIVE"
-        elif arm in session.arms:
+        elif not arm_finished(arm)(session):
             status = "up next"
         elif ins_key in session.assessments:
             a = session.assessments[ins_key]
@@ -121,7 +133,10 @@ def _item_lines(session: ClinicalSession, ins_key: str) -> list[str]:
 
 def _next_line(session: ClinicalSession) -> str:
     rest = ", ".join(f"{a} → {_TITLE[ARM_INSTRUMENT[a]]}"
-                     for a in session.arms)
+                     for a in ARM_ORDER
+                     if a != session.arm
+                     and session.prescreen.get(a, 0) > 0
+                     and not arm_finished(a)(session))
     tail = f" → then {rest}" if rest else ""
     if session.node.startswith("bi.") or session.node.startswith("confirm.bi"):
         return (f"Then: finish the brief intervention{tail} → closing → "
@@ -143,15 +158,15 @@ def _ask_text(session: ClinicalSession) -> tuple[str, str]:
                 else BY_KEY[exp.instrument].items[exp.item_index])
         return item.text, ("the engine speaks this stem verbatim, including "
                            "right after your reply — never write it yourself")
-    step = session.last_step
-    if step is not None:
-        for u in reversed(step.utterances):
-            if isinstance(u, Say):
-                return u.text, ("the engine speaks this line verbatim, "
-                                "including right after your reply — never "
-                                "write it yourself")
-            if isinstance(u, Speak):
-                return u.text, "this read-back was already spoken this turn"
+    fld = answerable(session)
+    if fld is not None:
+        if fld.kind == "confirm":
+            return (voice.ask_text(session, fld),
+                    "this read-back was already spoken this turn")
+        text = voice.ask_text(session, fld)
+        if text:
+            return text, ("the engine speaks this line verbatim, including "
+                          "right after your reply — never write it yourself")
     return ("(the ask was composed by the LLM in its own words this turn)",
             "already spoken")
 

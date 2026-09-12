@@ -10,37 +10,46 @@ from collections import deque
 import numpy as np
 
 import config
-from modules import asr, clipcache, llm, tts, privacy
+from modules import asr, clipcache, dialog, llm, tts
 from modules.privacy import phi, phi_keys
-from modules.sbirt import runtime, state_view, templates
-from modules.sbirt.instruments import BY_KEY, InvalidResponse, PRE_SCREEN
+from modules.sbirt import runtime, select as sel, state_view, templates
+from modules.sbirt.instruments import BY_KEY
 
 logger = logging.getLogger(__name__)
 
 
 class Segment:
 
-    __slots__ = ("sentence", "audio_url", "fps", "frames", "started",
-                 "cancelled", "_t_enqueue")
+    """One synthesized utterance and the frames that lip-sync it.
+
+    `delivered` is set by the pump when it broadcasts segment_end, which is the
+    only honest evidence that the audio left the server for a live socket. The
+    voiced ledger is committed on that rather than on the render finishing,
+    because a rendered segment still sitting in the queue is cancelled by a
+    flush and was never heard.
+    """
+
+    __slots__ = ("sentence", "audio_url", "fps", "frames",
+                 "cancelled", "delivered", "_t_enqueue")
 
     def __init__(self, sentence: str = ""):
         self.sentence = sentence
         self.audio_url = None
         self.fps = config.MUSETALK_FPS
         self.frames = queue.Queue()
-        self.started = threading.Event()
         self.cancelled = threading.Event()
+        self.delivered = threading.Event()
         self._t_enqueue = 0.0
 
     def open(self, audio_url: str):
         self.audio_url = audio_url
-        self.started.set()
 
     def close(self):
         self.frames.put(None)
 
     def cancel(self):
         self.cancelled.set()
+        self.delivered.set()
         self.frames.put(None)
 
 
@@ -229,7 +238,17 @@ def prewarm_fixed_clips():
                     cached, total, skipped, clipcache.stats())
 
 
+
+
 class Pipeline:
+    """Media, history and the browser-facing state. No clinical decisions.
+
+    Everything about which question comes next now lives in DialogRunner, which
+    owns the session on its own thread. That is what retired the protocol lock:
+    it used to be held across the model call, the TTS round-trip and a
+    multi-second render, so a second utterance queued behind a render instead of
+    superseding it.
+    """
 
     def __init__(self, audit_key: str = "default"):
         self.audit_key = audit_key
@@ -242,23 +261,32 @@ class Pipeline:
         self.dynamic_renders = 0
         self.fixed_renders = 0
         self.clinical = runtime.ClinicalSession()
-        runtime.start(self.clinical)
         self._lock = threading.Lock()
-        self._protocol_lock = threading.Lock()
-        self._processing_thread = None
-        self._turn = 0
+        self._epoch_lock = threading.Lock()
+        self._epoch = 0
         self._t0 = 0.0
         self._carry_lock = threading.Lock()
         self._pending_voice = None
         self._carry_audio = None
         self._live_lock = threading.Lock()
         self._live: list[Segment] = []
+        self.runner = dialog.DialogRunner(self, self.clinical)
 
-    def _new_segment(self, sentence: str) -> Segment:
-        seg = Segment(sentence)
+    # --- segments -----------------------------------------------------------
+
+    def _track(self, seg: Segment) -> Segment:
+        """Register a segment so a barge-in can cancel it.
+
+        Cached clips used to skip this and were only reachable through the queue
+        drain, so one already being pumped survived the flush that was supposed
+        to stop it.
+        """
         with self._live_lock:
             self._live.append(seg)
         return seg
+
+    def _new_segment(self, sentence: str) -> Segment:
+        return self._track(Segment(sentence))
 
     def _enqueue(self, seg: Segment):
         seg._t_enqueue = time.perf_counter()
@@ -278,115 +306,179 @@ class Pipeline:
             if isinstance(item, Segment):
                 item.cancel()
 
-    def _aborted(self, turn):
-        return self.cancel_event.is_set() or turn != self._turn
+    def get_next_video(self):
+        try:
+            item = self.video_queue.get_nowait()
+            if item is None:
+                self.state = "idle"
+                return False
+            return item
+        except queue.Empty:
+            return None
 
-    def _consume_utterance(self, turn):
-        with self._carry_lock:
-            if self._pending_voice is not None and self._pending_voice[0] == turn:
-                self._pending_voice = None
+    def end_response(self):
+        """Close the current response so the browser stops waiting for frames.
 
-    def _clear_carry(self):
-        with self._carry_lock:
-            self._pending_voice = self._carry_audio = None
+        Emitted when the runner stops delivering rather than after each unit, so
+        a question that follows a piece of education does not make the avatar
+        blink back to idle in between.
+        """
+        self.video_queue.put(None)
+
+    def session_ended(self):
+        self.ended = True
+
+    # --- epochs -------------------------------------------------------------
+
+    def _bump_epoch(self) -> int:
+        """Invalidate work in flight.
+
+        Guarded because three threads reach it — the event loop on a barge-in,
+        a worker on reset, and the HTTP handler on stop — and a bare += lost
+        increments.
+        """
+        with self._epoch_lock:
+            self._epoch += 1
+            return self._epoch
+
+    def _superseded(self, epoch) -> bool:
+        return epoch != self._epoch
+
+    def ready_to_speak(self) -> bool:
+        """Delivery cannot succeed while a cancel stands, and trying spins
+        the tick loop."""
+        return not self.cancel_event.is_set()
+
+    def floor_returned(self) -> None:
+        """The runner owns the turn again, so no cancel may still stand.
+
+        Clearing it here rather than at speech_end is what keeps the gap
+        between the two closed: until the runner has the floor back, nothing it
+        might deliver is wanted. It also bounds the cancel's life — a
+        speech_start the near-field gate rejects produces no speech_end, and
+        the cancel it set used to outlive the session.
+        """
+        self.cancel_event.clear()
+        if self.state == "listening":
+            self.state = "idle"
+
+    # --- speech in ----------------------------------------------------------
 
     def on_speech_start(self):
         note_activity()
+        self.runner.floor_taken()
         if self.state in ("processing", "speaking"):
             logger.info("Barge-in detected! Cancelling current response.")
             with self._carry_lock:
                 pv = self._pending_voice
-                if pv is not None and pv[0] == self._turn:
+                if pv is not None and pv[0] == self._epoch:
                     self._carry_audio, self._pending_voice = pv[1], None
                     logger.info("[continuation] pause-split: carrying the "
                                 "unconsumed first half into the next utterance")
             self.cancel_event.set()
-            self._turn += 1
+            self._bump_epoch()
             self._flush()
-
+            self.runner.interrupted()
         self.state = "listening"
 
     def cancel_response(self):
         if self.state in ("processing", "speaking"):
             self.cancel_event.set()
-            self._turn += 1
+            self._bump_epoch()
             self._flush()
+            self.runner.interrupted()
+            self.cancel_event.clear()
         self._clear_carry()
         self.state = "idle"
 
     def on_speech_end(self, audio_array):
-        self._t0 = time.perf_counter()
         with self._carry_lock:
             if self._carry_audio is not None:
                 audio_array = np.concatenate([self._carry_audio, audio_array])
                 self._carry_audio = None
                 logger.info("[continuation] resumed after a pause: merged "
                             "utterance is now %.2fs", len(audio_array) / 16000)
-        self.state = "processing"
-        self.cancel_event.clear()
-        self._turn += 1
-        turn = self._turn
-        with self._carry_lock:
-            self._pending_voice = (turn, audio_array)
+        self._start_turn(audio_array)
 
+    def _start_turn(self, audio_array):
+        self._t0 = time.perf_counter()
+        self.state = "processing"
+        self.runner.floor_pending()
+        epoch = self._bump_epoch()
+        with self._carry_lock:
+            self._pending_voice = (epoch, audio_array)
         _turn_begin()
-        self._processing_thread = threading.Thread(
-            target=self._process_speech, args=(audio_array, turn), daemon=True
-        )
-        self._processing_thread.start()
+        threading.Thread(target=self._transcribe, args=(audio_array, epoch),
+                         name="asr", daemon=True).start()
 
     def on_speech_end_text(self, text):
         self._t0 = time.perf_counter()
         self._clear_carry()
         self.state = "processing"
-        self.cancel_event.clear()
-        self._turn += 1
-        turn = self._turn
+        self._bump_epoch()
+        self.runner.user_said(text)
 
-        _turn_begin()
-        self._processing_thread = threading.Thread(
-            target=self._process_text, args=(text, turn), daemon=True
-        )
-        self._processing_thread.start()
+    def _transcribe(self, audio_array, epoch):
+        try:
+            text = asr.transcribe_array(audio_array, sample_rate=16000)
+            logger.info("[latency] ASR done at +%.2fs -> %s",
+                        time.perf_counter() - self._t0, phi(text))
+            if self._superseded(epoch):
+                return
+            self._consume_utterance(epoch)
+            if not text.strip():
+                # Nothing was actually said. The runner keeps whatever it still
+                # owes, so a phantom barge-in costs a pause rather than a
+                # question.
+                self.state = "idle"
+                self.runner.floor_released()
+                return
+            self.runner.user_said(text)
+        except Exception:
+            logger.exception("ASR failed")
+            self.state = "idle"
+            self.runner.floor_released()
+        finally:
+            _turn_end()
+
+    def _consume_utterance(self, epoch):
+        with self._carry_lock:
+            if self._pending_voice is not None and self._pending_voice[0] == epoch:
+                self._pending_voice = None
+
+    def _clear_carry(self):
+        with self._carry_lock:
+            self._pending_voice = self._carry_audio = None
 
     def start_greeting(self):
         self._t0 = time.perf_counter()
         self._clear_carry()
-        self.state = "processing"
         self.cancel_event.clear()
-        self._turn += 1
-        turn = self._turn
-        _turn_begin()
-        self._processing_thread = threading.Thread(
-            target=self._process_greeting, args=(turn,), daemon=True
-        )
-        self._processing_thread.start()
+        self._bump_epoch()
+        self.clinical = runtime.ClinicalSession()
+        self.runner.restart(self.clinical)
 
-    def _process_greeting(self, turn):
-        try:
-            if self._aborted(turn):
-                self.state = "idle"
-                return
-            self.clinical = runtime.ClinicalSession()
-            step = runtime.start(self.clinical)
-            beats = (runtime.Say(config.GREETING_CLIP_KEY,
-                                 config.GREETING_PREAMBLE),) + step.utterances
-            if not self._speak_beats(beats, turn):
-                self.state = "idle"
-        except Exception as e:
-            logger.error(f"Greeting error: {e}", exc_info=True)
-            self.state = "idle"
-        finally:
-            _turn_end()
+    # --- history and NLU context -------------------------------------------
 
-    def _api_window(self):
-        win = [dict(m) for m in
-               self.chat_history[-config.LLM_HISTORY_MAX_MESSAGES:]]
+    def api_window(self):
+        with self._lock:
+            win = [dict(m) for m in
+                   self.chat_history[-config.LLM_HISTORY_MAX_MESSAGES:]]
         if win and win[0]["role"] == "assistant":
             del win[0]
         return win
 
-    def _history_begin(self, user_text):
+    def patient_facts(self):
+        with self._lock:
+            return dict(self.patient)
+
+    def history_user(self, user_text):
+        """Record the user's turn.
+
+        A still-unanswered user message absorbs the new text: speech split by a
+        pause reassembles into one sentence rather than reaching the model as two
+        consecutive user messages.
+        """
         with self._lock:
             hist = self.chat_history
             if hist and hist[-1]["role"] == "user":
@@ -395,9 +487,18 @@ class Pipeline:
                                         + " " + user_text).strip()}
             else:
                 hist.append({"role": "user", "content": user_text})
-            window = self._api_window()
+        window = self.api_window()
         threading.Thread(target=self._extract_patient, args=(window,),
                          name="patient-extract", daemon=True).start()
+
+    def history_assistant_append(self, text):
+        """Grow the assistant's current turn in place as it is spoken."""
+        with self._lock:
+            hist = self.chat_history
+            if hist and hist[-1]["role"] == "assistant":
+                hist[-1]["content"] = (hist[-1]["content"] + " " + text).strip()
+            else:
+                hist.append({"role": "assistant", "content": text})
 
     def _extract_patient(self, history_snapshot):
         facts = llm.extract_patient_facts(history_snapshot)
@@ -410,267 +511,94 @@ class Pipeline:
                 self.patient[k] = v
         logger.info("[patient] profile now: %s", phi_keys(self.patient))
 
-    def _history_set_assistant(self, text):
-        with self._lock:
-            hist = self.chat_history
-            if hist and hist[-1]["role"] == "assistant":
-                hist[-1]["content"] = text
-            else:
-                hist.append({"role": "assistant", "content": text})
+    def turn_facts(self, session):
+        """The only factual source the model may draw on when it replies.
 
-    def _process_speech(self, audio_array, turn):
-        try:
-            if self._aborted(turn):
-                self.state = "idle"
-                return
-
-            user_text = asr.transcribe_array(audio_array, sample_rate=16000)
-            logger.info("[latency] ASR done at +%.2fs -> %s",
-                        time.perf_counter() - self._t0, phi(user_text))
-
-            if not user_text.strip():
-                self.state = "idle"
-                return
-
-            if self._aborted(turn):
-                self.state = "idle"
-                return
-
-            self._protocol_turn(user_text, turn)
-
-        except Exception as e:
-            logger.error(f"Pipeline error: {e}", exc_info=True)
-            self.state = "idle"
-        finally:
-            _turn_end()
-
-    def _process_text(self, user_text, turn):
-        try:
-            if self._aborted(turn):
-                self.state = "idle"
-                return
-
-            self._protocol_turn(user_text, turn)
-
-        except Exception as e:
-            logger.error(f"Pipeline error (text): {e}", exc_info=True)
-            self.state = "idle"
-        finally:
-            _turn_end()
-
-    def _current_question(self):
-        exp = self.clinical.expect
-        if exp.kind != "option":
-            return None, None
-        if exp.instrument == "prescreen":
-            item = PRE_SCREEN[exp.item_index].item
-        else:
-            item = BY_KEY[exp.instrument].items[exp.item_index]
-        return item.text, item.options
-
-    def _last_question_text(self):
-        step = self.clinical.last_step
-        if step:
-            for utt in reversed(step.utterances):
-                if isinstance(utt, runtime.Say):
-                    return utt.text
-        with self._lock:
-            for m in reversed(self.chat_history):
-                if m["role"] == "assistant" and m["content"].strip():
-                    return m["content"]
-        return config.CONSENT_QUESTION
-
-    def _turn_facts(self):
-        c = self.clinical
+        Every entry is deterministic state. What was DISCUSSED is read from the
+        voiced ledger rather than from a flag set while composing, so a piece of
+        education lost to a barge-in is no longer reported as delivered.
+        """
+        fld = sel.answerable(session)
         facts = {
-            "current_phase": c.node,
+            "current_phase": session.node,
             "standard_drink_definition_discussed":
-                "alcohol.edu.standard_drink" in c.covered,
-            "drinking_limits_discussed": "alcohol.edu.limits" in c.covered,
-            "permissions_declined_so_far": list(c.declined),
-            "active_topic": c.arm,
+                "alcohol.edu.standard_drink" in session.spoken,
+            "drinking_limits_discussed":
+                "alcohol.edu.limits" in session.spoken,
+            "permissions_declined_so_far": list(session.declined),
+            "active_topic": session.arm,
         }
         for unit_key, fact_key in (
                 ("alcohol.edu.standard_drink", "standard_drink_definition"),
                 ("alcohol.edu.limits", "recommended_drinking_limits")):
-            if unit_key in c.covered:
+            if unit_key in session.spoken:
                 facts[fact_key] = templates.FIXED[unit_key]
-        exp = c.expect
-        if (exp.kind == "option" and exp.instrument
-                and exp.instrument != "prescreen"):
-            items = BY_KEY[exp.instrument].items
+        if (fld is not None and fld.kind == "option" and fld.instrument
+                and fld.instrument != "prescreen"):
+            items = BY_KEY[fld.instrument].items
             facts["answers_already_given"] = [
                 {"item": i, "question": items[i].text,
                  "answer": items[i].options[code].label}
                 for i, code in sorted(
-                    c.responses.get(exp.instrument, {}).items())]
+                    session.responses.get(fld.instrument, {}).items())]
         return facts
 
-    def _protocol_turn(self, user_text, turn):
-        with self._protocol_lock:
-            if self._aborted(turn):
-                return
-            clinical = self.clinical
+    def interview_state(self, session):
+        return state_view.render_interview_state(session)
 
-            exp = clinical.expect
-            if exp.kind == "end":
-                self._consume_utterance(turn)
-                return self._deliver_step(user_text, runtime.Step(
-                    clinical.node, (runtime.LLMSay(
-                        "The screening session is already complete. In one warm "
-                        "sentence, acknowledge what the person said and remind "
-                        "them their provider will follow up with them."),),
-                    clinical.expect), turn)
+    # --- speech out ---------------------------------------------------------
 
-            with self._lock:
-                history = self._api_window()
-                patient = dict(self.patient)
-            out = llm.turn(user_text, exp,
-                           ask_text=self._last_question_text(),
-                           history=history, patient=patient,
-                           facts=self._turn_facts(),
-                           interview_state=state_view.render_interview_state(
-                               clinical))
+    def speak(self, delivery) -> bool:
+        """Voice one delivery unit, and report whether it reached the transcript.
 
-            if self._aborted(turn):
-                return
-            self._consume_utterance(turn)
+        The return value is the ledger's only input, and the bar is the
+        transcript rather than the audio: a line the person can read has been
+        said, so a barge-in part-way through it is not worth hearing again.
+        Only a cancel that lands before a beat is composed leaves the unit owed.
+        """
+        utterances = tuple(delivery.beats)
+        if delivery.ack:
+            if utterances and isinstance(utterances[0], runtime.LLMSay):
+                # One utterance, one author. Left as two beats, the second model
+                # call restates the acknowledgment it can see in the history and
+                # the person hears the same sentence twice.
+                utterances = (runtime.LLMSay(
+                    f"First acknowledge what the person just said, using these "
+                    f"words or very close to them: {delivery.ack!r}. Then, in "
+                    f"the same breath and without repeating yourself, "
+                    f"{utterances[0].instruction}"),) + utterances[1:]
+            else:
+                utterances = (runtime.Speak(delivery.ack),) + utterances
 
-            runtime.record_harvest(clinical, out)
+        for utt in utterances:
+            if self.cancel_event.is_set():
+                # Nothing of this beat was written, so the unit is still owed.
+                return False
+            self._voice_one(utt)
+        return True
 
-            if out.action == "crisis":
-                logger.warning("[crisis] NLU flagged crisis at node %s",
-                               clinical.node)
-                step = runtime.enter_crisis(clinical)
-                self._deliver_step(user_text, step, turn)
-                self.ended = True
-                return
-
-            if out.action == "abort":
-                step = runtime.enter_abort(clinical)
-                self._deliver_step(user_text, step, turn)
-                self.ended = True
-                return
-
-            if out.action == "correction":
-                try:
-                    step = runtime.correct(clinical, out)
-                except InvalidResponse:
-                    logger.exception("correction failed; holding")
-                    step = None
-                if step is None:
-                    return self._hold(user_text, out.reply, turn)
-                return self._deliver_step(user_text, step, turn,
-                                          ack=out.reply)
-
-            if out.action == "answer":
-                if exp.ask_key == "consent.opening":
-                    privacy.record_consent(
-                        self.audit_key, "yes" if out.code == 1 else "no")
-                if exp.ask_key == "pause.offer":
-                    step = runtime.resolve_pause(
-                        clinical, keep_going=(out.code == 1))
-                    return self._deliver_step(user_text, step, turn,
-                                              ack=out.reply)
-                if exp.kind == "confirm":
-                    step = runtime.resolve_confirm(clinical,
-                                                   yes=(out.code == 1))
-                    return self._deliver_step(user_text, step, turn,
-                                              ack=out.reply)
-                reason = runtime.confirm_reason(clinical, out)
-                if reason is not None:
-                    step = runtime.request_confirm(clinical, out, reason)
-                    return self._deliver_step(user_text, step, turn,
-                                              ack=out.reply)
-                try:
-                    step = runtime.advance(clinical, out)
-                except (runtime.ProtocolError, InvalidResponse):
-                    logger.exception("protocol advance failed; re-asking")
-                    return self._hold(user_text, "", turn)
-                if clinical.node == "declined":
-                    return self._deliver_step(user_text, step, turn)
-                return self._deliver_step(user_text, step, turn,
-                                          ack=out.reply)
-
-            if out.action == "continuation":
-                runtime.absorb(clinical, out)
-                return self._hold(user_text, out.reply, turn)
-
-            if out.action == "dont_know":
-                if runtime.note_stall(clinical) >= runtime.DONT_KNOW_LIMIT:
-                    return self._deliver_missing(user_text, "dont_know", turn)
-                return self._hold_probe(user_text, turn)
-
-            if out.action == "unclear":
-                if runtime.note_stall(clinical) >= runtime.UNCLEAR_LIMIT:
-                    return self._deliver_missing(user_text, "no_answer", turn)
-                return self._hold(user_text, out.reply, turn,
-                                  repose=not out.reply)
-
-            if out.action == "discomfort":
-                return self._deliver_step(
-                    user_text, runtime.offer_pause(clinical), turn,
-                    ack=out.reply)
-
-            if out.action == "tangent":
-                if runtime.note_aside(clinical) >= runtime.ASIDE_LIMIT:
-                    return self._deliver_step(
-                        user_text, runtime.offer_pause(clinical), turn,
-                        ack=out.reply)
-                return self._hold(user_text, out.reply, turn)
-
-            return self._hold(user_text, out.reply, turn)
-
-    def _deliver_missing(self, user_text, reason, turn):
-        step = runtime.mark_missing(self.clinical, reason)
-        return self._deliver_step(user_text, step, turn)
-
-    def _hold_probe(self, user_text, turn):
-        exp = self.clinical.expect
-        if exp.kind == "option":
-            instruction = (
-                "The person says they don't know or can't remember. In one "
-                "or two gentle sentences, help them estimate: suggest "
-                "thinking about the period in the past year when they were "
-                "drinking or using the most, and mention that a rough guess "
-                "is fine — or we can skip it and move on. Do NOT re-ask the "
-                "question; it is repeated for you straight afterwards.")
-        elif exp.kind == "number":
-            instruction = (
-                "The person says they don't know. In one gentle sentence, "
-                "say it doesn't have to be exact and that whatever number "
-                "feels closest is fine — or offer to skip it. Do NOT re-ask "
-                "the question; it is repeated for you straight afterwards.")
+    def _voice_one(self, utt):
+        clip_key = None
+        if isinstance(utt, runtime.Say):
+            text = utt.text
+            clip_key = protocol_clip_key(utt.key)
+            cached = fixed_segment(text, clip_key)
+            if cached is not None:
+                self.history_assistant_append(text)
+                self._track(cached)
+                self._enqueue(cached)
+                return cached
+        elif isinstance(utt, runtime.Speak):
+            text = utt.text
         else:
-            return self._deliver_step(
-                user_text, runtime.repeat_step(self.clinical), turn)
-        beats = [runtime.LLMSay(instruction)]
-        ask = runtime.current_ask(self.clinical)
-        if ask is not None:
-            beats.append(ask)
-        return self._deliver_step(
-            user_text,
-            runtime.Step(self.clinical.node, tuple(beats), exp),
-            turn)
+            text = llm.phrase_utterance(utt.instruction, self.api_window(),
+                                        self.patient_facts())
+        if not text or not text.strip():
+            return None
+        self.history_assistant_append(text)
+        return self._speak_dynamic(text, cache_key=clip_key)
 
-    def _hold(self, user_text, reply, turn, repose=True):
-        exp = self.clinical.expect
-        beats = []
-        if reply:
-            beats.append(runtime.Speak(reply))
-        ask = runtime.current_ask(self.clinical) if repose else None
-        if ask is not None:
-            beats.append(ask)
-        elif not beats:
-            beats.append(runtime.LLMSay(
-                "In one short sentence, gently ask again for an answer to "
-                f"{self._last_question_text()!r}."))
-        self._deliver_step(
-            user_text,
-            runtime.Step(self.clinical.node, tuple(beats), exp),
-            turn)
-
-    def _speak_dynamic(self, text, turn, cache_key=None):
+    def _speak_dynamic(self, text, cache_key=None):
         if cache_key is None:
             self.dynamic_renders += 1
             logger.info("[latency] dynamic render #%d this session",
@@ -682,95 +610,28 @@ class Pipeline:
                         "cold" if config.CLIP_CACHE else "off")
         seg = self._new_segment(text)
         audio = tts.synthesize(text, self.cancel_event)
-        if audio is None or self._aborted(turn):
+        if audio is None:
             seg.cancel()
             return None
         self._enqueue(seg)
         keep = bool(cache_key) and config.CLIP_CACHE
         frames = [] if keep else None
         render_into(seg, audio, abort=seg.cancelled.is_set, collect=frames)
-        if (keep and not seg.cancelled.is_set() and not self._aborted(turn)
+        if (keep and not seg.cancelled.is_set()
                 and (frames or not config.ENABLE_VIDEO_AVATAR)):
             clipcache.put_clip(cache_key, clip_stamp(text), audio, frames)
         return seg
 
-    def _speak_beats(self, utterances, turn):
-        spoken = []
-        for utt in utterances:
-            if self._aborted(turn):
-                return False
-            seg, pending, clip_key = None, False, None
-            if isinstance(utt, runtime.Say):
-                text = utt.text
-                clip_key = protocol_clip_key(utt.key)
-                seg = fixed_segment(text, clip_key)
-                pending = seg is None
-            elif isinstance(utt, runtime.Speak):
-                text = utt.text
-                if not text.strip():
-                    continue
-                pending = True
-            else:
-                with self._lock:
-                    history = self._api_window()
-                    patient = dict(self.patient)
-                text = llm.phrase_utterance(utt.instruction, history, patient)
-                if not text.strip():
-                    continue
-                pending = True
-            if self._aborted(turn):
-                return False
-            spoken.append(text)
-            self._history_set_assistant(" ".join(spoken))
-            if seg is not None:
-                self._enqueue(seg)
-            elif pending:
-                self._speak_dynamic(text, turn, cache_key=clip_key)
-        if self._aborted(turn):
-            return False
-        self.video_queue.put(None)
-        self.state = "speaking"
-        return True
-
-    def _deliver_step(self, user_text, step, turn, ack=""):
-        self._history_begin(user_text)
-        self.state = "processing"
-        utterances = tuple(step.utterances)
-        if ack:
-            if utterances and isinstance(utterances[0], runtime.LLMSay):
-                utterances = (runtime.LLMSay(
-                    f"First acknowledge what the person just said, using these "
-                    f"words or very close to them: {ack!r}. Then, in the same "
-                    f"breath and without repeating yourself, {utterances[0].instruction}"),
-                ) + utterances[1:]
-            else:
-                utterances = (runtime.Speak(ack),) + utterances
-        self._speak_beats(utterances, turn)
-        if step.expect.kind == "end":
-            self.ended = True
-
-    def get_next_video(self):
-        try:
-            item = self.video_queue.get_nowait()
-            if item is None:
-                self.state = "idle"
-                return False
-            return item
-        except queue.Empty:
-            return None
+    # --- lifecycle ----------------------------------------------------------
 
     def get_chat_history(self):
         return list(self.chat_history)
 
-    def reset(self):
+    def close(self):
+        """A dropped session must fall silent and must not keep its tick
+        thread alive."""
         self.cancel_event.set()
-        self._turn += 1
-        time.sleep(0.1)
-        self.cancel_event.clear()
-        self.chat_history.clear()
-        self.patient.clear()
-        self.ended = False
-        self.clinical = runtime.ClinicalSession()
-        runtime.start(self.clinical)
+        self._bump_epoch()
         self._flush()
+        self.runner.shutdown()
         self.state = "idle"

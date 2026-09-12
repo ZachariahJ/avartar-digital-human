@@ -46,7 +46,6 @@ body.with-card .card-panel { display: block; }
 #portrait { display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
             object-fit: contain; border-radius: 12px; z-index: 2; background: #111; }
 body.audio-only #portrait { display: block; }
-.subtitle-bar { width: 100%; max-width: 500px; text-align: center; padding: 8px 16px; font-size: 0.95em; min-height: 32px; color: #ccc; }
 
 /* The transcript, below the avatar. */
 .chat-panel { flex: 1; display: flex; flex-direction: column; border-top: 1px solid #0f3460; min-height: 0; }
@@ -97,7 +96,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
       <audio id="speech" preload="auto"></audio>
       <img id="portrait" alt="">
     </div>
-    <div class="subtitle-bar" id="subtitle"></div>
   </div>
   <div class="chat-panel">
     <div class="chat-messages" id="chatMessages"></div>
@@ -131,7 +129,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
   const stage = document.getElementById('stage');
   const speech = document.getElementById('speech');
   const stageCtx = stage.getContext('2d');
-  const subtitle = document.getElementById('subtitle');
   const chatMessages = document.getElementById('chatMessages');
   const btnStart = document.getElementById('btnStart');
   const btnClear = document.getElementById('btnClear');
@@ -163,17 +160,25 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
   // Per-browser session id: isolates this tab's conversation/avatar/mic on the
   // server from every other connected user. Sent on both WebSockets and all
   // HTTP calls.
-  // Persist the session id in sessionStorage so a page reload rejoins the SAME
-  // server session (the connect snapshot then restores the transcript) instead of
-  // silently discarding the conversation. Per-tab; a new tab gets its own session.
-  let SESSION_ID = sessionStorage.getItem('sid');
-  if (!SESSION_ID) {
-    SESSION_ID = (window.crypto && crypto.randomUUID)
+  // Minted fresh on every load, and again on Clear: a reload and a Clear must
+  // both start a new conversation, never rejoin the previous one mid-answer.
+  function newSessionId() {
+    return (window.crypto && crypto.randomUUID)
       ? crypto.randomUUID()
       : 'sid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-    sessionStorage.setItem('sid', SESSION_ID);
   }
-  const SID_Q = '?sid=' + encodeURIComponent(SESSION_ID);
+  let SESSION_ID = newSessionId();
+  let SID_Q = '?sid=' + encodeURIComponent(SESSION_ID);
+
+  // Drop the old session before minting a new sid, or it keeps pushing frames.
+  async function dropSession() {
+    disconnectStateWS();
+    interruptPlayback();
+    await fetch('/api/reset' + SID_Q, { method: 'POST' });
+    SESSION_ID = newSessionId();
+    SID_Q = '?sid=' + encodeURIComponent(SESSION_ID);
+    sessionEnded = false;
+  }
 
   // Playback.
   //
@@ -198,7 +203,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
       audioUrl: msg.audio_url,
       fps: msg.fps || SEG_FPS_FALLBACK,
       prebuffer: msg.prebuffer || 1,
-      text: msg.subtitle || '',
       frames: [],            // sparse: createImageBitmap resolves out of order
       have: 0,
       done: false,           // server sent segment_end
@@ -252,7 +256,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
     segQueue.shift();
     playing = seg;
     drawn = null;
-    subtitle.textContent = seg.text;
     if (VIDEO_AVATAR) stage.classList.add('speaking');
     speech.muted = !userGestured;
     speech.src = seg.audioUrl;
@@ -291,7 +294,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
 
   function toIdle() {
     stage.classList.remove('speaking');
-    subtitle.textContent = '';
     responseEnded = false;
     idleVideo.play().catch(() => {});
     statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
@@ -301,7 +303,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
     idleVideo.muted = true;         // the idle loop is silent by design
     if (!idleVideo.src.endsWith(IDLE_VIDEO_URL)) idleVideo.src = IDLE_VIDEO_URL;
     idleVideo.play().catch(() => {});
-    subtitle.textContent = '';
   }
 
   function announceSegment(msg) {
@@ -339,6 +340,19 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
 
   // Server messages.
   let stateWs = null;
+  // A lost connection ends it: the sid is minted per page load and the
+  // server destroys the session on disconnect, so reconnecting finds nothing.
+  function sessionLost() {
+    if (!micActive) return;
+    micActive = false;
+    stopMic();
+    disconnectStateWS();
+    interruptPlayback();
+    btnStart.textContent = 'Start';
+    btnStart.classList.remove('active');
+    disableTextInput();
+    statusBar.textContent = 'Connection lost - reload the page to start over';
+  }
 
   function connectStateWS() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -346,14 +360,16 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
     // One socket carries both control messages and video frames.
     stateWs.binaryType = 'arraybuffer';
     stateWs.onopen = () => console.log('[State] WS connected');
-    stateWs.onclose = () => {
-      console.log('[State] WS disconnected, reconnecting...');
-      setTimeout(connectStateWS, 2000);
-    };
+    stateWs.onclose = () => sessionLost();
     stateWs.onmessage = (e) => {
       if (typeof e.data === 'string') handleStateMessage(JSON.parse(e.data));
       else handleFrame(e.data);
     };
+  }
+
+  function disconnectStateWS() {
+    // Clear onclose first: a deliberate close is not a dropped connection.
+    if (stateWs) { stateWs.onclose = null; stateWs.close(); stateWs = null; }
   }
 
   let chatState = [];   // [{role, content}] mirror of the server-side chat
@@ -394,11 +410,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
           statusBar.textContent = micActive ? 'Ready - speak now' : 'Click Start to begin';
         }
       }
-    } else if (msg.type === 'reset') {
-      chatState = [];
-      chatMessages.innerHTML = '';
-      interruptPlayback();
-      statusBar.textContent = 'Click Start to begin';
     } else if (msg.type === 'stop') {
       // The session is over. Stop capturing and reset the controls, but leave
       // playback alone so the closing line finishes; cutting somebody off on
@@ -456,8 +467,6 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
     if (atBottom) chatMessages.scrollTop = chatMessages.scrollHeight;
   }
 
-  connectStateWS();
-
   // Microphone capture.
   let audioWs = null;
   let audioCtx = null;
@@ -471,10 +480,7 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
     audioWs = new WebSocket(proto + '//' + location.host + '/ws/audio' + SID_Q);
     audioWs.binaryType = 'arraybuffer';
     audioWs.onopen = () => console.log('[Audio] WS connected');
-    audioWs.onclose = () => {
-      console.log('[Audio] WS disconnected, reconnecting...');
-      if (micActive) setTimeout(connectAudioWS, 2000);
-    };
+    audioWs.onclose = () => sessionLost();
   }
 
   async function startMic() {
@@ -562,17 +568,16 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
     if (micSink) { micSink.disconnect(); micSink = null; }
     if (audioCtx) { audioCtx.close(); audioCtx = null; }
     if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-    if (audioWs) { audioWs.close(); audioWs = null; }
+    if (audioWs) { audioWs.onclose = null; audioWs.close(); audioWs = null; }
   }
 
   // Controls.
   btnStart.addEventListener('click', async () => {
     if (!micActive) {
-      // The previous session ended, so clear the server's conversation before
-      // starting; otherwise the greeting does not fire again.
+      // The previous session ended, so start a brand-new one; otherwise the
+      // greeting does not fire again.
       if (sessionEnded) {
-        sessionEnded = false;
-        await fetch('/api/reset' + SID_Q, { method: 'POST' });
+        await dropSession();
       }
 
       const resp = await fetch('/api/toggle' + SID_Q, { method: 'POST' });
@@ -580,6 +585,7 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
       if (data.mic === 'on') {
         const ok = await startMic();
         if (ok) {
+          if (!stateWs) connectStateWS();   // Stop left it open; don't double up
           micActive = true;
           btnStart.textContent = 'Stop';
           btnStart.classList.add('active');
@@ -599,6 +605,8 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
     } else {
       await fetch('/api/toggle' + SID_Q, { method: 'POST' });
       stopMic();
+      // The state socket stays open: closing it drops the server session, and
+      // Stop is a pause, not an end.
       interruptPlayback();          // Stop actually stops the avatar mid-response
       micActive = false;
       btnStart.textContent = 'Start';
@@ -657,20 +665,16 @@ body.with-card .btn-card { background: #4ecca3; color: #10233b; box-shadow: 0 2p
   });
 
   btnClear.addEventListener('click', async () => {
-    // The reset endpoint already turns the mic off server-side and reports the
-    // resulting state. Toggling as well would turn it back on, leaving the two
-    // sides disagreeing and the next Start doing nothing.
-    await fetch('/api/reset' + SID_Q, { method: 'POST' });
-    chatState = [];
-    chatMessages.innerHTML = '';
-    subtitle.textContent = '';
-    statusBar.textContent = 'Click Start to begin';
     if (micActive) {
       stopMic();
       micActive = false;
       btnStart.textContent = 'Start';
       btnStart.classList.remove('active');
     }
+    await dropSession();
+    chatState = [];
+    chatMessages.innerHTML = '';
+    statusBar.textContent = 'Click Start to begin';
     disableTextInput();
   });
 })();
