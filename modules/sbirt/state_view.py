@@ -177,8 +177,9 @@ def _answer_shape(session: ClinicalSession) -> str:
     if kind == "consent":
         return "A yes or no."
     if kind == "confirm":
-        return ("A yes or no to the read-back (yes commits the coded answer; "
-                "no re-collects the item).")
+        return ("A yes or no to the read-back (yes keeps the recorded answer; "
+                "no clears it and the question is asked again; a different "
+                "answer is a correction).")
     if kind == "option":
         item = (PRE_SCREEN[exp.item_index].item
                 if exp.instrument == "prescreen"

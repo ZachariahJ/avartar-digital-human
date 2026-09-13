@@ -207,6 +207,17 @@ def _expectation_text(expect) -> str:
     if kind == "consent":
         return ("A yes or no: \"code\" 1 = they agree, 0 = they decline.")
     if kind == "confirm":
+        if expect.instrument:
+            item = expected_item(expect)
+            lines = "\n".join(f"  {i}: {o.label}"
+                              for i, o in enumerate(item.options))
+            return (
+                "A yes or no to the read-back you just gave of their answer "
+                f"to \"{item.text}\". 1 = they agree, or simply repeat the "
+                "same answer; 0 = they say it is wrong without giving the "
+                "right one. If they give a DIFFERENT answer to that question, "
+                f"use action \"correction\" with \"item\" {expect.item_index} "
+                "and \"code\" = the new option number:\n" + lines)
         return ("A yes or no: you just read their previous answer back and "
                 "asked if you understood it right. 1 = confirmed, 0 = they "
                 "say it was wrong.")

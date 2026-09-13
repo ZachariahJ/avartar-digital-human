@@ -533,7 +533,7 @@ class Pipeline:
                 ("alcohol.edu.limits", "recommended_drinking_limits")):
             if unit_key in session.spoken:
                 facts[fact_key] = templates.FIXED[unit_key]
-        if (fld is not None and fld.kind == "option" and fld.instrument
+        if (fld is not None and fld.kind in ("option", "confirm") and fld.instrument
                 and fld.instrument != "prescreen"):
             items = BY_KEY[fld.instrument].items
             facts["answers_already_given"] = [

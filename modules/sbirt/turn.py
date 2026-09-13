@@ -143,12 +143,13 @@ def validate(out: TurnOut, expect, ask_text: str = "") -> TurnOut:
         "harvest": validate_harvest(out, expect),
     })
     if out.action == "correction":
-        if (expect.kind == "option" and expect.instrument
+        if (expect.kind in ("option", "confirm") and expect.instrument
                 and expect.instrument != "prescreen"
                 and isinstance(out.item, int) and isinstance(out.code, int)):
             items = BY_KEY[expect.instrument].items
             if (0 <= out.item < len(items)
-                    and out.item != expect.item_index
+                    and (expect.kind == "confirm"
+                         or out.item != expect.item_index)
                     and 0 <= out.code < len(items[out.item].options)):
                 return out.model_copy(update={"slots": {}, "text": None})
         return _unclear(out, "correction needs a known earlier item + option")

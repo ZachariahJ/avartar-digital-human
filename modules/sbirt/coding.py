@@ -77,8 +77,6 @@ _FREQ5_BOUNDS = ((0.23, 1), (0.9, 2), (5.0, 3))
 
 _FREQ_SCALES = {"freq_q1": (_Q1_BOUNDS, 4), "freq5": (_FREQ5_BOUNDS, 4)}
 
-_BOUNDARY_MARGIN = 0.15
-
 
 def per_week(value: float, per: str | None) -> float | None:
     if value is None or value < 0:
@@ -104,7 +102,9 @@ def derive_frequency(scale: str, value: float | None,
         if rate <= bound:
             code = c
             break
-    boundary = any(abs(rate - b) / b < _BOUNDARY_MARGIN for b, _ in bounds)
+    # Only a rate sitting exactly on a cut point is undecidable; anything else
+    # the cut points settle, and the person can correct it next turn.
+    boundary = any(abs(rate - b) < 1e-6 for b, _ in bounds)
     return Derived(code=code, boundary=boundary)
 
 

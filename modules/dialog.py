@@ -264,6 +264,10 @@ class DialogRunner:
                 "their provider will follow up with them."))
             return
 
+        if fld.kind == "confirm":
+            self._settle(fld, out)
+            return
+
         if out.action == "correction":
             try:
                 changed = runtime.correct(session, fld, out)
@@ -348,20 +352,38 @@ class DialogRunner:
                 if resumed is not None:
                     self._repose(resumed)
             return
-        if fld.kind == "confirm":
-            runtime.resolve_confirm(session, yes=(out.code == 1))
-            return
-
+        # Judged before the write: conflict detection reads the prior answers.
         reason = runtime.confirm_reason(session, fld, out)
-        if reason is not None:
-            runtime.request_confirm(session, fld, out, reason)
-            return
         try:
             runtime.record(session, fld, out)
         except (ProtocolError, InvalidResponse):
             logger.exception("[dialog] record failed; re-asking")
             self._pending_ack = ""
             self._repose(fld)
+            return
+        if reason is not None:
+            runtime.request_confirm(session, fld, out, reason)
+            # The read-back restates the answer; an ack before it says it twice.
+            self._pending_ack = ""
+
+    def _settle(self, fld: Field, out) -> None:
+        """Resolve a read-back on whatever came back; it is never put twice."""
+        session = self.session
+        self._pending_ack = "" if out.action == "unclear" else out.reply
+        corrected = False
+        if out.action == "correction":
+            try:
+                corrected = runtime.correct(session, fld, out)
+            except InvalidResponse:
+                logger.exception("[dialog] correction failed during read-back")
+        yes = None
+        if out.action == "answer":
+            yes = out.code == 1
+        elif corrected and out.item == fld.item_index:
+            yes = True
+        runtime.resolve_confirm(session, yes=yes)
+        if out.action == "discomfort":
+            runtime.offer_pause(session)
 
     # --- responses that are said but not owed -------------------------------
 

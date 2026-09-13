@@ -67,6 +67,8 @@ class ClinicalSession:
     candidates: dict[str, dict] = dc_field(default_factory=dict)
     refused_candidates: set = dc_field(default_factory=set)
     pending_confirm: dict | None = None
+    read_back: set[str] = dc_field(default_factory=set)
+    unconfirmed: set[str] = dc_field(default_factory=set)
     last_ask_key: str | None = None
     stalls: int = 0
     misreads: int = 0
@@ -180,7 +182,7 @@ def repose(session: ClinicalSession, unit: str) -> None:
 # --- unanswerable -----------------------------------------------------------
 
 DONT_KNOW_LIMIT = 2
-UNCLEAR_LIMIT = 3
+UNCLEAR_LIMIT = 2
 MISREAD_LIMIT = 3
 ASIDE_LIMIT = 2
 
@@ -220,18 +222,6 @@ def mark_missing(session: ClinicalSession, field: Field,
     """
     session.stalls = session.misreads = 0
     skip_line = (Say("item.skipped", templates.FIXED["item.skipped"]),)
-
-    if field.kind == "confirm":
-        p = session.pending_confirm
-        session.pending_confirm = None
-        if p is not None:
-            session.candidates.pop(p["target"], None)
-            head, _, tail = p["target"].rpartition(".")
-            if head in BY_KEY and tail.isdigit():
-                session.missing.setdefault(head, {})[int(tail)] = "unconfirmed"
-            logger.info("[clinical] confirm unresolvable: %s marked missing",
-                        p["target"])
-        return skip_line
 
     if field.kind == "option":
         if field.instrument == "prescreen":
@@ -321,6 +311,8 @@ def confirm_reason(session: ClinicalSession, field: Field,
             or field.instrument == "prescreen"
             or not isinstance(out.code, int)):
         return None
+    if field.slot in session.read_back:
+        return None
     conflict = _conflict(session, field, out)
     if conflict:
         return {"reason": "conflict", "rule": conflict[0], "prior": conflict[1]}
@@ -353,6 +345,7 @@ def request_confirm(session: ClinicalSession, field: Field, out: TurnOut,
     session.pending_confirm = {"target": field.slot, "code": out.code,
                                "text": out.text, "source": "asked",
                                **(reason or {})}
+    session.read_back.add(field.slot)
 
 
 def request_volunteered_confirm(session: ClinicalSession, target: str) -> None:
@@ -363,10 +356,12 @@ def request_volunteered_confirm(session: ClinicalSession, target: str) -> None:
     """
     session.pending_confirm = {"target": target, "source": "volunteered",
                                **session.candidates[target]}
+    session.read_back.add(target)
     logger.info("[clinical] reading back a volunteered answer for %s", target)
 
 
-def resolve_confirm(session: ClinicalSession, yes: bool) -> None:
+def resolve_confirm(session: ClinicalSession, yes: bool | None) -> None:
+    """Settle a read-back; yes=None means no clear verdict came back."""
     p = session.pending_confirm
     if p is None:
         raise ProtocolError("confirm resolution without a pending answer")
@@ -375,13 +370,30 @@ def resolve_confirm(session: ClinicalSession, yes: bool) -> None:
     target = p["target"]
     session.candidates.pop(target, None)
     session.spoken.discard(f"confirm.{target}")
-    if yes:
-        write_target(session, target, p.get("code"), p.get("text"))
-        logger.info("[clinical] confirm accepted: %s (%s)", target, p["source"])
-    else:
-        if p["source"] == "volunteered":
+
+    # A volunteered answer was never given to the question: only a yes commits it.
+    if p["source"] == "volunteered":
+        if yes:
+            write_target(session, target, p.get("code"), p.get("text"))
+            logger.info("[clinical] confirm accepted: %s (volunteered)", target)
+        else:
             session.refused_candidates.add(target)
-        logger.info("[clinical] confirm DENIED: %s re-collected", target)
+            logger.info("[clinical] volunteered %s not confirmed; asking it",
+                        target)
+        return
+
+    # A direct answer is already recorded: only an explicit no removes it.
+    if yes is False:
+        head, _, tail = target.rpartition(".")
+        session.responses.get(head, {}).pop(int(tail), None)
+        session.spoken.discard(target)
+        logger.info("[clinical] confirm DENIED: %s re-asked", target)
+    elif yes is None:
+        session.unconfirmed.add(target)
+        logger.info("[clinical] confirm unresolved: %s kept, flagged unconfirmed",
+                    target)
+    else:
+        logger.info("[clinical] confirm accepted: %s (asked)", target)
 
 
 # --- volunteered answers, continuations, corrections ------------------------
@@ -427,7 +439,7 @@ def correct(session: ClinicalSession, field: Field, out: TurnOut) -> bool:
     Returns False when the correction names nothing that can be changed, so the
     caller holds position and asks which answer was meant.
     """
-    if field.kind != "option" or not field.instrument \
+    if field.kind not in ("option", "confirm") or not field.instrument \
             or field.instrument == "prescreen":
         return False
     responses = session.responses.get(field.instrument, {})

@@ -72,6 +72,11 @@ def _confirm_field(session) -> Field | None:
     p = session.pending_confirm
     if p is None:
         return None
+    head, _, tail = p["target"].rpartition(".")
+    if head in BY_KEY and tail.isdigit():
+        arm = next(a for a, k in ARM_INSTRUMENT.items() if k == head)
+        return Field(f"confirm.{p['target']}", kind="confirm", prompt=Prompt(),
+                     arm=arm, instrument=head, item_index=int(tail))
     return Field(f"confirm.{p['target']}", kind="confirm", prompt=Prompt())
 
 
@@ -138,7 +143,9 @@ def field_expect(session, field: Field | None) -> Expect:
     if field is None:
         return Expect("end")
     if field.kind == "confirm":
-        return Expect("confirm", ask_key=session.pending_confirm["target"])
+        return Expect("confirm", instrument=field.instrument or None,
+                      item_index=field.item_index,
+                      ask_key=session.pending_confirm["target"])
     if field.kind == "consent":
         return Expect("consent", ask_key=field.slot)
     if field.kind == "option":
