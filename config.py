@@ -103,7 +103,7 @@ TEMP_FILE_TTL_SEC = 180
 TEMP_CLEAN_INTERVAL_SEC = 30
 
 MEDIA_BLOB_TTL_SEC = 300
-CLIP_CACHE = os.getenv("CLIP_CACHE", "0").lower() not in ("0", "false", "no")
+CLIP_CACHE = os.getenv("CLIP_CACHE", "1").lower() not in ("0", "false", "no")
 CLIP_CACHE_MAX_MB = int(os.getenv("CLIP_CACHE_MAX_MB", "2048"))
 _SHM = "/dev/shm"
 RENDER_SCRATCH_DIR = os.getenv(
